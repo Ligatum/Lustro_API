@@ -7,6 +7,5 @@ cargo build --release --features python<br>
 ## Clone
 
 ```bash
-git clone --filter=blob:none --sparse https://github.com/Ligatum/Lustro.git
-cd Lustro
-git sparse-checkout set API/LUSTRO_API_CODE
+git clone https://github.com/Ligatum/Lustro_API.git
+cd Lustro_API
