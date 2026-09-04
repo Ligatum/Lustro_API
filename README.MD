@@ -2,7 +2,7 @@ cargo build --release --features ffi,python<br>
 cargo build --release --features ffi<br>
 cargo build --release --features python<br>
 
-# Lustro API Code
+# Lustro API
 
 ## Clone
 
