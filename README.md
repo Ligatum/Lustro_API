@@ -34,7 +34,7 @@ The repo contains **Lustro_API_ffi_python_validator.py** and **Lustro_API_ffi_ba
 **Rust**
 
 ```rust
-use lustro::hash256;
+use lustro::hash::hash256;
 
 let digest = hash256(b"hello world");
 ```
@@ -63,7 +63,8 @@ lustro_hash256((const uint8_t *)"hello world", 11, digest);
 **Rust**
 
 ```rust
-use lustro::{LustroPrng, Seed256, StreamId};
+use lustro::prng::LustroPrng;
+use lustro::types::{Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let mut rng = LustroPrng::new(&seed, StreamId(0));
@@ -101,7 +102,7 @@ lustro_prng_free(rng);
 **Rust**
 
 ```rust
-use lustro::LustroXof;
+use lustro::xof::LustroXof;
 
 let mut xof = LustroXof::new(b"hello world");
 let block = xof.next_block();
@@ -139,7 +140,9 @@ Lustro can process multiple independent streams.
 **Rust**
 
 ```rust
-use lustro::{LustroPrngBatch, LustroXofBatch, Seed256, StreamId};
+use lustro::prng::LustroPrngBatch;
+use lustro::types::{Seed256, StreamId};
+use lustro::xof::LustroXofBatch;
 
 let seed = Seed256::from_bytes([0u8; 32]);
 
@@ -226,6 +229,13 @@ Create multiple child streams.
 **Rust**
 
 ```rust
+use lustro::prng::LustroPrngBatch;
+use lustro::types::{Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
+
+let prng = LustroPrngBatch::new(&seed, &ids);
 let children = prng.fork_range(StreamId(100));
 ```
 
@@ -257,7 +267,8 @@ Save and restore the exact stream position.
 **Rust**
 
 ```rust
-use lustro::{LustroPrng, LustroPrngSnapshot, Seed256, StreamId};
+use lustro::prng::LustroPrng;
+use lustro::types::{LustroPrngSnapshot, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let mut rng = LustroPrng::new(&seed, StreamId(0));
