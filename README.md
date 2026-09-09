@@ -242,6 +242,11 @@ let children = prng.fork_range(StreamId(100));
 **Python**
 
 ```python
+from lustro import LustroPrngBatchPy
+
+seed = bytes(32)
+prng = LustroPrngBatchPy.new(seed, [0, 1, 2, 3])
+
 children = prng.fork_range(100)
 ```
 
