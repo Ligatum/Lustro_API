@@ -29,4 +29,6 @@ For technical specifications, FFI mappings, snapshot mechanics, and binding exam
 
 ---
 
-Ps. Short usage examples for batch streaming and ease of use coming soon.
+## Speed Test and Validaton
+
+The repo contains **Lustro_API_ffi_python_validator.py** and **Lustro_API_ffi_base_speed_test.py**. Both scripts require lustro.dll in the same folder.
