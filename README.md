@@ -253,10 +253,17 @@ children = prng.fork_range(100)
 **C / C++**
 
 ```c
+#include "lustro.h"
+
+uint8_t seed[32] = {0};
+LustroPrngBatch *prng =
+    lustro_prng_batch_new_range(seed, 0, 0, 4);
+
 LustroPrngBatch *children =
     lustro_prng_batch_fork_range(prng, 0, 100);
 
 lustro_prng_batch_free(children);
+lustro_prng_batch_free(prng);
 ```
 
 `fork_range(first)` derives `batch.len()` children using sequential stream IDs. Each child starts at step 0.
