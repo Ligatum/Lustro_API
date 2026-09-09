@@ -25,7 +25,7 @@ cargo build --release --features ffi,python
 
 ## Speed Test and Validation
 
-The repo contains **Lustro_API_ffi_python_validator.py** and **Lustro_API_ffi_base_speed_test.py**. Both scripts require lustro.dll in the same folder.
+The repo contains **Lustro_API_ffi_python_validator.py** and **Lustro_API_ffi_base_speed_test.py**. Both scripts require lustro.dll in the same folder. The speed tester works only with C/C++.
 
 ---
 
