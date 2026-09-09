@@ -10,17 +10,15 @@ cd Lustro_API
 ## Build
 
 ```bash
-# Pure Rust
+# Rust
 cargo build --release
+
+# Python
+maturin develop --release
 
 # C/C++ FFI bindings
 cargo build --release --features ffi
 
-# Python
-cargo build --release --features python
-
-# FFI and Python
-cargo build --release --features ffi,python
 ```
 
 ## Speed Test and Validation
