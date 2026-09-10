@@ -11,13 +11,18 @@ cd Lustro_API
 
 ```bash
 # Rust
+
 cargo build --release
 
 # Python
+
 maturin develop --release
 
-# C/C++ FFI bindings
-cargo build --release --features ffi
+# C/C++ FFI bindings (release-ffi profile — required for panic = "unwind",
+# so that internal panics convert to LustroError::InternalPanic at the FFI
+# boundary instead of just aborting the process; please see ARCHITECTURE.md §13)
+
+cargo build --profile release-ffi --features ffi
 
 ```
 
