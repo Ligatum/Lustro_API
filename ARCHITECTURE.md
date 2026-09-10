@@ -3,6 +3,9 @@
 This document describes the architecture, execution semantics, and
 binding references for Lustro. For a quick start, see [README](README.md).
 
+For binding details please see [Rust API](#121-rust-api-pure-rust-no-bindings),
+[Python Bindings](#122-python-bindings), and [C FFI Reference](#123-c-ffi-reference).
+
 ---
 
 ## 1. Architecture at a Glance
