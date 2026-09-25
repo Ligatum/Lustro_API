@@ -1,0 +1,44 @@
+[package]
+name    = "lustro"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name       = "lustro"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+python  = ["dep:pyo3", "dep:numpy"]
+ffi     = []
+thread-pinning = []
+rand    = ["dep:rand_core"]
+
+[dependencies]
+pyo3   = { version = "0.22", features = ["extension-module"], optional = true }
+numpy  = { version = "0.22", optional = true }
+rayon  = "1.10"
+rand_core = { version = "0.6", features = ["alloc"], optional = true }
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = true
+debug         = false
+incremental   = false
+
+[profile.release-python]
+inherits = "release"
+panic    = "unwind"
+
+[profile.release-ffi]
+inherits = "release"
+panic    = "unwind"
+
+[dev-dependencies]
+proptest = "1.4"
