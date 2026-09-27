@@ -24,7 +24,7 @@ cargo build --release --features ffi
 
 ```
 
-All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead just aborting the process. See ARCHITECTURE.md §13.
+All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead of just aborting the process. See ARCHITECTURE.md §13.
 
 ## Speed Test and Validation
 
