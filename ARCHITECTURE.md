@@ -523,7 +523,10 @@ wraps back to `0`. The same applies to the Rust and Python APIs.
 | `const uint8_t* const*` | `&[&[u8]]` (array of message slices) | Used by variable-length message APIs such as `*_many_var(...)` and `lustro_xof_batch_new(...)`, together with a parallel `const uintptr_t*` of lengths |
 
 Input/output byte buffers are checked for `NULL`; no separate alignment check
-is performed. Scalar writes such as `*_next_u64` use `write_unaligned`.
+is performed. Hash functions (`lustro_hash256*`/`lustro_hash128*`) additionally
+reject overlapping input/output ranges — including, for `*_many_var`, overlap
+between `out` and the `message_ptrs`/`message_lens` tables themselves — with
+`InvalidPointer`. Scalar writes such as `*_next_u64` use `write_unaligned`.
 
 **2. Calling Convention**
 
@@ -541,7 +544,7 @@ There are three categories:
   |---|---|---|
   | 0 | `Ok` | success |
   | 1 | `InvalidLength` | buffer/length argument invalid |
-  | 2 | `InvalidPointer` | required pointer is `NULL` (the library checks for `NULL`, not alignment — see Type Mapping notes below) |
+  | 2 | `InvalidPointer` | required pointer is `NULL`, or (hash functions only) an input/output range overlaps another — see Type Mapping notes below |
   | 3 | `OutputTooSmall` | output buffer smaller than required |
   | 4 | `AlreadyFinalised` | context already finalised |
   | 5 | `VerificationFailed` | verification step failed |
