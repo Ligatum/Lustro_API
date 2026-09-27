@@ -167,8 +167,20 @@ impl LustroPrngBatchPy {
             ));
         }
 
+        // Validate contiguity first; the scope drops the borrow before allow_threads.
+        {
+            let mut out_arr = out.as_array_mut();
+            if out_arr.as_slice_mut().is_none() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "out must be a C-contiguous array (got a non-contiguous view, \
+                     e.g. from slicing or transposing — call np.ascontiguousarray() first)",
+                ));
+            }
+        }
+
         py.allow_threads(|| self.inner.fill_blocks(&mut self.blocks_buf));
 
+        // Re-borrow the output after the GIL is reacquired.
         let mut out_arr = out.as_array_mut();
         let flat = out_arr.as_slice_mut().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
@@ -200,7 +212,21 @@ impl LustroPrngBatchPy {
             ));
         }
 
-        let needed = n * steps;
+        let needed = n.checked_mul(steps).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("n_streams * steps overflows usize")
+        })?;
+
+        // Validate contiguity first; the scope drops the borrow before allow_threads.
+        {
+            let mut out_arr = out.as_array_mut();
+            if out_arr.as_slice_mut().is_none() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "out must be a C-contiguous array (got a non-contiguous view, \
+                     e.g. from slicing or transposing — call np.ascontiguousarray() first)",
+                ));
+            }
+        }
+
         if self.blocks_buf_many.len() < needed {
             self.blocks_buf_many.resize(needed, [0u8; 32]);
         }
@@ -209,6 +235,7 @@ impl LustroPrngBatchPy {
         py.allow_threads(|| self.inner.fill_blocks_many(buf, steps));
 
         // Stream-major layout matches the C-contiguous output layout.
+        // Re-borrow the output after the GIL is reacquired.
         let mut out_arr = out.as_array_mut();
         let flat = out_arr.as_slice_mut().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(

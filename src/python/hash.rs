@@ -47,7 +47,8 @@ impl LustroHashPy {
         let data_arr = data.as_array();
         let n = data_arr.shape()[0];
 
-        let mut rows: Vec<&[u8]> = Vec::with_capacity(n);
+        // Own copy — can't hold a &[u8] into NumPy's buffer across allow_threads().
+        let mut owned_rows: Vec<Vec<u8>> = Vec::with_capacity(n);
         for r in data_arr.rows() {
             let slice = r.to_slice().ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(
@@ -55,8 +56,9 @@ impl LustroHashPy {
                      e.g. from slicing or transposing — call np.ascontiguousarray() first)",
                 )
             })?;
-            rows.push(slice);
+            owned_rows.push(slice.to_vec());
         }
+        let rows: Vec<&[u8]> = owned_rows.iter().map(|v| v.as_slice()).collect();
 
         let out_arr = PyArray2::<u8>::zeros_bound(py, [n, 32], false);
         {
@@ -86,7 +88,8 @@ impl LustroHashPy {
         let data_arr = data.as_array();
         let n = data_arr.shape()[0];
 
-        let mut rows: Vec<&[u8]> = Vec::with_capacity(n);
+        // Own copy — can't hold a &[u8] into NumPy's buffer across allow_threads().
+        let mut owned_rows: Vec<Vec<u8>> = Vec::with_capacity(n);
         for r in data_arr.rows() {
             let slice = r.to_slice().ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(
@@ -94,8 +97,9 @@ impl LustroHashPy {
                      e.g. from slicing or transposing — call np.ascontiguousarray() first)",
                 )
             })?;
-            rows.push(slice);
+            owned_rows.push(slice.to_vec());
         }
+        let rows: Vec<&[u8]> = owned_rows.iter().map(|v| v.as_slice()).collect();
 
         let out_arr = PyArray2::<u8>::zeros_bound(py, [n, 16], false);
         {
