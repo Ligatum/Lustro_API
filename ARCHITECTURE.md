@@ -318,7 +318,7 @@ These guarantees hold across Rust, Python, and C FFI layers.
   This is distinct from malformed *runtime data* (e.g. corrupt snapshot bytes): 
   for APIs that explicitly validate external input, malformed input is reported through 
   `Result`, `LustroError`, or a null-pointer return, rather than being an intentionally 
-  exposed panic path. See §13 for the FFI panic-strategy caveat (`panic = "abort"` vs `"unwind"`).
+  exposed panic path. All release builds use `panic = "unwind"`; see §13.
 - **Snapshot kind is validated before decoding** — a PRNG snapshot cannot be
   imported as XOF (or vice versa), and a single-stream snapshot cannot be
   imported as a batch (or vice versa). A mismatch returns an error rather than
@@ -710,12 +710,12 @@ Python bindings require `--features python`.
 3. **No hidden generator state** — each PRNG/XOF instance owns its own state.
    The Rayon thread pool used for batch parallelism is shared execution state,
    not generator state.
-4. **FFI panic behavior depends on the panic strategy.** With
-   `panic = "unwind"` (the `release-ffi` profile), the FFI boundary catches
-   Rust panics and returns `LustroError::InternalPanic`. With the default
-   `panic = "abort"` release profile, a panic terminates the process instead.
-   Use `release-ffi` or an equivalent `panic = "unwind"` profile if
-   `InternalPanic` handling is required. Same method applies to Python.
+4. **FFI/Python panic handling.** All release builds use `panic = "unwind"` —
+   the FFI boundary always catches internal panics and returns
+   `LustroError::InternalPanic` (or the matching Python exception) instead
+   of aborting the process. A project using `lustro` as a plain dependency
+   sets its own panic strategy though; this profile only applies when
+   building `lustro` itself.
 5. **Thread safety** — the underlying Rust contexts
    (`LustroPrng`, `LustroPrngBatch`, `LustroXof`, `LustroXofBatch`) provide no
    internal synchronization. Shared handles or objects must not be mutated

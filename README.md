@@ -16,15 +16,15 @@ cargo build --release
 
 # Python
 
-maturin develop --profile release-python
+maturin develop --release
 
-# C/C++ FFI bindings (release-ffi profile — required for panic = "unwind",
-# so that internal panics convert to LustroError::InternalPanic at the FFI
-# boundary instead of just aborting the process; please see ARCHITECTURE.md §13)
+# C/C++ FFI bindings
 
-cargo build --profile release-ffi --features ffi
+cargo build --release --features ffi
 
 ```
+
+All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead just aborting the process. See ARCHITECTURE.md §13.
 
 ## Speed Test and Validation
 

@@ -27,18 +27,10 @@ cbindgen = "0.27"
 opt-level     = 3
 lto           = "fat"
 codegen-units = 1
-panic         = "abort"
+panic         = "unwind"
 strip         = true
 debug         = false
 incremental   = false
-
-[profile.release-python]
-inherits = "release"
-panic    = "unwind"
-
-[profile.release-ffi]
-inherits = "release"
-panic    = "unwind"
 
 [dev-dependencies]
 proptest = "1.4"
