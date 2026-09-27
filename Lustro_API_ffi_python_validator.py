@@ -21,44 +21,42 @@ DLL_PATH = os.path.join(SCRIPT_DIR, "lustro.dll")
 # ================================================================
 
 HASH_VECTORS = [
-    ("empty", b'', "b517c9080d7fe75a2d5d946f83f963669d1496992081a9a099fcdf652e209ce6", "b517c9080d7fe75a2d5d946f83f96366"),
-    ("len1_zero", b'\x00', "4af67eae6cb5cdf0a45a1885a493b52545ab58f99ee3f265d55ae3c983f07c4d", "4af67eae6cb5cdf0a45a1885a493b525"),
-    ("len31_zero", b'\x00' * 31, "27a4f04d79de8509c8948e8b00260f98ad1f80eb9ef5e165f8ee095d3b679eea", "27a4f04d79de8509c8948e8b00260f98"),
-    ("len32_zero", b'\x00' * 32, "842c078ce4c609fc2d9d1a1d37b12ecc9d6a41776b6929a85b9a45d269e23da9", "842c078ce4c609fc2d9d1a1d37b12ecc"),
-    ("len33_zero", b'\x00' * 33, "02f06e3381d2516860f70561db381b9b014b5f748c934e0229c8b3686a008c45", "02f06e3381d2516860f70561db381b9b"),
-    ("len63_zero", b'\x00' * 63, "748e004f95619944586748ae9d7001ddea5dde9eadc7ee76ff1975128d121ede", "748e004f95619944586748ae9d7001dd"),
-    ("len64_zero", b'\x00' * 64, "b81250dbb1da643d8a2260e6a0a716e405ef50dda2611ca457e6f49589d30ac6", "b81250dbb1da643d8a2260e6a0a716e4"),
-    ("len65_zero", b'\x00' * 65, "b97e709e60f31919453f0d5103930a0c78aab7cd1c57bf9f114c43e09c6fcfb2", "b97e709e60f31919453f0d5103930a0c"),
-    ("len32_ff", b'\xff' * 32, "898b88ba5569cc47f28cf5618a808eccbafd2d523efe9b573438e7c2bdaa2af9", "898b88ba5569cc47f28cf5618a808ecc"),
-    ("len32_ascending", bytes(range(32)), "a1dfb31c10cd28712a98eb5122926f55a117f776be90d77460ca3e0e09738e79", "a1dfb31c10cd28712a98eb5122926f55"),
-    ("len64_ascending", bytes(range(32)) + bytes([32 + i for i in range(32)]), "c5d10d1b3871e5172c181a6fdde2a425018c40cd7f8e17c403e918e90756b003", "c5d10d1b3871e5172c181a6fdde2a425"),
+    ('empty', b'', "a16b8377b406d0c43821de103a8054f8df152d9e0ea6cbccdbfd64620007fe8a", "a16b8377b406d0c43821de103a8054f8"),
+    ('len1_zero', b'\x00', "5e8a34d1d5ccfa6eb12652fa1dea82bb0faae3feb0c49009975b48ceadd71e21", "5e8a34d1d5ccfa6eb12652fa1dea82bb"),
+    ('len31_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', "33d8ba32c0a7b297dde8c4f4b95f3806171e3becb0d28309baef425b1540fc86", "33d8ba32c0a7b297dde8c4f4b95f3806"),
+    ('len32_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', "90504df35dbf3e6238e150628ec81952df6afa70454e4bc4199bfed747c55fc5", "90504df35dbf3e6238e150628ec81952"),
+    ('len33_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', "95f07e3d019ecc2b6a273b9bdffe6c4b8e53011d44cff4c22ddbc9bc7ed785d7", "95f07e3d019ecc2b6a273b9bdffe6c4b"),
+    ('len63_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', "56fb9a710715aea351e914806ef7296134e99aaad9dcb381f9cd69124da9255f", "56fb9a710715aea351e914806ef72961"),
+    ('len64_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', "7c201c02a6fe3bd1b88d0ff177493b6f2dec37a5c37dc94fb0e328c38a47f899", "7c201c02a6fe3bd1b88d0ff177493b6f"),
+    ('len65_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', "0a3dfa070d7a4ecbd090e73f25ea179891e83f8bd8d921826d689a0712dd9578", "0a3dfa070d7a4ecbd090e73f25ea1798"),
+    ('len32_ff', b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff', "9df7c2c5ec10fbd9e7f0bf1e33f9b952f8fd965510d9f93b76395cc7938d4895", "9df7c2c5ec10fbd9e7f0bf1e33f9b952"),
+    ('len32_ascending', b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f', "b5a3f963a9b41fef3fe4a12e9beb58cbe3174c7190b7b51822cb850b2754ec15", "b5a3f963a9b41fef3fe4a12e9beb58cb"),
+    ('len64_ascending', b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !"#$%&\'()*+,-./0123456789:;<=>?', "dae7ec4d18e105e5ed35e247f3f4e6a74938509d3ae7925954f82c463075a301", "dae7ec4d18e105e5ed35e247f3f4e6a7"),
 ]
 
 PRNG_VECTORS = [
-    ("seed_zero_stream0_32", b'\x00' * 32, 0, 32, "6ee8ec19b51f03056a5705675d962c17f39602cbe60099ff69bacc7e1a997869"),
-    ("seed_zero_stream0_64", b'\x00' * 32, 0, 64, "6ee8ec19b51f03056a5705675d962c17f39602cbe60099ff69bacc7e1a997869b08750b478760d28c813362b7fe77e0971e2451154decda83360c93b61d30b86"),
-    ("seed_ff_stream1_32", b'\xff' * 32, 1, 32, "d94a37c25905fa92182b72c091dfd927e9ba28d4b5388043017067689b44f4c6"),
-    ("seed_ascending_bigid", bytes(range(32)), 1267650600228229401496703205376, 32, "2e3a743027f5579c7af3d17e7b482c203ecb1b0f85c00dfc32b55c331e0eedf3"),
+    ('seed_zero_stream0_32', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 0, 32, "6ee8ec19b51f03056a5705675d962c17f39602cbe60099ff69bacc7e1a997869"),
+    ('seed_zero_stream0_64', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 0, 64, "6ee8ec19b51f03056a5705675d962c17f39602cbe60099ff69bacc7e1a997869b08750b478760d28c813362b7fe77e0971e2451154decda83360c93b61d30b86"),
+    ('seed_ff_stream1_32', b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff', 1, 32, "d94a37c25905fa92182b72c091dfd927e9ba28d4b5388043017067689b44f4c6"),
+    ('seed_ascending_bigid', b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f', 1267650600228229401496703205376, 32, "2e3a743027f5579c7af3d17e7b482c203ecb1b0f85c00dfc32b55c331e0eedf3"),
 ]
-
-GOLDEN_FINGERPRINT = "e5094cadc17043f4bf30bd66c80d22f0aa36fe6484154ef12950425d8b8016f2"
 
 XOF_VECTORS = [
-    ("empty", b'', 32, "02ad43fd65980f38f1b7534a64021590f6c8ba17d4221ae80aa96270dc6d94a4"),
-    ("len1_zero", b'\x00', 32, "e3910ae86648e8065edc228f173678111a14107e4fab23b8a1c5c07c57c7304f"),
-    ("len31_zero", b'\x00' * 31, 32, "1274c3bdb904b3cdef46fbbecf9d9378e3641b38d29de36c54efb1896a6ddb78"),
-    ("len32_zero", b'\x00' * 32, 32, "6b0d927254ba9817d5ff2ce7d2e8217904a84e42fb0d7860c307c2bb5cedf52a"),
-    ("len32_zero_fill64", b'\x00' * 32, 64, "6b0d927254ba9817d5ff2ce7d2e8217904a84e42fb0d7860c307c2bb5cedf52acd5d20925eb81f6e8ff14059d7b2dd8d916f7487971b3abfeeff94acff569caa"),
-    ("len33_zero", b'\x00' * 33, 32, "1ec0aa786e1e4be1029bd1ddd54c641ae3174625532b7afec557b2ba7a4e1188"),
-    ("len63_zero", b'\x00' * 63, 32, "00129b4a7d25693b76b9ca3efae5d243a476c47a8c216a2735ab0b1871a02272"),
-    ("len64_zero", b'\x00' * 64, 32, "8cfade886a41bae4495e88f385c916879bae62c3dc4389fce4bb02c02d50707d"),
-    ("len65_zero", b'\x00' * 65, 32, "4c0f92d962f0110402d76a0ffc535a23e51edfe0755f20400889634e03be2854"),
-    ("len32_ff", b'\xff' * 32, 32, "3c452b55bf3d2d9edb272126e6f1326ca219153aa28f68984d7927e09fd2a286"),
-    ("len32_ascending", bytes(range(32)), 32, "0c7591015f04ef0cf61c6b0f32d4f78e85e1d149275995820bef8129993e468b"),
-    ("len64_ascending", bytes(range(32)) + bytes([32 + i for i in range(32)]), 32, "8d99025b2ca5001a7bae78306e65c996fbca798372e0fd18e9e93b7deaea5a49"),
+    ('empty', b'', 32, "d7d3ab6d1bd937326071b96af1513a40669c2131ac37e295a794eb02ec3fc306"),
+    ('len1_zero', b'\x00', 32, "539acd0fa45bcb6c447be87a785ae02c5fd0e4a9636b3a43fd6207802ebc6fa8"),
+    ('len31_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 32, "4c532d066b3c80bae0d45c21f05bb6e64150e1889c3fb35c4d0c620a8f28a53e"),
+    ('len32_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 32, "70c6cb2cb6faeec1eda55ac9400b09a3ad0328bb499acc10eef1af0ae4bb3a48"),
+    ('len32_zero_fill64', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 64, "70c6cb2cb6faeec1eda55ac9400b09a3ad0328bb499acc10eef1af0ae4bb3a48dc3b526a628ea5ad2c2de81a5074a4f3d953bea1f5d961187bd4ebcf3a9ec31e"),
+    ('len33_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 32, "37b671c7725c4ac77c082200408a59c2a4ad7c5e3901e9221d81938e47ebb5ea"),
+    ('len63_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 32, "1f21e09b02a99115487c6bc74e6c4e74d9dbd9cb375fc1c344134d12663487c9"),
+    ('len64_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 32, "55e7ac4c8681f9163ff2536733af21dc791bfe5694f17ff7b7e01bd2326915e7"),
+    ('len65_zero', b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', 32, "5d0b291d9150090a2b80f9cf02c593db1aee94c3a75cfbd31d1b9fd9a250bd35"),
+    ('len32_ff', b'\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff', 32, "6ace491af13bcf020198e9e44c9a0d3f0de975800e3ff458007656d5250653b1"),
+    ('len32_ascending', b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f', 32, "e6782c97c70f82530f65c045e7b5797716ae13cd3171dd950ae3c9d76ee7d403"),
+    ('len64_ascending', b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !"#$%&\'()*+,-./0123456789:;<=>?', 32, "5861572fd65f53b1b49977cf1c12abaa6935558d4166a22c4516e0dbdcf2f475"),
 ]
 
-GOLDEN_FINGERPRINT = "fed255a3feb481e86992223866d08312b77f9c0b652056a8ccbb7466fa8aa50b"
+GOLDEN_FINGERPRINT = "d1f2b73d9da371903cc128dbd83b56471908b95a0025b0f809e2fc742c6e044e"
 
 # ================================================================
 # TEST HARNESS
@@ -250,7 +248,7 @@ def main():
             print(f"  - {f}")
         sys.exit(1)
     else:
-        print(f"RESULT: All tests passed. File is a binary match ({', '.join(active.keys())}).")
+        print(f"RESULT: All tests passed. Golden vectors match ({', '.join(active.keys())}).")
     print("=" * width)
 
 

@@ -30,6 +30,8 @@ cargo build --profile release-ffi --features ffi
 
 This repo is the full API implementation and also contains **Lustro_API_ffi_python_validator.py** and **Lustro_API_ffi_base_speed_test.py**. Both scripts require lustro.dll in the same folder. The speed tester works only with C/C++.
 
+Please note that the core mechanism and the API implementation are considered non-cryptographic at this moment.
+
 ---
 
 ## Quick Start

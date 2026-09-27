@@ -107,13 +107,13 @@ XOF:  message → absorption → StreamState → stream_step() → output (state
 **Absorption mechanics** (`absorb_with_domain`, `finalize_terminator`):
 
 - The domain tag is XORed into `s0`, and the encoded bit-length is XORed into `s1`.
-- Input is consumed in 32-byte blocks; each full block is XORed into
-  `(s0, s1)` and passed through `evaluate_scalar`.
+- Input is consumed in 32-byte blocks. Each block is XORed into `(s0, s1)`,
+  evaluated with `evaluate_scalar`, and combined with the previous state using
+  feed-forward.
 - If the input is a non-zero multiple of 32 bytes, no terminator round is performed.
-- Otherwise, the final block is padded with `0x80` followed by zeros and passed
-  through `finalize_terminator`, which performs one additional `evaluate_scalar()`
-  call. If the remaining input is shorter than 16 bytes, `b0` is also XORed into
-  `s1`.
+- Otherwise, the final block is padded with `0x80` followed by zeros and processed
+  with the same feed-forward rule. If the remaining input is shorter than 16 bytes,
+  `b0` is also XORed into `s1`.
 
 **Hash finalization**: `Hash256` is raw `(s0 || s1)` state as 32
 little-endian bytes; `Hash128` serializes only `s0` — see

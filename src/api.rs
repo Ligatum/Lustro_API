@@ -56,7 +56,7 @@ pub(crate) fn fork_lane(s0: u128, s1: u128, domain: u128, id: u128) -> (u128, u1
 // INTERNAL HASH API
 // ==========================================
 
-// Absorbs 32-byte blocks with domain and bit-length separation.
+// Absorbs 32-byte blocks with feed-forward.
 // Partial input is terminated with 0x80 and zero-padded.
 #[inline]
 pub(crate) fn absorb_with_domain(data: &[u8], domain: u128) -> (u128, u128) {
@@ -73,9 +73,11 @@ pub(crate) fn absorb_with_domain(data: &[u8], domain: u128) -> (u128, u128) {
     for block in chunks {
         let b0 = u128::from_le_bytes(block[..16].try_into().unwrap());
         let b1 = u128::from_le_bytes(block[16..].try_into().unwrap());
-        s0 ^= b0;
-        s1 ^= b1;
-        (s0, s1) = evaluate_scalar(s0, s1);
+        let prev0 = s0;
+        let prev1 = s1;
+        let (y0, y1) = evaluate_scalar(s0 ^ b0, s1 ^ b1);
+        s0 = y0 ^ prev0;
+        s1 = y1 ^ prev1;
     }
 
     // Length is already committed; no terminator round is needed.
@@ -86,8 +88,8 @@ pub(crate) fn absorb_with_domain(data: &[u8], domain: u128) -> (u128, u128) {
     finalize_terminator(s0, s1, remainder)
 }
 
-// Absorbs the final partial block with 0x80 termination and zero-padding.
-fn finalize_terminator(mut s0: u128, mut s1: u128, remainder: &[u8]) -> (u128, u128) {
+// Absorbs the final partial block with feed-forward.
+fn finalize_terminator(s0: u128, s1: u128, remainder: &[u8]) -> (u128, u128) {
     debug_assert!(
         remainder.len() < 32,
         "finalize_terminator: remainder must be a partial block"
@@ -96,13 +98,13 @@ fn finalize_terminator(mut s0: u128, mut s1: u128, remainder: &[u8]) -> (u128, u
     buf[..remainder.len()].copy_from_slice(remainder);
     buf[remainder.len()] = 0x80;
     let b0 = u128::from_le_bytes(buf[..16].try_into().unwrap());
-    let b1 = u128::from_le_bytes(buf[16..].try_into().unwrap());
-    s0 ^= b0;
-    s1 ^= b1;
+    let mut b1 = u128::from_le_bytes(buf[16..].try_into().unwrap());
+    // Fold low-half terminator into the high half.
     if remainder.len() < 16 {
-        s1 ^= b0;
+        b1 ^= b0;
     }
-    evaluate_scalar(s0, s1)
+    let (y0, y1) = evaluate_scalar(s0 ^ b0, s1 ^ b1);
+    (y0 ^ s0, y1 ^ s1)
 }
 
 // Hashes independent messages using scalar or parallel dispatch.
