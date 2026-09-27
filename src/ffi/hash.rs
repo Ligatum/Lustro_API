@@ -204,13 +204,9 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
         Some(v) => v,
         None => return LustroError::InvalidLength,
     };
-    if buf_out(out_ptr, total_out).is_none() {
-        return LustroError::InvalidPointer;
-    }
 
-    // The pointer/length tables themselves are readable memory too — out
-    // must not alias them, or we'd hold shared and mutable refs to the
-    // same bytes at once.
+    // Check overlap against the ptrs/lens tables before creating
+    // a mutable slice over the output buffer.
     let ptrs_len = match n.checked_mul(std::mem::size_of::<*const u8>()) {
         Some(v) => v,
         None => return LustroError::InvalidLength,
@@ -238,6 +234,10 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
         Some(true) => return LustroError::InvalidPointer,
         Some(false) => {}
         None => return LustroError::InvalidLength,
+    }
+
+    if buf_out(out_ptr, total_out).is_none() {
+        return LustroError::InvalidPointer;
     }
 
     let ptrs = std::slice::from_raw_parts(message_ptrs, n);
@@ -290,13 +290,9 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
         Some(v) => v,
         None => return LustroError::InvalidLength,
     };
-    if buf_out(out_ptr, total_out).is_none() {
-        return LustroError::InvalidPointer;
-    }
 
-    // The pointer/length tables themselves are readable memory too — out
-    // must not alias them, or we'd hold shared and mutable refs to the
-    // same bytes at once.
+    // Check overlap against the ptrs/lens tables before creating
+    // a mutable slice over the output buffer.
     let ptrs_len = match n.checked_mul(std::mem::size_of::<*const u8>()) {
         Some(v) => v,
         None => return LustroError::InvalidLength,
@@ -324,6 +320,10 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
         Some(true) => return LustroError::InvalidPointer,
         Some(false) => {}
         None => return LustroError::InvalidLength,
+    }
+
+    if buf_out(out_ptr, total_out).is_none() {
+        return LustroError::InvalidPointer;
     }
 
     let ptrs = std::slice::from_raw_parts(message_ptrs, n);
