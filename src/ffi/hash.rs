@@ -1,6 +1,6 @@
 //! FFI bindings for Lustro Hash.
 
-use super::types::{buf_in, buf_out};
+use super::types::{buf_in, buf_out, ranges_overlap};
 use crate::errors::LustroError;
 use crate::hash::{hash128, hash256};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -17,6 +17,11 @@ pub unsafe extern "C" fn lustro_hash256(
     data_len: usize,
     out: *mut u8,
 ) -> LustroError {
+    match ranges_overlap(data, data_len, out as *const u8, 32) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
     let input = match buf_in(data, data_len) {
         Some(s) => s,
         None => return LustroError::InvalidPointer,
@@ -42,6 +47,11 @@ pub unsafe extern "C" fn lustro_hash128(
     data_len: usize,
     out: *mut u8,
 ) -> LustroError {
+    match ranges_overlap(data, data_len, out as *const u8, 16) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
     let input = match buf_in(data, data_len) {
         Some(s) => s,
         None => return LustroError::InvalidPointer,
@@ -83,6 +93,12 @@ pub unsafe extern "C" fn lustro_hash256_many(
         Some(v) => v,
         None => return LustroError::InvalidLength,
     };
+
+    match ranges_overlap(data_ptr, total_in, out_ptr as *const u8, total_out) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
 
     let data = match buf_in(data_ptr, total_in) {
         Some(s) => s,
@@ -132,6 +148,12 @@ pub unsafe extern "C" fn lustro_hash128_many(
         Some(v) => v,
         None => return LustroError::InvalidLength,
     };
+
+    match ranges_overlap(data_ptr, total_in, out_ptr as *const u8, total_out) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
 
     let data = match buf_in(data_ptr, total_in) {
         Some(s) => s,
@@ -186,11 +208,48 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
         return LustroError::InvalidPointer;
     }
 
+    // The pointer/length tables themselves are readable memory too — out
+    // must not alias them, or we'd hold shared and mutable refs to the
+    // same bytes at once.
+    let ptrs_len = match n.checked_mul(std::mem::size_of::<*const u8>()) {
+        Some(v) => v,
+        None => return LustroError::InvalidLength,
+    };
+    let lens_len = match n.checked_mul(std::mem::size_of::<usize>()) {
+        Some(v) => v,
+        None => return LustroError::InvalidLength,
+    };
+    match ranges_overlap(
+        message_ptrs as *const u8,
+        ptrs_len,
+        out_ptr as *const u8,
+        total_out,
+    ) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
+    match ranges_overlap(
+        message_lens as *const u8,
+        lens_len,
+        out_ptr as *const u8,
+        total_out,
+    ) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
+
     let ptrs = std::slice::from_raw_parts(message_ptrs, n);
     let lens = std::slice::from_raw_parts(message_lens, n);
 
     let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
     for i in 0..n {
+        match ranges_overlap(ptrs[i], lens[i], out_ptr as *const u8, total_out) {
+            Some(true) => return LustroError::InvalidPointer,
+            Some(false) => {}
+            None => return LustroError::InvalidLength,
+        }
         match buf_in(ptrs[i], lens[i]) {
             Some(m) => messages.push(m),
             None => return LustroError::InvalidPointer,
@@ -235,11 +294,48 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
         return LustroError::InvalidPointer;
     }
 
+    // The pointer/length tables themselves are readable memory too — out
+    // must not alias them, or we'd hold shared and mutable refs to the
+    // same bytes at once.
+    let ptrs_len = match n.checked_mul(std::mem::size_of::<*const u8>()) {
+        Some(v) => v,
+        None => return LustroError::InvalidLength,
+    };
+    let lens_len = match n.checked_mul(std::mem::size_of::<usize>()) {
+        Some(v) => v,
+        None => return LustroError::InvalidLength,
+    };
+    match ranges_overlap(
+        message_ptrs as *const u8,
+        ptrs_len,
+        out_ptr as *const u8,
+        total_out,
+    ) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
+    match ranges_overlap(
+        message_lens as *const u8,
+        lens_len,
+        out_ptr as *const u8,
+        total_out,
+    ) {
+        Some(true) => return LustroError::InvalidPointer,
+        Some(false) => {}
+        None => return LustroError::InvalidLength,
+    }
+
     let ptrs = std::slice::from_raw_parts(message_ptrs, n);
     let lens = std::slice::from_raw_parts(message_lens, n);
 
     let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
     for i in 0..n {
+        match ranges_overlap(ptrs[i], lens[i], out_ptr as *const u8, total_out) {
+            Some(true) => return LustroError::InvalidPointer,
+            Some(false) => {}
+            None => return LustroError::InvalidLength,
+        }
         match buf_in(ptrs[i], lens[i]) {
             Some(m) => messages.push(m),
             None => return LustroError::InvalidPointer,
