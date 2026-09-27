@@ -428,11 +428,12 @@ let mut restored = LustroPrng::import_snapshot(snapshot2);  // infallible
 **Parameter Types**
 
 Unless otherwise noted, scalar parameters for functions not listed here are
-plain Python `int`/`bool` with no shape or dtype constraints. (Return values
-vary by function — e.g. `next_block()` returns `bytes`, `hash256_many()`
-returns a NumPy array; see the function tables above.) NumPy array
-*parameters* are required only where noted below — all must be C-contiguous
-or the call raises `ValueError`.
+plain Python `int`/`bool` with no shape or dtype constraints. Return values
+vary by function — e.g. `next_u64()`/`next_u128()` return Python `int`,
+`next_block()` returns `bytes`, `hash256_many()` returns a NumPy array;
+see the function tables above. NumPy array *parameters* are required only
+where noted below — all must be C-contiguous (else `ValueError`) and match the
+stated dtype (else `TypeError`, raised before the array reaches Rust code).
 
 | Function | Parameter | Expected type |
 |---|---|---|
