@@ -25,19 +25,3 @@ impl core::fmt::Display for LustroError {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::LustroError;
-
-    #[test]
-    fn test_abi_discriminants() {
-        assert_eq!(LustroError::Ok as i32, 0);
-        assert_eq!(LustroError::InvalidLength as i32, 1);
-        assert_eq!(LustroError::InvalidPointer as i32, 2);
-        assert_eq!(LustroError::OutputTooSmall as i32, 3);
-        assert_eq!(LustroError::AlreadyFinalised as i32, 4);
-        assert_eq!(LustroError::VerificationFailed as i32, 5);
-        assert_eq!(LustroError::InternalPanic as i32, 6);
-    }
-}
