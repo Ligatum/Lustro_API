@@ -30,8 +30,7 @@ All release builds catch internal panics and convert them to `LustroError::Inter
 
 ## Speed Test and Validation
 
-This repo is the full API implementation and also contains **Lustro_Golden_Vectors_Validator.py**. The script requires C FFI lustro.dll in the same folder.
-Note: Speed tester will be added back in shortly. I am currently working on the refactor.
+This repo is the full API implementation and also contains **Lustro_Golden_Vectors_Validator.py** along with **Lustro_Speed_Tester.py**. These scripts requires C FFI lustro.dll in the same folder.
 
 Please note that the core mechanism and the API implementation are considered non-cryptographic at this moment.
 

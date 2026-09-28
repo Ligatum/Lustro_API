@@ -15,7 +15,7 @@ const MT_THRESHOLD_MESSAGES: usize = 1664;
 const MT_THRESHOLD_BYTES: usize = 64 * 1024;
 
 // STREAM CHUNK SIZE (lanes per worker; keep a multiple of 16 for SIMD)
-const PARALLEL_CHUNK_STATES: usize = 288;
+const PARALLEL_CHUNK_STATES: usize = 64;
 const _: () = assert!(PARALLEL_CHUNK_STATES.is_multiple_of(16));
 
 // STREAM THRESHOLD (lanes * steps)
