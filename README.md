@@ -1,5 +1,7 @@
 # Lustro API
 
+Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
+
 ## Clone
 
 ```bash
@@ -28,7 +30,8 @@ All release builds catch internal panics and convert them to `LustroError::Inter
 
 ## Speed Test and Validation
 
-This repo is the full API implementation and also contains **Lustro_API_ffi_python_validator.py** and **Lustro_API_ffi_base_speed_test.py**. Both scripts require lustro.dll in the same folder. The speed tester works only with C/C++.
+This repo is the full API implementation and also contains **Lustro_Golden_Vectors_Validator.py**. The script requires C FFI lustro.dll in the same folder.
+Note: Speed tester will be added back in shortly. I am currently working on the refactor.
 
 Please note that the core mechanism and the API implementation are considered non-cryptographic at this moment.
 
@@ -156,8 +159,9 @@ let seed = Seed256::from_bytes([0u8; 32]);
 let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
 let mut prng = LustroPrngBatch::new(&seed, &ids);
 
-let mut prng_out = vec![[0u8; 32]; prng.len()];
-prng.fill_blocks(&mut prng_out);
+let steps = 2;
+let mut prng_out = vec![[0u8; 32]; prng.len() * steps];
+prng.fill_blocks(&mut prng_out, steps);
 
 let messages = [
     b"msg0".as_ref(),
@@ -166,8 +170,8 @@ let messages = [
 ];
 
 let mut xof = LustroXofBatch::new(&messages);
-let mut xof_out = vec![[0u8; 32]; xof.len()];
-xof.fill_blocks(&mut xof_out);
+let mut xof_out = vec![[0u8; 32]; xof.len() * steps];
+xof.fill_blocks(&mut xof_out, steps);
 ```
 
 **Python**
@@ -178,16 +182,18 @@ from lustro import LustroPrngBatchPy, LustroXofBatchPy
 
 seed = bytes(32)
 
+steps = 2
+
 prng = LustroPrngBatchPy.new(seed, [0, 1, 2, 3])
-prng_out = np.empty((prng.len(), 4), dtype=np.uint64)
-prng.fill_blocks(prng_out)
+prng_out = np.empty((steps, prng.len(), 4), dtype=np.uint64)
+prng.fill_blocks(prng_out, steps)
 
 xof = LustroXofBatchPy.new([b"msg0", b"msg1", b"msg2"])
-xof_out = np.empty((xof.len(), 4), dtype=np.uint64)
-xof.fill_blocks(xof_out)
+xof_out = np.empty((steps, xof.len(), 4), dtype=np.uint64)
+xof.fill_blocks(xof_out, steps)
 ```
 
-`fill_blocks()` writes one 32-byte block per stream. In Python, each block is represented as four `uint64` values.
+`fill_blocks(out, steps)` writes one 32-byte block per stream per step, step-major: stream `i` at step `s` is block `s * n + i` (`n` = number of streams). In Python that is `out[s, i]`, with `out` shaped `(steps, n_streams, 4)`; each block is four `uint64` values.
 
 **C / C++**
 
@@ -202,9 +208,11 @@ uint64_t ids_lo[4] = {0, 1, 2, 3};
 LustroPrngBatch *prng =
     lustro_prng_batch_new(seed, ids_hi, ids_lo, 4);
 
-uint8_t prng_out[4][32];
+#define STEPS 2
+
+uint8_t prng_out[STEPS][4][32];
 lustro_prng_batch_fill_blocks(
-    prng, (uint8_t *)prng_out, sizeof(prng_out)
+    prng, (uint8_t *)prng_out, sizeof(prng_out), STEPS
 );
 
 const uint8_t *messages[] = {
@@ -218,9 +226,9 @@ uintptr_t lengths[] = {4, 4, 4};
 LustroXofBatch *xof =
     lustro_xof_batch_new(messages, lengths, 3);
 
-uint8_t xof_out[3][32];
+uint8_t xof_out[STEPS][3][32];
 lustro_xof_batch_fill_blocks(
-    xof, (uint8_t *)xof_out, sizeof(xof_out)
+    xof, (uint8_t *)xof_out, sizeof(xof_out), STEPS
 );
 
 lustro_xof_batch_free(xof);

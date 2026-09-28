@@ -3,7 +3,7 @@
 
 use crate::api::{absorb_with_domain, fork_lane, StreamState};
 use crate::constants::Domain;
-use crate::dispatch::{dispatch_streams, dispatch_streams_many, StreamLane};
+use crate::dispatch::{dispatch_streams, StreamLane};
 use crate::types::{LustroXofBatchSnapshot, LustroXofSnapshot, StreamId};
 
 // ==========================================
@@ -107,31 +107,20 @@ impl LustroXofBatch {
         self.streams.is_empty()
     }
 
-    // Fills `out` with one block per stream in lockstep.
-    // Stream order is preserved.
-    pub fn fill_blocks(&mut self, out: &mut [[u8; 32]]) {
-        assert_eq!(
-            out.len(),
-            self.streams.len(),
-            "fill_blocks: output buffer length must match batch stream count"
-        );
-        dispatch_streams(&mut self.streams, out);
-    }
-
     // Fills `out` with `steps` blocks per stream.
-    // Output is stream-major and preserves stream order.
-    pub fn fill_blocks_many(&mut self, out: &mut [[u8; 32]], steps: usize) {
+    // Output is step-major: `out[step * len() + lane]`.
+    pub fn fill_blocks(&mut self, out: &mut [[u8; 32]], steps: usize) {
         let expected = self
             .streams
             .len()
             .checked_mul(steps)
-            .expect("fill_blocks_many: n_streams * steps overflows usize");
+            .expect("fill_blocks: n_streams * steps overflows usize");
         assert_eq!(
             out.len(),
             expected,
-            "fill_blocks_many: out length must equal len() * steps"
+            "fill_blocks: out length must equal len() * steps"
         );
-        dispatch_streams_many(&mut self.streams, out, steps);
+        dispatch_streams(&mut self.streams, out, steps);
     }
 
     // Derives one child stream per lane using the corresponding identifier.
@@ -190,7 +179,8 @@ impl LustroXofBatch {
 
     // Restores a batch from a snapshot.
     pub fn import_snapshot(snapshot: LustroXofBatchSnapshot) -> Self {
-        let streams = snapshot.into_lanes()
+        let streams = snapshot
+            .into_lanes()
             .into_iter()
             .map(|(s0, s1, step)| StreamLane { s0, s1, step })
             .collect();

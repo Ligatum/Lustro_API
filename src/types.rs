@@ -150,7 +150,12 @@ impl LustroPrngSnapshot {
     #[inline]
     pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
         let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Prng)?;
-        Ok(Self { s0, s1, step, cursor })
+        Ok(Self {
+            s0,
+            s1,
+            step,
+            cursor,
+        })
     }
 }
 
@@ -190,7 +195,12 @@ impl LustroXofSnapshot {
     #[inline]
     pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
         let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Xof)?;
-        Ok(Self { s0, s1, step, cursor })
+        Ok(Self {
+            s0,
+            s1,
+            step,
+            cursor,
+        })
     }
 }
 

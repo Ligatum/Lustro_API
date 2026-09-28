@@ -163,8 +163,7 @@ This is the shared mechanism behind stream initialization (PRNG) and forking (PR
 |---|---|
 | `dispatch_hash256_batch_into` | 256-bit batch evaluation using either the scalar or Rayon path, selected by workload. Writes directly into caller-provided `&mut [[u8;32]]`. |
 | `dispatch_hash128_batch_into` | Same scalar/parallel split as the 256-bit variant. It simply omits `s1` serialization. |
-| `dispatch_streams` | Lockstep single-step block generation for N independent `StreamLane`s. Scalar or Rayon-parallel path depends on workload size. |
-| `dispatch_streams_many` | Multi-step block generation — advances each lane by `steps`. Output is stream-major and the shared Rayon pool is reused for parallel dispatches. |
+| `dispatch_streams` | Advances N independent `StreamLane`s by `steps` rounds each. Output is step-major: `out[step * n + lane]`. Scalar or Rayon path depends on workload size; parallel workers own disjoint lane ranges and run them through all steps. |
 
 Threshold values between scalar and parallel execution are listed in [§9 Execution Policy](#9-execution-policy).
 
@@ -211,13 +210,24 @@ As a result, batch has no `next_u64()`-style API and its snapshot format has no 
 | Component | Purpose / API |
 |---|---|
 | `StreamLane` | Minimal per-lane state layout `(s0, s1, step)`. |
-| `LustroPrngBatch` | Multi-stream execution context over a shared seed. `new()` — explicit stream IDs; `new_range()` — sequential stream IDs; `fill_blocks()` / `fill_blocks_many()` — write directly into caller-provided output via the dispatcher; `len()` / `is_empty()` — batch geometry. |
-| `LustroXofBatch` | Multi-stream execution context derived from independently absorbed messages. Same `fill_blocks()` / `fill_blocks_many()` / `len()` / `is_empty()` surface as `LustroPrngBatch`; `new(messages)` absorbs each message independently before dispatch. |
+| `LustroPrngBatch` | Multi-stream execution context over a shared seed. `new()` — explicit stream IDs; `new_range()` — sequential stream IDs; `fill_blocks(out, steps)` — advances every lane by `steps` rounds, writing directly into caller-provided output via the dispatcher; `len()` / `is_empty()` — batch geometry. |
+| `LustroXofBatch` | Multi-stream execution context derived from independently absorbed messages. Same `fill_blocks()` / `len()` / `is_empty()` surface as `LustroPrngBatch`; `new(messages)` absorbs each message independently before dispatch. |
 
-`fill_blocks()` / `fill_blocks_many()` write directly into caller-provided
-output and perform no per-call heap allocation.
+`fill_blocks()` writes directly into caller-provided output and performs no
+per-call heap allocation.
 The Rayon thread pool is initialized lazily on the first parallel dispatch
 and reused afterwards.
+
+### Output Layout
+
+Batch output is step-major. With `n` lanes and `steps` rounds, the block of
+lane `i` at step `s` is `out[s * n + i]`:
+
+```text
+out[0 .. n]       step 0: lane 0 … lane n-1
+out[n .. 2n]      step 1: lane 0 … lane n-1
+…
+```
 
 ---
 
@@ -253,14 +263,10 @@ Hash parallelization
   message-count threshold:  1664 messages
   total-byte threshold:     64 KiB
 
-Stream parallelization (single-step, fill_blocks)
-  stream-count threshold:   1536 streams
-  parallel chunk size:      288 lanes
-
-Multi-step stream parallelization (fill_blocks_many)
+Stream parallelization (fill_blocks)
   work-size threshold:      1536 (lanes × steps)
   minimum chunk count:      2
-  parallel chunk size:      34 lanes
+  parallel chunk size:      288 lanes
 ```
 
 The current thresholds were tuned on an Intel i5-11600K.
@@ -306,10 +312,11 @@ These guarantees hold across Rust, Python, and C FFI layers.
 ### Batch semantics
 
 - Batch operations preserve lane/stream order end to end.
-- `fill_blocks_many()` uses stream-major output: all requested blocks for
-  lane 0, then all blocks for lane 1, and so on. This differs from
-  calling `fill_blocks()` repeatedly, which advances every lane in lockstep
-  and produces lane-major blocks per call. These two are not interchangeable output layouts.
+- `fill_blocks(out, steps)` output is step-major: all lanes for step 0, then
+  all lanes for step 1, and so on (`out[step * n + lane]`).
+- Consecutive calls concatenate: `steps = a` followed by `steps = b` yields the
+  same blocks and the same final state as one call with `steps = a + b`.
+- `steps = 0` is a no-op; state is unchanged.
 
 ### API robustness semantics
 
@@ -355,9 +362,9 @@ below.
 | API Version | `lustro_api_version()` |
 | Hash | `hash256(message)`, `hash128(message)`, `hash256_many(messages)`, `hash128_many(messages)`, `hash256_many_into(messages, out)`, `hash128_many_into(messages, out)` |
 | `LustroPrng` | `new(seed, stream_id)`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `fork(id)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
-| `LustroPrngBatch` | `new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `len()`, `is_empty()`, `fill_blocks(out)`, `fill_blocks_many(out, steps)`, `fork(ids)`, `fork_range(first)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
+| `LustroPrngBatch` | `new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
 | `LustroXof` | `new(message)`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `fork(id)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
-| `LustroXofBatch` | `new(messages)`, `len()`, `is_empty()`, `fill_blocks(out)`, `fill_blocks_many(out, steps)`, `fork(ids)`, `fork_range(first)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
+| `LustroXofBatch` | `new(messages)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
 
 **Types**
 
@@ -392,8 +399,7 @@ mismatches, which are handled with Rust panics.
 | `LustroPrngSnapshot::from_le_bytes`, `LustroXofSnapshot::from_le_bytes`, `LustroPrngBatchSnapshot::from_le_bytes`, `LustroXofBatchSnapshot::from_le_bytes` | Returns `Result<Self, SnapshotError>`. |
 | `Hash128::try_from`, `Hash256::try_from`, `Seed256::try_from` (via `TryFrom<&[u8]>`) | Returns `Result<Self, TryFromSliceError>` on wrong-length input. |
 | `hash256_many_into` / `hash128_many_into` | Panics if `messages.len() != out.len()`. |
-| `LustroPrngBatch::fill_blocks` / `LustroXofBatch::fill_blocks` | Panics if `out.len() != len()`. |
-| `LustroPrngBatch::fill_blocks_many` / `LustroXofBatch::fill_blocks_many` | Panics if `out.len() != len() * steps` (or on `usize` overflow). |
+| `LustroPrngBatch::fill_blocks` / `LustroXofBatch::fill_blocks` | Panics if `out.len() != len() * steps` (or on `usize` overflow). |
 | `LustroPrngBatch::fork` / `LustroXofBatch::fork` | Panics if `ids.len() != len()`. |
 | Everything else (`new`, `next_*`, `fill_bytes`, single-stream `fork`, `clone`, `export_snapshot`, `import_snapshot(snapshot)`, `fork_range`, `hash256`, `hash128`, `hash256_many`, `hash128_many`) | Infallible — always succeeds for valid Rust-typed arguments. |
 
@@ -421,9 +427,9 @@ let mut restored = LustroPrng::import_snapshot(snapshot2);  // infallible
 | API Version | `lustro_api_version()` |
 | `LustroHashPy` | `hash256(message)`, `hash128(message)`, `hash256_many(messages)`, `hash128_many(messages)` |
 | `LustroPrngPy` | `new(seed, stream_id)`, `next_u64()`, `next_u128()`, `next_block()`, `fill(size)`, `fill_into(buf)`, `clone_rng()`, `fork(id)`, `export_snapshot()`, `import_snapshot(bytes)` |
-| `LustroPrngBatchPy` | `new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `len()`, `is_empty()`, `fill_blocks(out)`, `fill_blocks_many(steps, out)`, `fork(ids)`, `fork_range(first)`, `export_snapshot()`, `import_snapshot(bytes)` |
+| `LustroPrngBatchPy` | `new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `export_snapshot()`, `import_snapshot(bytes)` |
 | `LustroXofPy` | `new(message)`, `next_u64()`, `next_u128()`, `next_block()`, `fill(size)`, `fill_into(buf)`, `clone_xof()`, `fork(id)`, `export_snapshot()`, `import_snapshot(bytes)` |
-| `LustroXofBatchPy` | `new(messages)`, `len()`, `is_empty()`, `fill_blocks(out)`, `fill_blocks_many(steps, out)`, `fork(ids)`, `fork_range(first)`, `export_snapshot()`, `import_snapshot(bytes)` |
+| `LustroXofBatchPy` | `new(messages)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `export_snapshot()`, `import_snapshot(bytes)` |
 
 **Parameter Types**
 
@@ -449,18 +455,19 @@ stated dtype (else `TypeError`, raised before the array reaches Rust code).
 | `LustroPrngPy.import_snapshot(bytes)` | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
 | `LustroPrngBatchPy.new(seed, stream_ids)` | `stream_ids` | Python `list[int]` (staticmethod) |
 | `LustroPrngBatchPy.new_range(seed, first_stream_id, count)` | `first_stream_id`, `count` | Python `int`, Python `int` (staticmethod) |
-| `LustroPrngBatchPy.fill_blocks(out)` | `out` | `numpy.ndarray`, shape `(n, 4)`, dtype `uint64`, `n == batch.len()` |
-| `LustroPrngBatchPy.fill_blocks_many(steps, out)` | `out` | `numpy.ndarray`, shape `(n, steps, 4)`, dtype `uint64` |
+| `LustroPrngBatchPy.fill_blocks(out, steps)` | `out`, `steps` | `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == batch.len()`; Python `int` |
 | `LustroPrngBatchPy.fork(ids)` | `ids` | Python `list[int]`, `len(ids) == batch.len()` |
 | `LustroXofPy(message)` | `message` | Python `bytes`, any length (including empty) |
 | `LustroXofBatchPy.new(messages)` | `messages` | Python `list[bytes]` — **not** numpy; each element independently sized (staticmethod) |
+| `LustroXofBatchPy.fill_blocks(out, steps)` | `out`, `steps` | `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == batch.len()`; Python `int` |
+| `LustroXofBatchPy.fork(ids)` | `ids` | Python `list[int]`, `len(ids) == batch.len()` |
 
 **Python-Specific Notes**
 
 - The following methods release the GIL while the underlying Rust computation
   runs (`py.allow_threads`), allowing other Python threads to run concurrently:
   `LustroHashPy.hash256`/`hash128`, `hash256_many`/`hash128_many`; `LustroPrngPy`/`LustroXofPy.fill`;
-  `LustroPrngBatchPy`/`LustroXofBatchPy.fill_blocks`/`fill_blocks_many`. **`fill_into()` 
+  `LustroPrngBatchPy`/`LustroXofBatchPy.fill_blocks`. **`fill_into()` 
   does not release the GIL** — it writes into the caller's `bytearray` through an `unsafe` 
   borrow; the GIL prevents concurrent resize or drop of the buffer.
 - `import_snapshot(bytes)` raises `ValueError` on malformed input (wrong
@@ -481,8 +488,9 @@ import numpy as np
 from lustro import LustroPrngBatchPy
 
 batch = LustroPrngBatchPy.new_range(seed, 0, 4)
-out = np.empty((batch.len(), 4), dtype=np.uint64)
-batch.fill_blocks(out)
+steps = 2
+out = np.empty((steps, batch.len(), 4), dtype=np.uint64)
+batch.fill_blocks(out, steps)
 ```
 
 ---
@@ -499,9 +507,9 @@ C ABI exported through `extern "C"` functions, compatible with C and C++.
 | Hash | `lustro_hash256(data, data_len, out)`, `lustro_hash128(data, data_len, out)` |
 | Hash Batch | `lustro_hash256_many(data_ptr, n, message_len, out_ptr)`, `lustro_hash128_many(data_ptr, n, message_len, out_ptr)`, `lustro_hash256_many_var(message_ptrs, n, message_lens, out_ptr)`, `lustro_hash128_many_var(message_ptrs, n, message_lens, out_ptr)` |
 | PRNG | `lustro_prng_new(seed, stream_id_hi, stream_id_lo)`, `_free`, `_clone`, `_fill(out, out_len)`, `_next_u64`, `_next_u128`, `_next_block`, `_fork(id_hi, id_lo)`, `_export_snapshot(out)`, `_import_snapshot(bytes)` |
-| PRNG Batch | `lustro_prng_batch_new(seed, ids_hi, ids_lo, n)`, `_new_range(seed, first_hi, first_lo, count)`, `_free`, `_len`, `_fill_blocks(out, out_len)`, `_fill_blocks_many(out, out_len, steps)`, `_fork(ids_hi, ids_lo, n)`, `_fork_range(first_hi, first_lo)`, `_snapshot_size`, `_export_snapshot(out, out_len)`, `_import_snapshot(bytes, len)` |
+| PRNG Batch | `lustro_prng_batch_new(seed, ids_hi, ids_lo, n)`, `_new_range(seed, first_hi, first_lo, count)`, `_free`, `_len`, `_fill_blocks(out, out_len, steps)`, `_fork(ids_hi, ids_lo, n)`, `_fork_range(first_hi, first_lo)`, `_snapshot_size`, `_export_snapshot(out, out_len)`, `_import_snapshot(bytes, len)` |
 | XOF | `lustro_xof_new(message, message_len)`, `_free`, `_clone`, `_fill(out, out_len)`, `_next_u64`, `_next_u128`, `_next_block`, `_fork(id_hi, id_lo)`, `_export_snapshot(out)`, `_import_snapshot(bytes)` |
-| XOF Batch | `lustro_xof_batch_new(message_ptrs, message_lens, n)`, `_free`, `_len`, `_fill_blocks(out, out_len)`, `_fill_blocks_many(out, out_len, steps)`, `_fork(ids_hi, ids_lo, n)`, `_fork_range(first_hi, first_lo)`, `_snapshot_size`, `_export_snapshot(out, out_len)`, `_import_snapshot(bytes, len)` |
+| XOF Batch | `lustro_xof_batch_new(message_ptrs, message_lens, n)`, `_free`, `_len`, `_fill_blocks(out, out_len, steps)`, `_fork(ids_hi, ids_lo, n)`, `_fork_range(first_hi, first_lo)`, `_snapshot_size`, `_export_snapshot(out, out_len)`, `_import_snapshot(bytes, len)` |
 
 `fork_range(ctx, first_hi, first_lo)` variants do not take a count. They
 derive `ctx.len()` children with sequential IDs starting at `first`, equivalent
@@ -578,8 +586,7 @@ Output buffers:
 | `*_next_u128` | `out` | 16 bytes |
 | `*_next_block` | `out` | 32 bytes |
 | `*_export_snapshot` (single-context, PRNG/XOF) | `out` | 56 bytes |
-| `*_batch_fill_blocks` | `out` | `n_lanes × 32` bytes — matches `sizeof(...)` on a `[n][32]` array, as in the README batch example |
-| `*_batch_fill_blocks_many` | `out` | `n_lanes × steps × 32` bytes |
+| `*_batch_fill_blocks` | `out` | `n_lanes × steps × 32` bytes — matches `sizeof(...)` on a `[steps][n][32]` array, as in the README batch example |
 | `*_batch_export_snapshot` | `out` | `16 + n_lanes × 48` bytes — call `*_batch_snapshot_size(ctx)` first |
 
 Input buffers:
@@ -607,8 +614,9 @@ make every pointer argument optional; only array/data pointers whose length
 is determined by `n` may be `NULL`:
 
 - **`LustroError`-returning functions** (`*_many`, `*_many_var`,
-  `*_batch_fill_blocks*`): with `n == 0`, the function returns
-  `LustroError::Ok` without dereferencing the `n`-sized data/output pointers.
+  `*_batch_fill_blocks`): with `n == 0` (or `steps == 0` for
+  `*_batch_fill_blocks`), the function returns `LustroError::Ok` without
+  dereferencing the data/output pointers.
   Those pointers may be `NULL`. For `n > 0`, a required `NULL` pointer returns
   `InvalidPointer`.
 - **Batch constructors and batch fork operations** (`*_batch_new`,
@@ -693,9 +701,8 @@ Python bindings require `--features python`.
 - `*_next_u128` writes 16 raw little-endian bytes from the same stream as
   `*_fill`.
 - `*_fill` and `*_batch_fill_blocks` preserve the concatenation guarantee from
-  §10. `*_batch_fill_blocks_many` uses stream-major output, so matching it
-  against repeated `*_batch_fill_blocks` calls requires reordering the latter's
-  output first.
+  §10. Batch output is step-major, so consecutive `*_batch_fill_blocks` calls
+  concatenate directly.
 - `*_import_snapshot` returns `NULL` for malformed input. Rust and Python
   report the same errors through `SnapshotError` and the corresponding Python
   exception.

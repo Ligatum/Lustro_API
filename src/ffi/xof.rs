@@ -257,47 +257,12 @@ pub unsafe extern "C" fn lustro_xof_batch_len(ctx: *const LustroXofBatch) -> usi
     (*ctx).len()
 }
 
-// Advances all streams by one step and writes one 32-byte block per stream.
-// `out_len` must equal `batch_len * 32`.
-#[no_mangle]
-pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
-    ctx: *mut LustroXofBatch,
-    out: *mut u8,
-    out_len: usize,
-) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let batch = &mut *ctx;
-    let n = batch.len();
-
-    let expected_len = match n.checked_mul(32) {
-        Some(v) => v,
-        None => return LustroError::InvalidLength,
-    };
-    if out_len != expected_len {
-        return LustroError::InvalidLength;
-    }
-    if n == 0 {
-        return LustroError::Ok;
-    }
-    if out.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    // SAFETY: `out` is non-null and `out_len` was validated for `n_blocks * 32` bytes.
-    let out_blocks: &mut [[u8; 32]] = std::slice::from_raw_parts_mut(out as *mut [u8; 32], n);
-
-    match catch_unwind(AssertUnwindSafe(|| batch.fill_blocks(out_blocks))) {
-        Ok(()) => LustroError::Ok,
-        Err(_) => LustroError::InternalPanic,
-    }
-}
-
 // Advances all streams by `steps` rounds.
 // `out_len` must equal `batch_len * steps * 32`.
-// Output is stream-major.
+// Output is step-major: the block of `lane` at `step` starts at
+// byte offset `(step * batch_len + lane) * 32`.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_xof_batch_fill_blocks_many(
+pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
     ctx: *mut LustroXofBatch,
     out: *mut u8,
     out_len: usize,
@@ -328,9 +293,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks_many(
     let out_blocks: &mut [[u8; 32]] =
         std::slice::from_raw_parts_mut(out as *mut [u8; 32], n_blocks);
 
-    match catch_unwind(AssertUnwindSafe(|| {
-        batch.fill_blocks_many(out_blocks, steps)
-    })) {
+    match catch_unwind(AssertUnwindSafe(|| batch.fill_blocks(out_blocks, steps))) {
         Ok(()) => LustroError::Ok,
         Err(_) => LustroError::InternalPanic,
     }

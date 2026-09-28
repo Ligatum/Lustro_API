@@ -14,13 +14,12 @@ use std::sync::OnceLock;
 const MT_THRESHOLD_MESSAGES: usize = 1664;
 const MT_THRESHOLD_BYTES: usize = 64 * 1024;
 
-// STREAM CHUNK SIZES
+// STREAM CHUNK SIZE (lanes per worker; keep a multiple of 16 for SIMD)
 const PARALLEL_CHUNK_STATES: usize = 288;
-const PARALLEL_CHUNK_STATES_MANY: usize = 34;
+const _: () = assert!(PARALLEL_CHUNK_STATES.is_multiple_of(16));
 
-// STREAMS THRESHOLDS
-const MT_THRESHOLD_STREAMS: usize = 1536;
-const MT_THRESHOLD_STREAMS_MANY: usize = 1536;
+// STREAM THRESHOLD (lanes * steps)
+const MT_THRESHOLD_WORK: usize = 1536;
 
 // ==========================================
 // THREAD TOPOLOGY FLAGS
@@ -188,7 +187,10 @@ pub(crate) fn dispatch_hash256_batch_into(messages: &[&[u8]], domain: u128, out:
         return;
     }
 
-    let total_bytes: usize = messages.iter().map(|m| m.len()).sum();
+    let total_bytes: usize = messages
+        .iter()
+        .map(|m| m.len())
+        .fold(0, usize::saturating_add);
 
     if len >= MT_THRESHOLD_MESSAGES || total_bytes >= MT_THRESHOLD_BYTES {
         let pool = get_or_init_pool();
@@ -230,7 +232,10 @@ pub(crate) fn dispatch_hash128_batch_into(messages: &[&[u8]], domain: u128, out:
         return;
     }
 
-    let total_bytes: usize = messages.iter().map(|m| m.len()).sum();
+    let total_bytes: usize = messages
+        .iter()
+        .map(|m| m.len())
+        .fold(0, usize::saturating_add);
 
     if len >= MT_THRESHOLD_MESSAGES || total_bytes >= MT_THRESHOLD_BYTES {
         let pool = get_or_init_pool();
@@ -259,109 +264,85 @@ pub(crate) struct StreamLane {
     pub(crate) step: u64,
 }
 
+/// Raw output pointer shared between workers.
+/// Workers write disjoint blocks only (see `dispatch_streams`).
+#[derive(Clone, Copy)]
+struct OutPtr(*mut [u8; 32]);
+
+unsafe impl Send for OutPtr {}
+unsafe impl Sync for OutPtr {}
+
+impl OutPtr {
+    // Method (not `.0`) so closures capture the whole wrapper, not the raw field.
+    #[inline(always)]
+    fn get(self) -> *mut [u8; 32] {
+        self.0
+    }
+}
+
+/// Advances `lanes` by `steps` rounds. The block of lane `first + i` at
+/// step `s` is written to `out[s * n + first + i]`.
+///
+/// SAFETY: `out` must be valid for `n * steps` blocks, `first + lanes.len() <= n`,
+/// and no other thread may write to this lane range.
 #[inline(always)]
-fn process_lanes_scalar(lanes: &mut [StreamLane], out: &mut [[u8; 32]]) {
-    for (lane, block) in lanes.iter_mut().zip(out.iter_mut()) {
-        let (s0, s1) = crate::api::stream_step(lane.s0, lane.s1, lane.step);
-        lane.step = lane.step.wrapping_add(1);
-        lane.s0 = s0;
-        lane.s1 = s1;
-        block[..16].copy_from_slice(&s0.to_le_bytes());
-        block[16..].copy_from_slice(&s1.to_le_bytes());
-    }
-}
-
-/// Advances every lane by one lockstep round.
-pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]]) {
-    assert_eq!(lanes.len(), out.len(), "dispatch_streams: length mismatch");
-    match lanes.len() {
-        0 => (),
-
-        len if len == 1 || len < MT_THRESHOLD_STREAMS => {
-            process_lanes_scalar(lanes, out);
-        }
-
-        _ => {
-            let pool = get_or_init_pool();
-            pool.install(|| {
-                lanes
-                    .par_chunks_mut(PARALLEL_CHUNK_STATES)
-                    .zip(out.par_chunks_mut(PARALLEL_CHUNK_STATES))
-                    .for_each(|(l_chunk, o_chunk)| {
-                        process_lanes_scalar(l_chunk, o_chunk);
-                    });
-            });
+unsafe fn process_lanes_scalar(
+    lanes: &mut [StreamLane],
+    out: *mut [u8; 32],
+    n: usize,
+    first: usize,
+    steps: usize,
+) {
+    debug_assert!(first + lanes.len() <= n);
+    for s in 0..steps {
+        let row = out.add(s * n + first);
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let (s0, s1) = crate::api::stream_step(lane.s0, lane.s1, lane.step);
+            lane.step = lane.step.wrapping_add(1);
+            lane.s0 = s0;
+            lane.s1 = s1;
+            let block = &mut *row.add(i);
+            block[..16].copy_from_slice(&s0.to_le_bytes());
+            block[16..].copy_from_slice(&s1.to_le_bytes());
         }
     }
 }
 
-#[inline(always)]
-fn process_lanes_many_scalar(lanes: &mut [StreamLane], out: &mut [[u8; 32]], steps: usize) {
-    debug_assert_eq!(
-        out.len(),
-        lanes.len() * steps,
-        "process_lanes_many_scalar: out length must equal lanes.len() * steps"
-    );
-    for (lane, block_chunk) in lanes.iter_mut().zip(out.chunks_exact_mut(steps)) {
-        let mut cur_s0 = lane.s0;
-        let mut cur_s1 = lane.s1;
-        let mut step = lane.step;
-
-        for block in block_chunk.iter_mut() {
-            let (next_s0, next_s1) = crate::api::stream_step(cur_s0, cur_s1, step);
-            cur_s0 = next_s0;
-            cur_s1 = next_s1;
-            block[..16].copy_from_slice(&cur_s0.to_le_bytes());
-            block[16..].copy_from_slice(&cur_s1.to_le_bytes());
-            step = step.wrapping_add(1);
-        }
-
-        lane.s0 = cur_s0;
-        lane.s1 = cur_s1;
-        lane.step = step;
-    }
-}
-
-/// Advances each lane by `steps` rounds in one dispatch.
-/// Output is stream-major: each lane's blocks are stored in step order.
-pub(crate) fn dispatch_streams_many(lanes: &mut [StreamLane], out: &mut [[u8; 32]], steps: usize) {
+/// Advances every lane by `steps` rounds.
+/// Output is step-major: `out[step * n + lane]`, with `n = lanes.len()`.
+pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]], steps: usize) {
     let n = lanes.len();
     let expected = n
         .checked_mul(steps)
-        .expect("dispatch_streams_many: lanes.len() * steps overflows usize");
+        .expect("dispatch_streams: lanes.len() * steps overflows usize");
     assert_eq!(
         out.len(),
         expected,
-        "dispatch_streams_many: out length must equal lanes.len() * steps"
+        "dispatch_streams: out length must equal lanes.len() * steps"
     );
 
     if n == 0 || steps == 0 {
         return;
     }
 
-    if steps == 1 {
-        dispatch_streams(lanes, out);
-        return;
-    }
+    let out_ptr = OutPtr(out.as_mut_ptr());
 
-    let total_work = expected;
-    let chunk_size = PARALLEL_CHUNK_STATES_MANY;
-    let real_chunks = n.div_ceil(chunk_size);
-
-    let go_parallel = real_chunks >= 2 && total_work >= MT_THRESHOLD_STREAMS_MANY;
-
-    if !go_parallel {
-        process_lanes_many_scalar(lanes, out, steps);
+    if n.div_ceil(PARALLEL_CHUNK_STATES) < 2 || expected < MT_THRESHOLD_WORK {
+        // SAFETY: one call covers all lanes; out holds n * steps blocks.
+        unsafe { process_lanes_scalar(lanes, out_ptr.get(), n, 0, steps) };
         return;
     }
 
     let pool = get_or_init_pool();
     pool.install(|| {
         lanes
-            .par_chunks_mut(chunk_size)
-            .zip(out.par_chunks_mut(chunk_size * steps))
-            .for_each(|(l_chunk, o_chunk)| {
-                process_lanes_many_scalar(l_chunk, o_chunk, steps);
+            .par_chunks_mut(PARALLEL_CHUNK_STATES)
+            .enumerate()
+            .for_each(|(k, l_chunk)| {
+                let first = k * PARALLEL_CHUNK_STATES;
+                // SAFETY: chunks cover disjoint lane ranges, and (step, lane)
+                // maps to a unique index, so no two workers write the same block.
+                unsafe { process_lanes_scalar(l_chunk, out_ptr.get(), n, first, steps) };
             });
     });
 }

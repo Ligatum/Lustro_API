@@ -1,7 +1,7 @@
 //! Python bindings for Lustro XOF.
 //! Output stream is derived from an absorbed message.
 
-use numpy::{PyReadwriteArray2, PyReadwriteArray3, PyUntypedArrayMethods};
+use numpy::{PyReadwriteArray3, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes};
 
@@ -99,7 +99,6 @@ impl LustroXofPy {
 pub struct LustroXofBatchPy {
     inner: LustroXofBatch,
     blocks_buf: Vec<[u8; 32]>,
-    blocks_buf_many: Vec<[u8; 32]>,
 }
 
 #[pymethods]
@@ -112,7 +111,6 @@ impl LustroXofBatchPy {
         Self {
             inner,
             blocks_buf: vec![[0u8; 32]; count],
-            blocks_buf_many: Vec::new(),
         }
     }
 
@@ -124,58 +122,18 @@ impl LustroXofBatchPy {
         self.inner.is_empty()
     }
 
+    // Advances all streams by `steps` rounds.
+    // Output is step-major, shape `(steps, n_streams, 4)`.
     pub fn fill_blocks(
         &mut self,
         py: Python<'_>,
-        mut out: PyReadwriteArray2<'_, u64>,
-    ) -> PyResult<()> {
-        let n = self.inner.len();
-        if out.shape() != [n, 4] {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "out must have shape (n_streams, 4)",
-            ));
-        }
-
-        // Validate contiguity first; the scope drops the borrow before allow_threads.
-        {
-            let mut out_arr = out.as_array_mut();
-            if out_arr.as_slice_mut().is_none() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "out must be a C-contiguous array (got a non-contiguous view, \
-                     e.g. from slicing or transposing — call np.ascontiguousarray() first)",
-                ));
-            }
-        }
-
-        py.allow_threads(|| self.inner.fill_blocks(&mut self.blocks_buf));
-
-        // Re-borrow the output after the GIL is reacquired.
-        let mut out_arr = out.as_array_mut();
-        let flat = out_arr.as_slice_mut().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "out must be a C-contiguous array (got a non-contiguous view, \
-                 e.g. from slicing or transposing — call np.ascontiguousarray() first)",
-            )
-        })?;
-        for (block, words) in self.blocks_buf.iter().zip(flat.chunks_exact_mut(4)) {
-            words[0] = u64::from_le_bytes(block[0..8].try_into().unwrap());
-            words[1] = u64::from_le_bytes(block[8..16].try_into().unwrap());
-            words[2] = u64::from_le_bytes(block[16..24].try_into().unwrap());
-            words[3] = u64::from_le_bytes(block[24..32].try_into().unwrap());
-        }
-        Ok(())
-    }
-
-    pub fn fill_blocks_many(
-        &mut self,
-        py: Python<'_>,
-        steps: usize,
         mut out: PyReadwriteArray3<'_, u64>,
+        steps: usize,
     ) -> PyResult<()> {
         let n = self.inner.len();
-        if out.shape() != [n, steps, 4] {
+        if out.shape() != [steps, n, 4] {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "out must have shape (n_streams, steps, 4)",
+                "out must have shape (steps, n_streams, 4)",
             ));
         }
 
@@ -194,13 +152,14 @@ impl LustroXofBatchPy {
             }
         }
 
-        if self.blocks_buf_many.len() < needed {
-            self.blocks_buf_many.resize(needed, [0u8; 32]);
+        if self.blocks_buf.len() < needed {
+            self.blocks_buf.resize(needed, [0u8; 32]);
         }
-        let buf = &mut self.blocks_buf_many[..needed];
+        let buf = &mut self.blocks_buf[..needed];
 
-        py.allow_threads(|| self.inner.fill_blocks_many(buf, steps));
+        py.allow_threads(|| self.inner.fill_blocks(buf, steps));
 
+        // Step-major blocks map 1:1 onto the C-contiguous (steps, n, 4) output.
         // Re-borrow the output after the GIL is reacquired.
         let mut out_arr = out.as_array_mut();
         let flat = out_arr.as_slice_mut().ok_or_else(|| {
@@ -232,7 +191,6 @@ impl LustroXofBatchPy {
         Ok(Self {
             inner,
             blocks_buf: vec![[0u8; 32]; count],
-            blocks_buf_many: Vec::new(),
         })
     }
 
@@ -243,7 +201,6 @@ impl LustroXofBatchPy {
         Self {
             inner,
             blocks_buf: vec![[0u8; 32]; count],
-            blocks_buf_many: Vec::new(),
         }
     }
 
@@ -265,7 +222,6 @@ impl LustroXofBatchPy {
         Ok(Self {
             inner,
             blocks_buf: vec![[0u8; 32]; count],
-            blocks_buf_many: Vec::new(),
         })
     }
 }
