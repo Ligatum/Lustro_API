@@ -66,6 +66,21 @@ impl LustroXofPy {
         }
     }
 
+    // Derives an XOF from `message` along `path`.
+    // `path` must not be empty.
+    #[staticmethod]
+    pub fn derive_path(message: &[u8], path: Vec<u128>) -> PyResult<Self> {
+        if path.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "path must not be empty",
+            ));
+        }
+        let ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
+        Ok(Self {
+            inner: LustroXof::derive_path(message, &ids),
+        })
+    }
+
     pub fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }

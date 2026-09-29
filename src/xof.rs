@@ -1,7 +1,7 @@
 //! Lustro V1 — pure Rust XOF API.
 //! Output stream is derived from an absorbed message.
 
-use crate::api::{absorb_with_domain, fork_lane, StreamState};
+use crate::api::{absorb_with_domain, derive_path_lane, fork_lane, StreamState};
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, StreamLane};
 use crate::types::{LustroXofBatchSnapshot, LustroXofSnapshot, StreamId};
@@ -54,6 +54,21 @@ impl LustroXof {
     pub fn fork(&self, id: StreamId) -> Self {
         Self {
             state: self.state.fork(Domain::Xof as u128, id.get()),
+        }
+    }
+
+    // Derives a stream from `seed` along `path`.
+    // Equivalent to `new(seed, path[0])` followed by `fork` for remaining ids.
+    // Panics if `path` is empty.
+    pub fn derive_path(message: &[u8], path: &[StreamId]) -> Self {
+        assert!(!path.is_empty(), "derive_path: path must not be empty");
+        let (s0, s1) = absorb_with_domain(message, Domain::Xof as u128);
+
+        let (s0, s1) =
+            derive_path_lane(s0, s1, Domain::Xof as u128, path.iter().map(|id| id.get()));
+
+        Self {
+            state: StreamState::new(s0, s1),
         }
     }
 

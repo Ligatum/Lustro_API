@@ -161,6 +161,44 @@ pub unsafe extern "C" fn lustro_prng_fork(
     }
 }
 
+// Derives a PRNG from a 32-byte seed along a path of `n` identifiers.
+// IDs are passed as parallel `(hi, lo)` u64 arrays.
+// Returns null on invalid input, including `n == 0`.
+//
+// # Safety
+// `seed` must be valid for 32 bytes.
+// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_derive_path(
+    seed: *const u8,
+    ids_hi: *const u64,
+    ids_lo: *const u64,
+    n: usize,
+) -> *mut LustroPrng {
+    let seed_bytes = match buf_in(seed, 32) {
+        Some(s) if s.len() == 32 => s,
+        _ => return std::ptr::null_mut(),
+    };
+    if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
+        return std::ptr::null_mut();
+    }
+    let his = std::slice::from_raw_parts(ids_hi, n);
+    let los = std::slice::from_raw_parts(ids_lo, n);
+    let path: Vec<StreamId> = his
+        .iter()
+        .zip(los.iter())
+        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+        .collect();
+
+    match catch_unwind(|| {
+        let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
+        LustroPrng::derive_path(&seed256, &path)
+    }) {
+        Ok(prng) => Box::into_raw(Box::new(prng)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // Exports the current PRNG snapshot into `out`.
 // `out` must provide at least 56 writable bytes.
 #[no_mangle]

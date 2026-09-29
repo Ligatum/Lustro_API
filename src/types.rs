@@ -115,12 +115,23 @@ fn decode_single_snapshot(
 }
 
 // Serialized PRNG stream state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LustroPrngSnapshot {
     s0: u128,
     s1: u128,
     step: u64,
     cursor: u8,
+}
+
+impl core::fmt::Debug for LustroPrngSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroPrngSnapshot")
+            .field("state", &"[redacted]")
+            .field("step", &self.step)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
 }
 
 impl LustroPrngSnapshot {
@@ -160,12 +171,23 @@ impl LustroPrngSnapshot {
 }
 
 // Serialized XOF stream state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LustroXofSnapshot {
     s0: u128,
     s1: u128,
     step: u64,
     cursor: u8,
+}
+
+impl core::fmt::Debug for LustroXofSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroXofSnapshot")
+            .field("state", &"[redacted]")
+            .field("step", &self.step)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
 }
 
 impl LustroXofSnapshot {
@@ -275,9 +297,19 @@ fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64,
 }
 
 // Serialized PRNG batch state.
-#[derive(Clone, PartialEq, Eq, Debug)]
+// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct LustroPrngBatchSnapshot {
     lanes: Vec<(u128, u128, u64)>,
+}
+
+impl core::fmt::Debug for LustroPrngBatchSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroPrngBatchSnapshot")
+            .field("lane_count", &self.lanes.len())
+            .field("lanes", &"[redacted]")
+            .finish()
+    }
 }
 
 impl LustroPrngBatchSnapshot {
@@ -319,9 +351,19 @@ impl LustroPrngBatchSnapshot {
 }
 
 // Serialized XOF batch state.
-#[derive(Clone, PartialEq, Eq, Debug)]
+// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct LustroXofBatchSnapshot {
     lanes: Vec<(u128, u128, u64)>,
+}
+
+impl core::fmt::Debug for LustroXofBatchSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroXofBatchSnapshot")
+            .field("lane_count", &self.lanes.len())
+            .field("lanes", &"[redacted]")
+            .finish()
+    }
 }
 
 impl LustroXofBatchSnapshot {
@@ -453,6 +495,15 @@ impl Seed256 {
     #[inline]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    // Splits the seed into native state halves.
+    #[inline]
+    pub(crate) fn to_state(&self) -> (u128, u128) {
+        (
+            u128::from_le_bytes(self.0[..16].try_into().unwrap()),
+            u128::from_le_bytes(self.0[16..].try_into().unwrap()),
+        )
     }
 }
 

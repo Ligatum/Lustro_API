@@ -156,6 +156,7 @@ This is the shared mechanism behind stream initialization (PRNG) and forking (PR
 | `prepare_base` | Stage 1: applies the domain tag and `STREAM_INIT_MASK` to `(s0, s1)`. Accepts either seed-derived state or live stream state and can be reused for sibling derivations. |
 | `derive_branch_stream` | Stage 2: XORs the identifier into `base_s1`, then calls `evaluate_scalar`. Returns `(s0, s1)` ready for `StreamState::new()`. |
 | `fork_lane` | Per-lane fork helper: `prepare_base` + `derive_branch_stream` on raw `(s0, s1)` pairs. Used by `LustroPrngBatch`/`LustroXofBatch` `fork`/`fork_range`. |
+| `derive_path_lane` | Applies `fork_lane` once per identifier, in path order. Backs single-stream `derive_path` (PRNG and XOF). |
 
 ### Dispatch Layer
 
@@ -251,6 +252,9 @@ restoration.
 `SnapshotKind` values: `Prng`, `Xof`, `PrngBatch`, `XofBatch`.
 `SnapshotError` values: `UnsupportedVersion`, `InvalidKind`, `InvalidCursor`,
 `InvalidLength`.
+`Debug` output on all four snapshot types is redacted — same convention
+as `Seed256` — as snapshots contain internal stream state.
+This affects only formatting; `to_le_bytes()` / `from_le_bytes()` are unaffected.
 
 ---
 
@@ -266,7 +270,7 @@ Hash parallelization
 Stream parallelization (fill_blocks)
   work-size threshold:      1536 (lanes × steps)
   minimum chunk count:      2
-  parallel chunk size:      288 lanes
+  parallel chunk size:      64 lanes
 ```
 
 The current thresholds were tuned on an Intel i5-11600K.
@@ -303,6 +307,14 @@ These guarantees hold across Rust, Python, and C FFI layers.
   are intended to produce different derived streams.
 - Two forks with the same identifier will be identical regardless of how many
   bytes were consumed from the parent's current output block.
+
+### Derive-path semantics
+
+- `derive_path` depends only on the seed/message and the path, not on prior
+  reads from any stream.
+- Equivalent to `new(seed, path[0])` (PRNG) or `new(message)` (XOF) followed
+  by `fork()` for each remaining identifier, provided no output is read from
+  an intermediate stream.
 
 ### Hash semantics
 
@@ -361,9 +373,9 @@ below.
 |---|---|
 | API Version | `lustro_api_version()` |
 | Hash | `hash256(message)`, `hash128(message)`, `hash256_many(messages)`, `hash128_many(messages)`, `hash256_many_into(messages, out)`, `hash128_many_into(messages, out)` |
-| `LustroPrng` | `new(seed, stream_id)`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `fork(id)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
+| `LustroPrng` | `new(seed, stream_id)`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `fork(id)`, `derive_path(seed, path)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
 | `LustroPrngBatch` | `new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
-| `LustroXof` | `new(message)`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `fork(id)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
+| `LustroXof` | `new(message)`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `fork(id)`, `derive_path(message, path)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
 | `LustroXofBatch` | `new(messages)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
 
 **Types**
@@ -401,6 +413,7 @@ mismatches, which are handled with Rust panics.
 | `hash256_many_into` / `hash128_many_into` | Panics if `messages.len() != out.len()`. |
 | `LustroPrngBatch::fill_blocks` / `LustroXofBatch::fill_blocks` | Panics if `out.len() != len() * steps` (or on `usize` overflow). |
 | `LustroPrngBatch::fork` / `LustroXofBatch::fork` | Panics if `ids.len() != len()`. |
+| `LustroPrng::derive_path` / `LustroXof::derive_path` | Panics if `path` is empty. |
 | Everything else (`new`, `next_*`, `fill_bytes`, single-stream `fork`, `clone`, `export_snapshot`, `import_snapshot(snapshot)`, `fork_range`, `hash256`, `hash128`, `hash256_many`, `hash128_many`) | Infallible — always succeeds for valid Rust-typed arguments. |
 
 Note: these panics are plain Rust panics (`assert_eq!`), not `LustroError`
@@ -426,9 +439,9 @@ let mut restored = LustroPrng::import_snapshot(snapshot2);  // infallible
 |---|---|
 | API Version | `lustro_api_version()` |
 | `LustroHashPy` | `hash256(message)`, `hash128(message)`, `hash256_many(messages)`, `hash128_many(messages)` |
-| `LustroPrngPy` | `new(seed, stream_id)`, `next_u64()`, `next_u128()`, `next_block()`, `fill(size)`, `fill_into(buf)`, `clone_rng()`, `fork(id)`, `export_snapshot()`, `import_snapshot(bytes)` |
+| `LustroPrngPy` | `new(seed, stream_id)`, `next_u64()`, `next_u128()`, `next_block()`, `fill(size)`, `fill_into(buf)`, `clone_rng()`, `fork(id)`, `derive_path(seed, path)`, `export_snapshot()`, `import_snapshot(bytes)` |
 | `LustroPrngBatchPy` | `new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `export_snapshot()`, `import_snapshot(bytes)` |
-| `LustroXofPy` | `new(message)`, `next_u64()`, `next_u128()`, `next_block()`, `fill(size)`, `fill_into(buf)`, `clone_xof()`, `fork(id)`, `export_snapshot()`, `import_snapshot(bytes)` |
+| `LustroXofPy` | `new(message)`, `next_u64()`, `next_u128()`, `next_block()`, `fill(size)`, `fill_into(buf)`, `clone_xof()`, `fork(id)`, `derive_path(message, path)`, `export_snapshot()`, `import_snapshot(bytes)` |
 | `LustroXofBatchPy` | `new(messages)`, `len()`, `is_empty()`, `fill_blocks(out, steps)`, `fork(ids)`, `fork_range(first)`, `export_snapshot()`, `import_snapshot(bytes)` |
 
 **Parameter Types**
@@ -453,14 +466,29 @@ stated dtype (else `TypeError`, raised before the array reaches Rust code).
 | `LustroPrngPy.fork(id)` | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) |
 | `LustroPrngPy.export_snapshot()` | — | returns `bytes`, exactly 56 bytes |
 | `LustroPrngPy.import_snapshot(bytes)` | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
+| `LustroPrngPy.derive_path(seed, path)` | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
+| | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) |
 | `LustroPrngBatchPy.new(seed, stream_ids)` | `stream_ids` | Python `list[int]` (staticmethod) |
 | `LustroPrngBatchPy.new_range(seed, first_stream_id, count)` | `first_stream_id`, `count` | Python `int`, Python `int` (staticmethod) |
 | `LustroPrngBatchPy.fill_blocks(out, steps)` | `out`, `steps` | `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == batch.len()`; Python `int` |
 | `LustroPrngBatchPy.fork(ids)` | `ids` | Python `list[int]`, `len(ids) == batch.len()` |
+| `LustroPrngBatchPy.fork_range(first)` | `first` | Python `int` |
+| `LustroPrngBatchPy.export_snapshot()` | — | returns `bytes`, variable length |
+| `LustroPrngBatchPy.import_snapshot(bytes)` | `bytes` | Python `bytes`, variable length (staticmethod) |
 | `LustroXofPy(message)` | `message` | Python `bytes`, any length (including empty) |
+| `LustroXofPy.fill(size)` | `size` | Python `int` → returns `bytes` of that length |
+| `LustroXofPy.fill_into(buf)` | `buf` | Python `bytearray`, filled in place to `len(buf)` |
+| `LustroXofPy.fork(id)` | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) |
+| `LustroXofPy.export_snapshot()` | — | returns `bytes`, exactly 56 bytes |
+| `LustroXofPy.import_snapshot(bytes)` | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
+| `LustroXofPy.derive_path(message, path)` | `message` | Python `bytes`, any length (staticmethod) |
+| | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) |
 | `LustroXofBatchPy.new(messages)` | `messages` | Python `list[bytes]` — **not** numpy; each element independently sized (staticmethod) |
 | `LustroXofBatchPy.fill_blocks(out, steps)` | `out`, `steps` | `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == batch.len()`; Python `int` |
 | `LustroXofBatchPy.fork(ids)` | `ids` | Python `list[int]`, `len(ids) == batch.len()` |
+| `LustroXofBatchPy.fork_range(first)` | `first` | Python `int` |
+| `LustroXofBatchPy.export_snapshot()` | — | returns `bytes`, variable length |
+| `LustroXofBatchPy.import_snapshot(bytes)` | `bytes` | Python `bytes`, variable length (staticmethod) |
 
 **Python-Specific Notes**
 
@@ -506,9 +534,9 @@ C ABI exported through `extern "C"` functions, compatible with C and C++.
 | API Version | `lustro_api_version()` |
 | Hash | `lustro_hash256(data, data_len, out)`, `lustro_hash128(data, data_len, out)` |
 | Hash Batch | `lustro_hash256_many(data_ptr, n, message_len, out_ptr)`, `lustro_hash128_many(data_ptr, n, message_len, out_ptr)`, `lustro_hash256_many_var(message_ptrs, n, message_lens, out_ptr)`, `lustro_hash128_many_var(message_ptrs, n, message_lens, out_ptr)` |
-| PRNG | `lustro_prng_new(seed, stream_id_hi, stream_id_lo)`, `_free`, `_clone`, `_fill(out, out_len)`, `_next_u64`, `_next_u128`, `_next_block`, `_fork(id_hi, id_lo)`, `_export_snapshot(out)`, `_import_snapshot(bytes)` |
+| PRNG | `lustro_prng_new(seed, stream_id_hi, stream_id_lo)`, `_free`, `_clone`, `_fill(out, out_len)`, `_next_u64`, `_next_u128`, `_next_block`, `_fork(id_hi, id_lo)`, `_derive_path(seed, ids_hi, ids_lo, n)`, `_export_snapshot(out)`, `_import_snapshot(bytes)` |
 | PRNG Batch | `lustro_prng_batch_new(seed, ids_hi, ids_lo, n)`, `_new_range(seed, first_hi, first_lo, count)`, `_free`, `_len`, `_fill_blocks(out, out_len, steps)`, `_fork(ids_hi, ids_lo, n)`, `_fork_range(first_hi, first_lo)`, `_snapshot_size`, `_export_snapshot(out, out_len)`, `_import_snapshot(bytes, len)` |
-| XOF | `lustro_xof_new(message, message_len)`, `_free`, `_clone`, `_fill(out, out_len)`, `_next_u64`, `_next_u128`, `_next_block`, `_fork(id_hi, id_lo)`, `_export_snapshot(out)`, `_import_snapshot(bytes)` |
+| XOF | `lustro_xof_new(message, message_len)`, `_free`, `_clone`, `_fill(out, out_len)`, `_next_u64`, `_next_u128`, `_next_block`, `_fork(id_hi, id_lo)`, `_derive_path(message, message_len, ids_hi, ids_lo, n)`, `_export_snapshot(out)`, `_import_snapshot(bytes)` |
 | XOF Batch | `lustro_xof_batch_new(message_ptrs, message_lens, n)`, `_free`, `_len`, `_fill_blocks(out, out_len, steps)`, `_fork(ids_hi, ids_lo, n)`, `_fork_range(first_hi, first_lo)`, `_snapshot_size`, `_export_snapshot(out, out_len)`, `_import_snapshot(bytes, len)` |
 
 `fork_range(ctx, first_hi, first_lo)` variants do not take a count. They
@@ -566,7 +594,7 @@ There are three categories:
   the exact expected size.
 
 - **Pointer-returning functions** (`*_new`, `*_clone`, `*_fork`,
-  `*_fork_range`, `*_import_snapshot`) — `NULL` indicates failure; no error
+  `*_fork_range`, `*_derive_path`, `*_import_snapshot`) — `NULL` indicates failure; no error
   code is returned.
 
 - **Value-returning functions** (`*_len`, `*_snapshot_size` → `uintptr_t`;
@@ -594,14 +622,15 @@ Input buffers:
 | Function family | Buffer | Size |
 |---|---|---|
 | `lustro_prng_new` / `lustro_prng_batch_new` / `lustro_prng_batch_new_range` | `seed` | 32 bytes, fixed |
+| `lustro_prng_derive_path` | `seed` | 32 bytes, fixed |
 
 **5. Ownership / Lifetime**
 
 | Handle type | Created by | Freed by |
 |---|---|---|
-| `LustroPrng*` | `_new`, `_clone`, `_fork`, `_import_snapshot` | `lustro_prng_free` |
+| `LustroPrng*` | `_new`, `_clone`, `_fork`, `_derive_path`, `_import_snapshot` | `lustro_prng_free` |
 | `LustroPrngBatch*` | `_new`, `_new_range`, `_fork`, `_fork_range`, `_import_snapshot` | `lustro_prng_batch_free` |
-| `LustroXof*` | `_new`, `_clone`, `_fork`, `_import_snapshot` | `lustro_xof_free` |
+| `LustroXof*` | `_new`, `_clone`, `_fork`, `_derive_path`, `_import_snapshot` | `lustro_xof_free` |
 | `LustroXofBatch*` | `_new`, `_fork`, `_fork_range`, `_import_snapshot` | `lustro_xof_batch_free` |
 
 `*_import_snapshot` returns an independent context with the same ownership
@@ -630,6 +659,10 @@ is determined by `n` may be `NULL`:
   requires a valid 32-byte `seed`; a `NULL` seed returns `NULL`, even when
   `n == 0`. Only the `n`-sized `ids_hi`/`ids_lo` arrays are exempt from the
   `NULL` check when `n == 0`.
+- **`*_derive_path` is the one exception to "n == 0 is valid."** Unlike batch
+  constructors, `lustro_prng_derive_path` and `lustro_xof_derive_path` treat
+  `n == 0` (an empty path) as invalid and return `NULL`, matching the Rust
+  panic and the Python `ValueError` for an empty path.
 
 **7. Thread Safety**
 

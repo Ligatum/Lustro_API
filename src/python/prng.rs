@@ -73,6 +73,27 @@ impl LustroPrngPy {
         }
     }
 
+    // Derives a generator from `seed` along `path`.
+    // `path` must not be empty.
+    #[staticmethod]
+    pub fn derive_path(seed: &[u8], path: Vec<u128>) -> PyResult<Self> {
+        if seed.len() != 32 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "seed must be exactly 32 bytes",
+            ));
+        }
+        if path.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "path must not be empty",
+            ));
+        }
+        let seed256 = Seed256::from_bytes(seed.try_into().unwrap());
+        let ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
+        Ok(Self {
+            inner: LustroPrng::derive_path(&seed256, &ids),
+        })
+    }
+
     pub fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }

@@ -52,6 +52,20 @@ pub(crate) fn fork_lane(s0: u128, s1: u128, domain: u128, id: u128) -> (u128, u1
     derive_branch_stream(base_s0, base_s1, id)
 }
 
+// Applies `fork_lane` once per id, in order.
+#[inline]
+pub(crate) fn derive_path_lane(
+    mut s0: u128,
+    mut s1: u128,
+    domain: u128,
+    ids: impl Iterator<Item = u128>,
+) -> (u128, u128) {
+    for id in ids {
+        (s0, s1) = fork_lane(s0, s1, domain, id);
+    }
+    (s0, s1)
+}
+
 // ==========================================
 // INTERNAL HASH API
 // ==========================================

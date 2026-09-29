@@ -151,6 +151,42 @@ pub unsafe extern "C" fn lustro_xof_fork(
     }
 }
 
+// Derives an XOF from a message along a path of `n` identifiers.
+// IDs are passed as parallel `(hi, lo)` u64 arrays.
+// Returns null on invalid input, including `n == 0`.
+//
+// # Safety
+// `message` must be valid for `message_len` bytes when `message_len > 0`.
+// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_derive_path(
+    message: *const u8,
+    message_len: usize,
+    ids_hi: *const u64,
+    ids_lo: *const u64,
+    n: usize,
+) -> *mut LustroXof {
+    let message = match buf_in(message, message_len) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+    if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
+        return std::ptr::null_mut();
+    }
+    let his = std::slice::from_raw_parts(ids_hi, n);
+    let los = std::slice::from_raw_parts(ids_lo, n);
+    let path: Vec<StreamId> = his
+        .iter()
+        .zip(los.iter())
+        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+        .collect();
+
+    match catch_unwind(|| LustroXof::derive_path(message, &path)) {
+        Ok(xof) => Box::into_raw(Box::new(xof)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // Exports the current XOF snapshot into `out`.
 // `out` must provide at least 56 writable bytes.
 #[no_mangle]

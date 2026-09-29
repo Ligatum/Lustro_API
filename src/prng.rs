@@ -1,7 +1,7 @@
 //! Lustro V1 — pure Rust PRNG API.
 //! Each instance is an independent stream.
 
-use crate::api::{derive_branch_stream, fork_lane, prepare_base, StreamState};
+use crate::api::{derive_branch_stream, derive_path_lane, fork_lane, prepare_base, StreamState};
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, StreamLane};
 use crate::types::{LustroPrngBatchSnapshot, LustroPrngSnapshot, Seed256, StreamId};
@@ -24,9 +24,7 @@ pub struct LustroPrng {
 impl LustroPrng {
     // Creates a stream from a seed and stream identifier.
     pub fn new(seed: &Seed256, stream_id: StreamId) -> Self {
-        let raw = seed.as_bytes();
-        let s0 = u128::from_le_bytes(raw[..16].try_into().unwrap());
-        let s1 = u128::from_le_bytes(raw[16..].try_into().unwrap());
+        let (s0, s1) = seed.to_state();
 
         let (base_s0, base_s1) = prepare_base(s0, s1, Domain::Prng as u128);
         let (s0, s1) = derive_branch_stream(base_s0, base_s1, stream_id.get());
@@ -67,6 +65,21 @@ impl LustroPrng {
         }
     }
 
+    // Derives a stream from `seed` along `path`.
+    // Equivalent to `new(seed, path[0])` followed by `fork` for remaining ids.
+    // Panics if `path` is empty.
+    pub fn derive_path(seed: &Seed256, path: &[StreamId]) -> Self {
+        assert!(!path.is_empty(), "derive_path: path must not be empty");
+        let (s0, s1) = seed.to_state();
+
+        let (s0, s1) =
+            derive_path_lane(s0, s1, Domain::Prng as u128, path.iter().map(|id| id.get()));
+
+        Self {
+            state: StreamState::new(s0, s1),
+        }
+    }
+
     // Exports the current stream state.
     #[must_use]
     pub fn export_snapshot(&self) -> LustroPrngSnapshot {
@@ -96,9 +109,7 @@ pub struct LustroPrngBatch {
 impl LustroPrngBatch {
     // Creates a batch from explicit stream identifiers.
     pub fn new(seed: &Seed256, stream_ids: &[StreamId]) -> Self {
-        let raw = seed.as_bytes();
-        let s0 = u128::from_le_bytes(raw[..16].try_into().unwrap());
-        let s1 = u128::from_le_bytes(raw[16..].try_into().unwrap());
+        let (s0, s1) = seed.to_state();
         let (base_s0, base_s1) = prepare_base(s0, s1, Domain::Prng as u128);
 
         let streams = stream_ids
@@ -115,9 +126,7 @@ impl LustroPrngBatch {
     // Creates a batch from a sequential stream ID range.
     pub fn new_range(seed: &Seed256, first_stream_id: StreamId, count: usize) -> Self {
         let first_stream_id = first_stream_id.get();
-        let raw = seed.as_bytes();
-        let s0 = u128::from_le_bytes(raw[..16].try_into().unwrap());
-        let s1 = u128::from_le_bytes(raw[16..].try_into().unwrap());
+        let (s0, s1) = seed.to_state();
         let (base_s0, base_s1) = prepare_base(s0, s1, Domain::Prng as u128);
 
         let streams = (0..count)
