@@ -377,6 +377,104 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
     }
 }
 
+// Derives `k` children per lane. Output is parent-major:
+// child `j` of lane `i` is at index `i * k + j`.
+// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
+// Returns null on invalid input, including on `len() * k` overflow.
+//
+// # Safety
+// `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_fork_many(
+    ctx: *const LustroXofBatch,
+    ids_hi: *const u64,
+    ids_lo: *const u64,
+    k: usize,
+) -> *mut LustroXofBatch {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let batch = &*ctx;
+    if batch.len().checked_mul(k).is_none() {
+        return std::ptr::null_mut();
+    }
+
+    let ids: Vec<StreamId> = if k == 0 {
+        Vec::new()
+    } else {
+        if ids_hi.is_null() || ids_lo.is_null() {
+            return std::ptr::null_mut();
+        }
+        let his = std::slice::from_raw_parts(ids_hi, k);
+        let los = std::slice::from_raw_parts(ids_lo, k);
+        his.iter()
+            .zip(los.iter())
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+            .collect()
+    };
+
+    match catch_unwind(AssertUnwindSafe(|| batch.fork_many(&ids))) {
+        Ok(child) => Box::into_raw(Box::new(child)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// Derives a canonical batch: one lane per message, each walked along a path
+// of `n_path` identifiers. Messages are passed as parallel pointer/length
+// arrays; path IDs as parallel `(hi, lo)` u64 arrays. `n_path` must be
+// nonzero; `n_messages` may be zero.
+// Returns null on invalid input, including an empty path.
+//
+// # Safety
+// `message_ptrs` and `message_lens` must each be valid for `n_messages`
+// elements when `n_messages > 0`. Each `message_ptrs[i]` must be valid for
+// `message_lens[i]` bytes if `message_lens[i] > 0`.
+// `path_hi` and `path_lo` must each be valid for `n_path` elements when
+// `n_path > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_derive_path(
+    message_ptrs: *const *const u8,
+    message_lens: *const usize,
+    n_messages: usize,
+    path_hi: *const u64,
+    path_lo: *const u64,
+    n_path: usize,
+) -> *mut LustroXofBatch {
+    if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
+        return std::ptr::null_mut();
+    }
+    if n_messages > 0 && (message_ptrs.is_null() || message_lens.is_null()) {
+        return std::ptr::null_mut();
+    }
+
+    let mut messages: Vec<&[u8]> = Vec::with_capacity(n_messages);
+    if n_messages > 0 {
+        let ptrs = std::slice::from_raw_parts(message_ptrs, n_messages);
+        let lens = std::slice::from_raw_parts(message_lens, n_messages);
+        for i in 0..n_messages {
+            match buf_in(ptrs[i], lens[i]) {
+                Some(s) => messages.push(s),
+                None => return std::ptr::null_mut(),
+            }
+        }
+    }
+
+    let his = std::slice::from_raw_parts(path_hi, n_path);
+    let los = std::slice::from_raw_parts(path_lo, n_path);
+    let path: Vec<StreamId> = his
+        .iter()
+        .zip(los.iter())
+        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+        .collect();
+
+    match catch_unwind(AssertUnwindSafe(|| {
+        LustroXofBatch::derive_path(&messages, &path)
+    })) {
+        Ok(batch) => Box::into_raw(Box::new(batch)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // Derives one child XOF per lane with sequential IDs starting at `first`.
 // `first` is passed as `(hi, lo)` u64 values.
 // Returns null on null `ctx`.

@@ -189,6 +189,53 @@ impl LustroPrngBatch {
         Self { streams }
     }
 
+    // Derives `ids.len()` children per lane. Output is parent-major:
+    // child `j` of lane `i` is at index `i * ids.len() + j`.
+    // Empty `ids` produces an empty batch.
+    pub fn fork_many(&self, ids: &[StreamId]) -> Self {
+        let child_count = self
+            .streams
+            .len()
+            .checked_mul(ids.len())
+            .expect("fork_many: len() * ids.len() overflows usize");
+
+        let mut streams = Vec::with_capacity(child_count);
+        for lane in &self.streams {
+            for &id in ids {
+                let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Prng as u128, id.get());
+                // Child stream starts at step 0.
+                streams.push(StreamLane { s0, s1, step: 0 });
+            }
+        }
+
+        Self { streams }
+    }
+
+    // Derives a canonical batch: one lane per root, each walked along `path`.
+    // Lane `i` equals `LustroPrng::new(seed, roots[i])` followed by `fork`
+    // for each id in `path`. Depends only on `seed`, `roots`, and `path` —
+    // independent of any other stream's state.
+    // Panics if `path` is empty. Empty `roots` produces an empty batch.
+    pub fn derive_path(seed: &Seed256, roots: &[StreamId], path: &[StreamId]) -> Self {
+        assert!(!path.is_empty(), "derive_path: path must not be empty");
+        let (s0, s1) = seed.to_state();
+        let (base_s0, base_s1) = prepare_base(s0, s1, Domain::Prng as u128);
+
+        let mut streams = Vec::with_capacity(roots.len());
+        for &root in roots {
+            let (root_s0, root_s1) = derive_branch_stream(base_s0, base_s1, root.get());
+            let (s0, s1) = derive_path_lane(
+                root_s0,
+                root_s1,
+                Domain::Prng as u128,
+                path.iter().map(|id| id.get()),
+            );
+            streams.push(StreamLane { s0, s1, step: 0 });
+        }
+
+        Self { streams }
+    }
+
     // Derives sequential child identifiers starting at `first`.
     pub fn fork_range(&self, first: StreamId) -> Self {
         let first = first.get();

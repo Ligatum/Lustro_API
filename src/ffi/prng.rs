@@ -417,6 +417,102 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
     }
 }
 
+// Derives `k` children per lane. Output is parent-major:
+// child `j` of lane `i` is at index `i * k + j`.
+// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
+// Returns null on invalid input, including on `len() * k` overflow.
+//
+// # Safety
+// `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_batch_fork_many(
+    ctx: *const LustroPrngBatch,
+    ids_hi: *const u64,
+    ids_lo: *const u64,
+    k: usize,
+) -> *mut LustroPrngBatch {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let batch = &*ctx;
+    if batch.len().checked_mul(k).is_none() {
+        return std::ptr::null_mut();
+    }
+
+    let ids: Vec<StreamId> = if k == 0 {
+        Vec::new()
+    } else {
+        if ids_hi.is_null() || ids_lo.is_null() {
+            return std::ptr::null_mut();
+        }
+        let his = std::slice::from_raw_parts(ids_hi, k);
+        let los = std::slice::from_raw_parts(ids_lo, k);
+        his.iter()
+            .zip(los.iter())
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+            .collect()
+    };
+
+    match catch_unwind(AssertUnwindSafe(|| batch.fork_many(&ids))) {
+        Ok(child) => Box::into_raw(Box::new(child)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// Derives a canonical batch: one lane per root, each walked along a path
+// of `n_path` identifiers. Root and path IDs are each passed as parallel
+// `(hi, lo)` u64 arrays. `n_path` must be nonzero; `n_roots` may be zero.
+// Returns null on invalid input, including an empty path.
+//
+// # Safety
+// `seed` must be valid for 32 bytes.
+// `roots_hi` and `roots_lo` must each be valid for `n_roots` elements when
+// `n_roots > 0`. `path_hi` and `path_lo` must each be valid for `n_path`
+// elements when `n_path > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_batch_derive_path(
+    seed: *const u8,
+    roots_hi: *const u64,
+    roots_lo: *const u64,
+    n_roots: usize,
+    path_hi: *const u64,
+    path_lo: *const u64,
+    n_path: usize,
+) -> *mut LustroPrngBatch {
+    let seed_bytes = match buf_in(seed, 32) {
+        Some(s) if s.len() == 32 => s,
+        _ => return std::ptr::null_mut(),
+    };
+    if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
+        return std::ptr::null_mut();
+    }
+    if n_roots > 0 && (roots_hi.is_null() || roots_lo.is_null()) {
+        return std::ptr::null_mut();
+    }
+
+    let ids_from_parts = |hi: *const u64, lo: *const u64, n: usize| -> Vec<StreamId> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let his = std::slice::from_raw_parts(hi, n);
+        let los = std::slice::from_raw_parts(lo, n);
+        his.iter()
+            .zip(los.iter())
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+            .collect()
+    };
+    let roots = ids_from_parts(roots_hi, roots_lo, n_roots);
+    let path = ids_from_parts(path_hi, path_lo, n_path);
+
+    match catch_unwind(AssertUnwindSafe(|| {
+        let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
+        LustroPrngBatch::derive_path(&seed256, &roots, &path)
+    })) {
+        Ok(batch) => Box::into_raw(Box::new(batch)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // Derives one child PRNG per lane with sequential IDs starting at `first`.
 // `first` is passed as `(hi, lo)` u64 values.
 // Returns null on null `ctx`.

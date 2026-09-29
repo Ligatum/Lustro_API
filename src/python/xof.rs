@@ -209,6 +209,40 @@ impl LustroXofBatchPy {
         })
     }
 
+    // Derives `len(ids)` children per lane. Output is parent-major:
+    // child `j` of lane `i` is at index `i * len(ids) + j`.
+    pub fn fork_many(&self, ids: Vec<u128>) -> PyResult<Self> {
+        self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")
+        })?;
+        let stream_ids: Vec<StreamId> = ids.into_iter().map(StreamId).collect();
+        let inner = self.inner.fork_many(&stream_ids);
+        let count = inner.len();
+        Ok(Self {
+            inner,
+            blocks_buf: vec![[0u8; 32]; count],
+        })
+    }
+
+    // Derives a canonical batch: one lane per message, each walked along `path`.
+    // `path` must not be empty. Empty `messages` produces an empty batch.
+    #[staticmethod]
+    pub fn derive_path(messages: Vec<Vec<u8>>, path: Vec<u128>) -> PyResult<Self> {
+        if path.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "path must not be empty",
+            ));
+        }
+        let refs: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
+        let path_ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
+        let inner = LustroXofBatch::derive_path(&refs, &path_ids);
+        let count = inner.len();
+        Ok(Self {
+            inner,
+            blocks_buf: vec![[0u8; 32]; count],
+        })
+    }
+
     // Derives sequential child identifiers starting at `first`.
     pub fn fork_range(&self, first: u128) -> Self {
         let inner = self.inner.fork_range(StreamId(first));

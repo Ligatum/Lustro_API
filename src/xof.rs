@@ -57,8 +57,8 @@ impl LustroXof {
         }
     }
 
-    // Derives a stream from `seed` along `path`.
-    // Equivalent to `new(seed, path[0])` followed by `fork` for remaining ids.
+    // Derives a stream from `message` along `path`.
+    // Equivalent to `new(message)` followed by `fork` for each id in `path`.
     // Panics if `path` is empty.
     pub fn derive_path(message: &[u8], path: &[StreamId]) -> Self {
         assert!(!path.is_empty(), "derive_path: path must not be empty");
@@ -157,6 +157,51 @@ impl LustroXofBatch {
                 StreamLane { s0, s1, step: 0 }
             })
             .collect();
+
+        Self { streams }
+    }
+
+    // Derives `ids.len()` children per lane. Output is parent-major:
+    // child `j` of lane `i` is at index `i * ids.len() + j`.
+    // Empty `ids` produces an empty batch.
+    pub fn fork_many(&self, ids: &[StreamId]) -> Self {
+        let child_count = self
+            .streams
+            .len()
+            .checked_mul(ids.len())
+            .expect("fork_many: len() * ids.len() overflows usize");
+
+        let mut streams = Vec::with_capacity(child_count);
+        for lane in &self.streams {
+            for &id in ids {
+                let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, id.get());
+                // Child stream starts at step 0.
+                streams.push(StreamLane { s0, s1, step: 0 });
+            }
+        }
+
+        Self { streams }
+    }
+
+    // Derives a canonical batch: one lane per message, each walked along `path`.
+    // Lane `i` equals `LustroXof::new(messages[i])` followed by `fork` for
+    // each id in `path`. Depends only on `messages` and `path` — independent
+    // of any other stream's state.
+    // Panics if `path` is empty. Empty `messages` produces an empty batch.
+    pub fn derive_path(messages: &[&[u8]], path: &[StreamId]) -> Self {
+        assert!(!path.is_empty(), "derive_path: path must not be empty");
+
+        let mut streams = Vec::with_capacity(messages.len());
+        for &message in messages {
+            let (root_s0, root_s1) = absorb_with_domain(message, Domain::Xof as u128);
+            let (s0, s1) = derive_path_lane(
+                root_s0,
+                root_s1,
+                Domain::Xof as u128,
+                path.iter().map(|id| id.get()),
+            );
+            streams.push(StreamLane { s0, s1, step: 0 });
+        }
 
         Self { streams }
     }

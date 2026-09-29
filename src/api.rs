@@ -165,7 +165,7 @@ impl StreamState {
         let mut written = 0;
 
         // Drain the current partial block first.
-        if self.cursor > 0 && self.cursor < 32 && written < out.len() {
+        if self.cursor < 32 && written < out.len() {
             let pos = self.cursor as usize;
             let available = 32 - pos;
             let chunk = available.min(out.len());

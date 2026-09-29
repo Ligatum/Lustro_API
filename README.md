@@ -142,6 +142,56 @@ lustro_xof_free(xof);
 
 ---
 
+### Derive Path
+
+Derive a stream directly from seed and path of identifiers, without
+exposing the intermediate streams.
+
+**Rust**
+
+```rust
+use lustro::prng::LustroPrng;
+use lustro::types::{Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let rng = LustroPrng::derive_path(&seed, &[StreamId(12), StreamId(7), StreamId(99)]);
+```
+
+**Python**
+
+```python
+from lustro import LustroPrngPy
+
+seed = bytes(32)
+rng = LustroPrngPy.derive_path(seed, [12, 7, 99])
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+uint8_t seed[32] = {0};
+
+uint64_t ids_hi[3] = {0, 0, 0};
+uint64_t ids_lo[3] = {12, 7, 99};
+
+LustroPrng *rng =
+    lustro_prng_derive_path(seed, ids_hi, ids_lo, 3);
+
+lustro_prng_free(rng);
+```
+
+`derive_path(seed, path)` derives the same stream as calling `new` with the
+first identifier, then `fork` for each remaining one — in one call, without
+creating the intermediate streams. The same API is available for XOF, via
+`LustroXof::derive_path(message, path)` (Rust), `LustroXofPy.derive_path(message, path)`
+(Python), and `lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, n)`
+(C/C++); there every identifier in `path` is a `fork`, since `XOF::new` already
+takes the message as its root.
+
+---
+
 ### Batch — PRNG and XOF
 
 Lustro can process multiple independent streams.
@@ -251,6 +301,7 @@ let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
 
 let prng = LustroPrngBatch::new(&seed, &ids);
 let children = prng.fork_range(StreamId(100));
+let many_children = prng.fork_many(&[StreamId(100), StreamId(200)]);
 ```
 
 **Python**
@@ -262,6 +313,7 @@ seed = bytes(32)
 prng = LustroPrngBatchPy.new(seed, [0, 1, 2, 3])
 
 children = prng.fork_range(100)
+many_children = prng.fork_many([100, 200])
 ```
 
 **C / C++**
@@ -276,13 +328,81 @@ LustroPrngBatch *prng =
 LustroPrngBatch *children =
     lustro_prng_batch_fork_range(prng, 0, 100);
 
+uint64_t k_hi[2] = {0, 0};
+uint64_t k_lo[2] = {100, 200};
+
+LustroPrngBatch *many_children =
+    lustro_prng_batch_fork_many(prng, k_hi, k_lo, 2);
+
+lustro_prng_batch_free(many_children);
 lustro_prng_batch_free(children);
 lustro_prng_batch_free(prng);
 ```
 
-`fork_range(first)` derives `batch.len()` children using sequential stream IDs. Each child starts at step 0.
+`fork_range(first)` derives `batch.len()` children using sequential stream IDs.
+`fork_many(ids)` derives `ids.len()` children per lane instead, producing a
+batch of `batch.len() * ids.len()` lanes, ordered parent-major: child `j` of
+lane `i` is at index `i * ids.len() + j`. Each child starts at step 0.
 
 The same batch fork API is available for XOF.
+
+---
+
+### Batch Derive Path
+
+Derive a batch directly from a seed and a shared path, one lane
+per root.
+
+**Rust**
+
+```rust
+use lustro::prng::LustroPrngBatch;
+use lustro::types::{Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let roots = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
+let path = [StreamId(12), StreamId(7)];
+
+let batch = LustroPrngBatch::derive_path(&seed, &roots, &path);
+```
+
+**Python**
+
+```python
+from lustro import LustroPrngBatchPy
+
+seed = bytes(32)
+batch = LustroPrngBatchPy.derive_path(seed, [0, 1, 2, 3], [12, 7])
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+uint8_t seed[32] = {0};
+
+uint64_t roots_hi[4] = {0, 0, 0, 0};
+uint64_t roots_lo[4] = {0, 1, 2, 3};
+
+uint64_t path_hi[2] = {0, 0};
+uint64_t path_lo[2] = {12, 7};
+
+LustroPrngBatch *batch =
+    lustro_prng_batch_derive_path(
+        seed, roots_hi, roots_lo, 4, path_hi, path_lo, 2
+    );
+
+lustro_prng_batch_free(batch);
+```
+
+`derive_path(seed, roots, path)` derives a canonical batch: lane `i` equals
+`LustroPrng::derive_path(seed, [roots[i]] + path)`, independent of any other
+stream's state. The same API is available for XOF, via
+`LustroXofBatch::derive_path(messages, path)` (Rust),
+`LustroXofBatchPy.derive_path(messages, path)` (Python), and
+`lustro_xof_batch_derive_path(message_ptrs, message_lens, n_messages, path_hi, path_lo, n_path)`
+(C/C++), using a list of messages instead of a seed and root identifiers.
 
 ---
 
