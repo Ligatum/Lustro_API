@@ -257,8 +257,8 @@ impl StreamState {
     #[inline]
     pub(crate) fn from_parts(s0: u128, s1: u128, step: u64, cursor: u8) -> Self {
         assert!(
-            cursor <= 32,
-            "StreamState::from_parts: cursor cannot exceed 32"
+            cursor > 0 && cursor <= 32,
+            "StreamState::from_parts: cursor must be in range 1..=32"
         );
         Self {
             s0,

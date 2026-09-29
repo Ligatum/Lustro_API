@@ -105,7 +105,7 @@ fn decode_single_snapshot(
         return Err(SnapshotError::InvalidKind);
     }
     let cursor = bytes[48];
-    if cursor > 32 {
+    if cursor == 0 || cursor > 32 {
         return Err(SnapshotError::InvalidCursor);
     }
     let s0 = u128::from_le_bytes(bytes[8..24].try_into().unwrap());
