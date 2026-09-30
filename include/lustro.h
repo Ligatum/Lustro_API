@@ -78,6 +78,11 @@ struct LustroPrng *lustro_prng_clone(const struct LustroPrng *ctx);
 
 struct LustroPrng *lustro_prng_fork(const struct LustroPrng *ctx, uint64_t id_hi, uint64_t id_lo);
 
+struct LustroPrng *lustro_prng_derive_path(const uint8_t *seed,
+                                           const uint64_t *ids_hi,
+                                           const uint64_t *ids_lo,
+                                           uintptr_t n);
+
 LustroError lustro_prng_export_snapshot(const struct LustroPrng *ctx, uint8_t *out);
 
 struct LustroPrng *lustro_prng_import_snapshot(const uint8_t *bytes);
@@ -105,6 +110,19 @@ struct LustroPrngBatch *lustro_prng_batch_fork(const struct LustroPrngBatch *ctx
                                                const uint64_t *ids_hi,
                                                const uint64_t *ids_lo,
                                                uintptr_t n);
+
+struct LustroPrngBatch *lustro_prng_batch_fork_many(const struct LustroPrngBatch *ctx,
+                                                    const uint64_t *ids_hi,
+                                                    const uint64_t *ids_lo,
+                                                    uintptr_t k);
+
+struct LustroPrngBatch *lustro_prng_batch_derive_path(const uint8_t *seed,
+                                                      const uint64_t *roots_hi,
+                                                      const uint64_t *roots_lo,
+                                                      uintptr_t n_roots,
+                                                      const uint64_t *path_hi,
+                                                      const uint64_t *path_lo,
+                                                      uintptr_t n_path);
 
 struct LustroPrngBatch *lustro_prng_batch_fork_range(const struct LustroPrngBatch *ctx,
                                                      uint64_t first_hi,
@@ -134,6 +152,12 @@ struct LustroXof *lustro_xof_clone(const struct LustroXof *ctx);
 
 struct LustroXof *lustro_xof_fork(const struct LustroXof *ctx, uint64_t id_hi, uint64_t id_lo);
 
+struct LustroXof *lustro_xof_derive_path(const uint8_t *message,
+                                         uintptr_t message_len,
+                                         const uint64_t *ids_hi,
+                                         const uint64_t *ids_lo,
+                                         uintptr_t n);
+
 LustroError lustro_xof_export_snapshot(const struct LustroXof *ctx, uint8_t *out);
 
 struct LustroXof *lustro_xof_import_snapshot(const uint8_t *bytes);
@@ -155,6 +179,18 @@ struct LustroXofBatch *lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
                                              const uint64_t *ids_hi,
                                              const uint64_t *ids_lo,
                                              uintptr_t n);
+
+struct LustroXofBatch *lustro_xof_batch_fork_many(const struct LustroXofBatch *ctx,
+                                                  const uint64_t *ids_hi,
+                                                  const uint64_t *ids_lo,
+                                                  uintptr_t k);
+
+struct LustroXofBatch *lustro_xof_batch_derive_path(const uint8_t *const *message_ptrs,
+                                                    const uintptr_t *message_lens,
+                                                    uintptr_t n_messages,
+                                                    const uint64_t *path_hi,
+                                                    const uint64_t *path_lo,
+                                                    uintptr_t n_path);
 
 struct LustroXofBatch *lustro_xof_batch_fork_range(const struct LustroXofBatch *ctx,
                                                    uint64_t first_hi,
