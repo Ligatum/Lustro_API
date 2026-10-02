@@ -1,3 +1,5 @@
+Please note this is still considered a beta release. I plan to release the final functional API by 05.10.2026.
+
 # Lustro API
 
 Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
