@@ -5,8 +5,8 @@ use crate::types::StreamId;
 use crate::xof::LustroXof;
 use crate::xof::LustroXofBatch;
 
-use super::types::{buf_in, buf_out};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use super::guarded;
+use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
 
 // ==========================================
 // FFI XOF SINGLE API
@@ -16,82 +16,77 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 // Returns null on invalid input.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_new(message: *const u8, message_len: usize) -> *mut LustroXof {
-    let message = match buf_in(message, message_len) {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
+    guarded(std::ptr::null_mut(), || {
+        let message = match buf_in(message, message_len) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
 
-    match catch_unwind(|| LustroXof::new(message)) {
-        Ok(xof) => Box::into_raw(Box::new(xof)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroXof::new(message)))
+    })
 }
 
 // Frees an XOF context. Passing null is safe (no-op).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_free(ctx: *mut LustroXof) {
-    if !ctx.is_null() {
-        let _ = catch_unwind(|| drop(Box::from_raw(ctx)));
-    }
+    guarded((), || {
+        if !ctx.is_null() {
+            drop(Box::from_raw(ctx));
+        }
+    })
 }
 
 // Returns the next 64 output bits.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64) -> LustroError {
-    if ctx.is_null() || out.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let xof = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| xof.next_u64())) {
-        Ok(val) => {
-            core::ptr::write_unaligned(out, val);
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() || out.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let xof = &mut *ctx;
+
+        let val = xof.next_u64();
+        core::ptr::write_unaligned(out, val);
+        LustroError::Ok
+    })
 }
 
 // Returns the next 128 output bits as 16 bytes (LE).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_u128(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, 16) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let xof = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| xof.next_u128())) {
-        Ok(val) => {
-            output.copy_from_slice(&val.to_le_bytes());
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let output = match buf_out(out, 16) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let xof = &mut *ctx;
+
+        let val = xof.next_u128();
+        output.copy_from_slice(&val.to_le_bytes());
+        LustroError::Ok
+    })
 }
 
 // Returns one full 32-byte engine block.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_block(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, 32) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let xof = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| xof.next_block())) {
-        Ok(val) => {
-            output.copy_from_slice(&val);
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let output = match buf_out(out, 32) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let xof = &mut *ctx;
+
+        let val = xof.next_block();
+        output.copy_from_slice(&val);
+        LustroError::Ok
+    })
 }
 
 // Fills `out` with `out_len` output bytes.
@@ -101,33 +96,35 @@ pub unsafe extern "C" fn lustro_xof_fill(
     out: *mut u8,
     out_len: usize,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, out_len) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let xof = &mut *ctx;
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !fits_slice::<u8>(out_len) {
+            return LustroError::InvalidLength;
+        }
+        let output = match buf_out(out, out_len) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let xof = &mut *ctx;
 
-    match catch_unwind(AssertUnwindSafe(|| xof.fill_bytes(output))) {
-        Ok(()) => LustroError::Ok,
-        Err(_) => LustroError::InternalPanic,
-    }
+        xof.fill_bytes(output);
+        LustroError::Ok
+    })
 }
 
 // Clones the XOF context and returns a new independent instance.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_clone(ctx: *const LustroXof) -> *mut LustroXof {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let xof = &*ctx;
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let xof = &*ctx;
 
-    match catch_unwind(|| xof.clone()) {
-        Ok(cloned) => Box::into_raw(Box::new(cloned)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(xof.clone()))
+    })
 }
 
 // Derives a child XOF from the current state and 128-bit identifier.
@@ -139,16 +136,15 @@ pub unsafe extern "C" fn lustro_xof_fork(
     id_hi: u64,
     id_lo: u64,
 ) -> *mut LustroXof {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let xof = &*ctx;
-    let id = ((id_hi as u128) << 64) | (id_lo as u128);
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let xof = &*ctx;
+        let id = ((id_hi as u128) << 64) | (id_lo as u128);
 
-    match catch_unwind(|| xof.fork(StreamId(id))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(xof.fork(StreamId(id))))
+    })
 }
 
 // Derives an XOF from a message along a path of `n` identifiers.
@@ -166,25 +162,30 @@ pub unsafe extern "C" fn lustro_xof_derive_path(
     ids_lo: *const u64,
     n: usize,
 ) -> *mut LustroXof {
-    let message = match buf_in(message, message_len) {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
-    if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
-        return std::ptr::null_mut();
-    }
-    let his = std::slice::from_raw_parts(ids_hi, n);
-    let los = std::slice::from_raw_parts(ids_lo, n);
-    let path: Vec<StreamId> = his
-        .iter()
-        .zip(los.iter())
-        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-        .collect();
+    guarded(std::ptr::null_mut(), || {
+        let message = match buf_in(message, message_len) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
+            return std::ptr::null_mut();
+        }
+        let his = match slice_in(ids_hi, n) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let los = match slice_in(ids_lo, n) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let path: Vec<StreamId> = his
+            .iter()
+            .zip(los.iter())
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+            .collect();
 
-    match catch_unwind(|| LustroXof::derive_path(message, &path)) {
-        Ok(xof) => Box::into_raw(Box::new(xof)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroXof::derive_path(message, &path)))
+    })
 }
 
 // Exports the current XOF snapshot into `out`.
@@ -194,44 +195,39 @@ pub unsafe extern "C" fn lustro_xof_export_snapshot(
     ctx: *const LustroXof,
     out: *mut u8,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, 56) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let xof = &*ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| xof.export_snapshot())) {
-        Ok(snapshot) => {
-            output.copy_from_slice(&snapshot.to_le_bytes());
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let output = match buf_out(out, 56) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let xof = &*ctx;
+
+        let snapshot = xof.export_snapshot();
+        output.copy_from_slice(&snapshot.to_le_bytes());
+        LustroError::Ok
+    })
 }
 
 // Restores an XOF context from a 56-byte snapshot.
 // Returns null on invalid input or decoding failure.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_import_snapshot(bytes: *const u8) -> *mut LustroXof {
-    let snapshot_bytes = match buf_in(bytes, 56) {
-        Some(s) if s.len() == 56 => s,
-        _ => return std::ptr::null_mut(),
-    };
-    let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
+    guarded(std::ptr::null_mut(), || {
+        let snapshot_bytes = match buf_in(bytes, 56) {
+            Some(s) if s.len() == 56 => s,
+            _ => return std::ptr::null_mut(),
+        };
+        let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
 
-    match catch_unwind(|| {
         if let Ok(snapshot) = crate::types::LustroXofSnapshot::from_le_bytes(array_ref) {
-            Some(LustroXof::import_snapshot(snapshot))
+            Box::into_raw(Box::new(LustroXof::import_snapshot(snapshot)))
         } else {
-            None
+            std::ptr::null_mut()
         }
-    }) {
-        Ok(Some(xof)) => Box::into_raw(Box::new(xof)),
-        _ => std::ptr::null_mut(),
-    }
+    })
 }
 
 // ==========================================
@@ -252,36 +248,43 @@ pub unsafe extern "C" fn lustro_xof_batch_new(
     message_lens: *const usize,
     n: usize,
 ) -> *mut LustroXofBatch {
-    if n == 0 {
-        return Box::into_raw(Box::new(LustroXofBatch::new(&[])));
-    }
-    if message_ptrs.is_null() || message_lens.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let ptrs = std::slice::from_raw_parts(message_ptrs, n);
-    let lens = std::slice::from_raw_parts(message_lens, n);
-
-    let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
-    for i in 0..n {
-        match buf_in(ptrs[i], lens[i]) {
-            Some(s) => messages.push(s),
-            None => return std::ptr::null_mut(),
+    guarded(std::ptr::null_mut(), || {
+        if n == 0 {
+            return Box::into_raw(Box::new(LustroXofBatch::new(&[])));
         }
-    }
+        if message_ptrs.is_null() || message_lens.is_null() {
+            return std::ptr::null_mut();
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| LustroXofBatch::new(&messages))) {
-        Ok(batch) => Box::into_raw(Box::new(batch)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let ptrs = match slice_in(message_ptrs, n) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let lens = match slice_in(message_lens, n) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+
+        let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
+        for i in 0..n {
+            match buf_in(ptrs[i], lens[i]) {
+                Some(s) => messages.push(s),
+                None => return std::ptr::null_mut(),
+            }
+        }
+
+        Box::into_raw(Box::new(LustroXofBatch::new(&messages)))
+    })
 }
 
 // Frees a batch context. Passing null is safe (no-op).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_free(ctx: *mut LustroXofBatch) {
-    if !ctx.is_null() {
-        let _ = catch_unwind(|| drop(Box::from_raw(ctx)));
-    }
+    guarded((), || {
+        if !ctx.is_null() {
+            drop(Box::from_raw(ctx));
+        }
+    })
 }
 
 // Returns the number of streams, or 0 for null `ctx`.
@@ -304,35 +307,41 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
     out_len: usize,
     steps: usize,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let batch = &mut *ctx;
-    let n = batch.len();
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let batch = &mut *ctx;
+        let n = batch.len();
 
-    let expected_len = match n.checked_mul(steps).and_then(|v| v.checked_mul(32)) {
-        Some(v) => v,
-        None => return LustroError::InvalidLength,
-    };
-    if out_len != expected_len {
-        return LustroError::InvalidLength;
-    }
-    if n == 0 || steps == 0 {
-        return LustroError::Ok;
-    }
-    if out.is_null() {
-        return LustroError::InvalidPointer;
-    }
+        let expected_len = match n.checked_mul(steps).and_then(|v| v.checked_mul(32)) {
+            Some(v) => v,
+            None => return LustroError::InvalidLength,
+        };
+        if out_len != expected_len {
+            return LustroError::InvalidLength;
+        }
+        if n == 0 || steps == 0 {
+            return LustroError::Ok;
+        }
+        if out.is_null() {
+            return LustroError::InvalidPointer;
+        }
 
-    let n_blocks = n * steps;
-    // SAFETY: `out` is non-null and `out_len` was validated for `n_blocks * 32` bytes.
-    let out_blocks: &mut [[u8; 32]] =
-        std::slice::from_raw_parts_mut(out as *mut [u8; 32], n_blocks);
+        if !fits_slice::<u8>(out_len) {
+            return LustroError::InvalidLength;
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fill_blocks(out_blocks, steps))) {
-        Ok(()) => LustroError::Ok,
-        Err(_) => LustroError::InternalPanic,
-    }
+        let n_blocks = n * steps;
+        // SAFETY: `out_len` was validated for `n_blocks * 32` bytes.
+        let out_blocks: &mut [[u8; 32]] = match slice_out(out as *mut [u8; 32], n_blocks) {
+            Some(v) => v,
+            None => return LustroError::InvalidPointer,
+        };
+
+        batch.fill_blocks(out_blocks, steps);
+        LustroError::Ok
+    })
 }
 
 // Derives one child XOF per lane from `n` child identifiers.
@@ -349,38 +358,43 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
     ids_lo: *const u64,
     n: usize,
 ) -> *mut LustroXofBatch {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let batch = &*ctx;
-    if n != batch.len() {
-        return std::ptr::null_mut();
-    }
-
-    let stream_ids: Vec<StreamId> = if n == 0 {
-        Vec::new()
-    } else {
-        if ids_hi.is_null() || ids_lo.is_null() {
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
             return std::ptr::null_mut();
         }
-        let his = std::slice::from_raw_parts(ids_hi, n);
-        let los = std::slice::from_raw_parts(ids_lo, n);
-        his.iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect()
-    };
+        let batch = &*ctx;
+        if n != batch.len() {
+            return std::ptr::null_mut();
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fork(&stream_ids))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let stream_ids: Vec<StreamId> = if n == 0 {
+            Vec::new()
+        } else {
+            if ids_hi.is_null() || ids_lo.is_null() {
+                return std::ptr::null_mut();
+            }
+            let his = match slice_in(ids_hi, n) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            let los = match slice_in(ids_lo, n) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            his.iter()
+                .zip(los.iter())
+                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+                .collect()
+        };
+
+        Box::into_raw(Box::new(batch.fork(&stream_ids)))
+    })
 }
 
 // Derives `k` children per lane. Output is parent-major:
 // child `j` of lane `i` is at index `i * k + j`.
 // IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
-// Returns null on invalid input, including on `len() * k` overflow.
+// Returns null on invalid input, `len() * k` overflow, or allocation failure.
 //
 // # Safety
 // `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
@@ -391,32 +405,40 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     ids_lo: *const u64,
     k: usize,
 ) -> *mut LustroXofBatch {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let batch = &*ctx;
-    if batch.len().checked_mul(k).is_none() {
-        return std::ptr::null_mut();
-    }
-
-    let ids: Vec<StreamId> = if k == 0 {
-        Vec::new()
-    } else {
-        if ids_hi.is_null() || ids_lo.is_null() {
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
             return std::ptr::null_mut();
         }
-        let his = std::slice::from_raw_parts(ids_hi, k);
-        let los = std::slice::from_raw_parts(ids_lo, k);
-        his.iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect()
-    };
+        let batch = &*ctx;
+        if batch.len().checked_mul(k).is_none() {
+            return std::ptr::null_mut();
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fork_many(&ids))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let ids: Vec<StreamId> = if k == 0 {
+            Vec::new()
+        } else {
+            if ids_hi.is_null() || ids_lo.is_null() {
+                return std::ptr::null_mut();
+            }
+            let his = match slice_in(ids_hi, k) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            let los = match slice_in(ids_lo, k) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            his.iter()
+                .zip(los.iter())
+                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+                .collect()
+        };
+
+        match batch.try_fork_many(&ids) {
+            Ok(child) => Box::into_raw(Box::new(child)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 // Derives a canonical batch: one lane per message, each walked along a path
@@ -440,39 +462,48 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
     path_lo: *const u64,
     n_path: usize,
 ) -> *mut LustroXofBatch {
-    if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
-        return std::ptr::null_mut();
-    }
-    if n_messages > 0 && (message_ptrs.is_null() || message_lens.is_null()) {
-        return std::ptr::null_mut();
-    }
+    guarded(std::ptr::null_mut(), || {
+        if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
+            return std::ptr::null_mut();
+        }
+        if n_messages > 0 && (message_ptrs.is_null() || message_lens.is_null()) {
+            return std::ptr::null_mut();
+        }
 
-    let mut messages: Vec<&[u8]> = Vec::with_capacity(n_messages);
-    if n_messages > 0 {
-        let ptrs = std::slice::from_raw_parts(message_ptrs, n_messages);
-        let lens = std::slice::from_raw_parts(message_lens, n_messages);
-        for i in 0..n_messages {
-            match buf_in(ptrs[i], lens[i]) {
-                Some(s) => messages.push(s),
+        let mut messages: Vec<&[u8]> = Vec::with_capacity(n_messages);
+        if n_messages > 0 {
+            let ptrs = match slice_in(message_ptrs, n_messages) {
+                Some(s) => s,
                 None => return std::ptr::null_mut(),
+            };
+            let lens = match slice_in(message_lens, n_messages) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            for i in 0..n_messages {
+                match buf_in(ptrs[i], lens[i]) {
+                    Some(s) => messages.push(s),
+                    None => return std::ptr::null_mut(),
+                }
             }
         }
-    }
 
-    let his = std::slice::from_raw_parts(path_hi, n_path);
-    let los = std::slice::from_raw_parts(path_lo, n_path);
-    let path: Vec<StreamId> = his
-        .iter()
-        .zip(los.iter())
-        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-        .collect();
+        let his = match slice_in(path_hi, n_path) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let los = match slice_in(path_lo, n_path) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let path: Vec<StreamId> = his
+            .iter()
+            .zip(los.iter())
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+            .collect();
 
-    match catch_unwind(AssertUnwindSafe(|| {
-        LustroXofBatch::derive_path(&messages, &path)
-    })) {
-        Ok(batch) => Box::into_raw(Box::new(batch)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroXofBatch::derive_path(&messages, &path)))
+    })
 }
 
 // Derives one child XOF per lane with sequential IDs starting at `first`.
@@ -484,16 +515,15 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_range(
     first_hi: u64,
     first_lo: u64,
 ) -> *mut LustroXofBatch {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let batch = &*ctx;
-    let first = ((first_hi as u128) << 64) | (first_lo as u128);
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let batch = &*ctx;
+        let first = ((first_hi as u128) << 64) | (first_lo as u128);
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fork_range(StreamId(first)))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(batch.fork_range(StreamId(first))))
+    })
 }
 
 // Returns the snapshot size in bytes, or 0 for null `ctx`.
@@ -515,30 +545,28 @@ pub unsafe extern "C" fn lustro_xof_batch_export_snapshot(
     out: *mut u8,
     out_len: usize,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let batch = &*ctx;
-
-    let expected_len = match crate::types::batch_snapshot_encoded_len(batch.len()) {
-        Some(v) => v,
-        None => return LustroError::InvalidLength,
-    };
-    if out_len != expected_len {
-        return LustroError::InvalidLength;
-    }
-    let output = match buf_out(out, expected_len) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-
-    match catch_unwind(AssertUnwindSafe(|| batch.export_snapshot())) {
-        Ok(snapshot) => {
-            output.copy_from_slice(&snapshot.to_le_bytes());
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let batch = &*ctx;
+
+        let expected_len = match crate::types::batch_snapshot_encoded_len(batch.len()) {
+            Some(v) => v,
+            None => return LustroError::InvalidLength,
+        };
+        if out_len != expected_len {
+            return LustroError::InvalidLength;
+        }
+        let output = match buf_out(out, expected_len) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+
+        let snapshot = batch.export_snapshot();
+        output.copy_from_slice(&snapshot.to_le_bytes());
+        LustroError::Ok
+    })
 }
 
 // Restores an XOF batch from `len` snapshot bytes.
@@ -551,17 +579,16 @@ pub unsafe extern "C" fn lustro_xof_batch_import_snapshot(
     bytes: *const u8,
     len: usize,
 ) -> *mut LustroXofBatch {
-    let snapshot_bytes = match buf_in(bytes, len) {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
+    guarded(std::ptr::null_mut(), || {
+        let snapshot_bytes = match buf_in(bytes, len) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
 
-    match catch_unwind(|| {
-        crate::types::LustroXofBatchSnapshot::from_le_bytes(snapshot_bytes)
-            .ok()
-            .map(LustroXofBatch::import_snapshot)
-    }) {
-        Ok(Some(batch)) => Box::into_raw(Box::new(batch)),
-        _ => std::ptr::null_mut(),
-    }
+        if let Ok(snapshot) = crate::types::LustroXofBatchSnapshot::from_le_bytes(snapshot_bytes) {
+            Box::into_raw(Box::new(LustroXofBatch::import_snapshot(snapshot)))
+        } else {
+            std::ptr::null_mut()
+        }
+    })
 }

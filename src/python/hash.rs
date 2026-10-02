@@ -1,6 +1,6 @@
 //! Python bindings for Lustro Hash.
 
-use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray2};
+use numpy::{PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -42,8 +42,10 @@ impl LustroHashPy {
     pub fn hash256_many<'py>(
         &self,
         py: Python<'py>,
-        data: PyReadonlyArray2<'_, u8>,
+        data: &Bound<'_, PyArray2<u8>>,
     ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        // Use the non-panicking borrow API so conflicting NumPy borrows become Python errors.
+        let data = data.try_readonly()?;
         let data_arr = data.as_array();
         let n = data_arr.shape()[0];
 
@@ -83,8 +85,10 @@ impl LustroHashPy {
     pub fn hash128_many<'py>(
         &self,
         py: Python<'py>,
-        data: PyReadonlyArray2<'_, u8>,
+        data: &Bound<'_, PyArray2<u8>>,
     ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        // Use the non-panicking borrow API so conflicting NumPy borrows become Python errors.
+        let data = data.try_readonly()?;
         let data_arr = data.as_array();
         let n = data_arr.shape()[0];
 

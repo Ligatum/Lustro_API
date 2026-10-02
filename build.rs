@@ -8,20 +8,20 @@ fn main() {
 }
 
 fn generate_header() {
-    use std::path::PathBuf;
     use cbindgen::{EnumConfig, RenameRule};
+    use std::path::PathBuf;
 
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir   = PathBuf::from(&crate_dir).join("include");
+    let out_dir = PathBuf::from(&crate_dir).join("include");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let mut config = cbindgen::Config::default();
-    config.language    = cbindgen::Language::C;
+    config.language = cbindgen::Language::C;
     config.pragma_once = false;
     config.no_includes = true;
 
     config.enumeration = EnumConfig {
-        rename_variants:  RenameRule::ScreamingSnakeCase,
+        rename_variants: RenameRule::ScreamingSnakeCase,
         prefix_with_name: true,
         ..Default::default()
     };
@@ -46,12 +46,14 @@ fn generate_header() {
          \tLUSTRO_ERROR_ALREADY_FINALISED   = 4,\n\
          \tLUSTRO_ERROR_VERIFICATION_FAILED = 5,\n\
          \tLUSTRO_ERROR_INTERNAL_PANIC      = 6\n\
-         } LustroError;".to_string()
+         } LustroError;"
+            .to_string(),
     );
     config.trailer = Some(
         "#ifdef __cplusplus\n\
          }\n\
-         #endif".to_string()
+         #endif"
+            .to_string(),
     );
 
     cbindgen::Builder::new()

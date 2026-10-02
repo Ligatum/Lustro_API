@@ -13,7 +13,7 @@ For binding details please see [Rust API](#121-rust-api-pure-rust-no-bindings),
 ### Design Principles
 
 - Single internal transformation engine shared by all public modules.
-- Minimalism and a straightforward pipeline. Simple things work, when organized.
+- Minimalism, modularity and a straightforward pipeline. Simple things work, when organized.
 - Stateless (Hash) and stream-oriented (PRNG, XOF) execution modes.
 - Explicit domain separation for every public primitive via domain tags.
 
@@ -56,9 +56,11 @@ dispatch_hash128_batch_into           │                    │
                                                      lockstep dispatch)
 ```
 
-All public primitives use the same internal engine through
-`evaluate_scalar()` and `stream_step()`. `absorb_with_domain()`
-and `StreamState` are built on top of that engine.
+All public primitives use the same transformation semantics through
+`evaluate_scalar()` and `stream_step()`. Batch stream execution may use
+an AVX2 implementation of the stream-step computation on supported
+`x86_64` CPUs; the scalar path remains the reference execution path.
+`absorb_with_domain()` and `StreamState` are built on top of these semantics.
 
 ---
 
@@ -139,6 +141,11 @@ Split across `core.rs`, `api.rs`, and `dispatch.rs`.
 | `evaluate_scalar` | Single stateless IDM + ERD evaluation (`step = 0`). Used for message absorption (Hash/XOF) and branch derivation. |
 | `stream_step` | Counter-driven IDM + ERD evaluation. Called by `StreamState::refill()` on every PRNG/XOF block advance. |
 
+### SIMD Backend
+
+On `x86_64` the batch stream execution may use AVX2 backend when the CPU
+supports it. `core_avx2.rs` processes four independent `StreamLane` at a time.
+
 ### Absorption Layer
 
 | Function | Description |
@@ -214,10 +221,11 @@ As a result, batch has no `next_u64()`-style API and its snapshot format has no 
 | `LustroPrngBatch` | Multi-stream execution context over a shared seed. `new()` — explicit stream IDs; `new_range()` — sequential stream IDs; `fill_blocks(out, steps)` — advances every lane by `steps` rounds, writing directly into caller-provided output via the dispatcher; `len()` / `is_empty()` — batch geometry. |
 | `LustroXofBatch` | Multi-stream execution context derived from independently absorbed messages. Same `fill_blocks()` / `len()` / `is_empty()` surface as `LustroPrngBatch`; `new(messages)` absorbs each message independently before dispatch. |
 
-`fill_blocks()` writes directly into caller-provided output and performs no
-per-call heap allocation.
+`fill_blocks()` writes directly into caller-provided output. Python batch bindings 
+reuse an internal temporary block buffer.
 The Rayon thread pool is initialized lazily on the first parallel dispatch
-and reused afterwards.
+and reused afterwards. If pool creation fails then dispatch silently falls back 
+to single-threaded execution.
 
 ### Output Layout
 
@@ -267,13 +275,32 @@ Hash parallelization
   message-count threshold:  1664 messages
   total-byte threshold:     64 KiB
 
-Stream parallelization (fill_blocks)
-  work-size threshold:      1536 (lanes × steps)
-  minimum chunk count:      2
-  parallel chunk size:      64 lanes
+Stream parallelization (`fill_blocks`)
+
+Scalar backend:
+  parallel work-size threshold: 1536 (lanes × steps)
+  parallel chunk size:          162 lanes
+
+AVX2 backend (`x86_64`, AVX2 available):
+  minimum lanes for AVX2:       4
+  parallel work-size threshold: 2048 (lanes × steps)
+  parallel chunk size:          216 lanes
+  AVX2 kernel width:            4 lanes
+
+Parallel execution requires at least 2 Rayon work chunks.
 ```
 
-The current thresholds were tuned on an Intel i5-11600K.
+The current thresholds are still to be fine-tuned. This will be performed in  a future update. Hash is processed using scalar at this moment.
+
+### Runtime Execution Controls
+
+The dispatcher reads the following environment variables once, on first use:
+
+- `LUSTRO_DISABLE_MT` — disables Rayon parallel execution.
+- `LUSTRO_DISABLE_SIMD` — disables AVX2 stream execution and uses the scalar backend.
+- `LUSTRO_NUM_THREADS=N` — sets the Rayon pool size, capped at the number of logical CPUs.
+
+These settings affect execution strategy only.
 
 ---
 
@@ -338,6 +365,8 @@ These guarantees hold across Rust, Python, and C FFI layers.
 - Consecutive calls concatenate: `steps = a` followed by `steps = b` yields the
   same blocks and the same final state as one call with `steps = a + b`.
 - `steps = 0` is a no-op; state is unchanged.
+- Execution fallback is transparent: if Rayon pool cannot be initialized,
+  execution falls back to the single-threaded path.
 
 ### API robustness semantics
 
@@ -412,8 +441,8 @@ under `feature = "rand"`.
 
 The Rust API has only a few fallible operations: the four snapshot decoders
 and the `TryFrom<&[u8]>` conversions for `Hash128`, `Hash256`, and `Seed256`.
-Everything else is infallible, except for caller-supplied length/shape
-mismatches, which are handled with Rust panics.
+Everything else is infallible for valid arguments at the API contract level, 
+except for documented misuse checks and allocation/size failures that may panic.
 
 | Function(s) | Behavior |
 |---|---|
@@ -457,7 +486,7 @@ let mut restored = LustroPrng::import_snapshot(snapshot2);  // infallible
 
 **Parameter Types**
 
-Unless otherwise noted, scalar parameters for functions not listed here are
+Unless otherwise noted, parameters for functions not listed here are
 plain Python `int`/`bool` with no shape or dtype constraints. Return values
 vary by function — e.g. `next_u64()`/`next_u128()` return Python `int`,
 `next_block()` returns `bytes`, `hash256_many()` returns a NumPy array;
@@ -771,13 +800,17 @@ Python bindings require `--features python`.
    cleared on drop.
 3. **No hidden generator state** — each PRNG/XOF instance owns its own state.
    The Rayon thread pool used for batch parallelism is shared execution state,
-   not generator state.
-4. **FFI/Python panic handling.** All release builds use `panic = "unwind"` —
-   the FFI boundary always catches internal panics and returns
-   `LustroError::InternalPanic` (or the matching Python exception) instead
-   of aborting the process. A project using `lustro` as a plain dependency
-   sets its own panic strategy though; this profile only applies when
-   building `lustro` itself.
+   not generator state. If pool creation fails due to system limits, execution
+   falls back to single-threaded mode.
+4. **FFI/Python panic handling.** All release builds use `panic = "unwind"`. 
+   FFI functions that are panic-guarded catch internal unwinds and return their 
+   documented failure value — `LustroError::InternalPanic` for error-returning 
+   functions, or `NULL` for pointer-returning functions. Python bindings require 
+   `panic = "unwind"` so that Rust panics can be translated at the boundary. 
+   This does not protect against undefined behavior from invalid non-null pointers, 
+   fatal process-level conditions, or builds using a different panic strategy.
+   Panic catching does not make invalid non-null pointers safe; violating the 
+   FFI pointer preconditions remains undefined behavior.
 5. **Thread safety** — the underlying Rust contexts
    (`LustroPrng`, `LustroPrngBatch`, `LustroXof`, `LustroXofBatch`) provide no
    internal synchronization. Shared handles or objects must not be mutated

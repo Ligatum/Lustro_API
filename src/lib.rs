@@ -4,6 +4,8 @@ pub mod types;
 
 mod api;
 mod core;
+#[cfg(target_arch = "x86_64")]
+mod core_avx2;
 mod dispatch;
 pub use api::lustro_api_version;
 

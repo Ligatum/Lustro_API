@@ -1,7 +1,6 @@
 [build]
 
-# Generic modern x86-64 build
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+# No global target-cpu: AVX2 is selected at runtime from dispatch.rs.
 
-# Native build on local machine
+# Local-only build:
 # rustflags = ["-C", "target-cpu=native"]

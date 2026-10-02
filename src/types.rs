@@ -499,7 +499,7 @@ impl Seed256 {
 
     // Splits the seed into native state halves.
     #[inline]
-    pub(crate) fn to_state(&self) -> (u128, u128) {
+    pub(crate) fn to_state(self) -> (u128, u128) {
         (
             u128::from_le_bytes(self.0[..16].try_into().unwrap()),
             u128::from_le_bytes(self.0[16..].try_into().unwrap()),

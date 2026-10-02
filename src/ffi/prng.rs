@@ -6,8 +6,8 @@ use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
 use crate::types::{Seed256, StreamId};
 
-use super::types::{buf_in, buf_out};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use super::guarded;
+use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
 
 // ==========================================
 // FFI STREAM SINGLE API
@@ -22,86 +22,79 @@ pub unsafe extern "C" fn lustro_prng_new(
     stream_id_hi: u64,
     stream_id_lo: u64,
 ) -> *mut LustroPrng {
-    let seed_bytes = match buf_in(seed, 32) {
-        Some(s) if s.len() == 32 => s,
-        _ => return std::ptr::null_mut(),
-    };
-    let stream_id = ((stream_id_hi as u128) << 64) | (stream_id_lo as u128);
+    guarded(std::ptr::null_mut(), || {
+        let seed_bytes = match buf_in(seed, 32) {
+            Some(s) if s.len() == 32 => s,
+            _ => return std::ptr::null_mut(),
+        };
+        let stream_id = ((stream_id_hi as u128) << 64) | (stream_id_lo as u128);
 
-    match catch_unwind(|| {
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrng::new(&seed256, StreamId(stream_id))
-    }) {
-        Ok(prng) => Box::into_raw(Box::new(prng)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroPrng::new(&seed256, StreamId(stream_id))))
+    })
 }
 
 // Frees a PRNG context. Passing null is safe (no-op).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_free(ctx: *mut LustroPrng) {
-    if !ctx.is_null() {
-        let _ = catch_unwind(|| drop(Box::from_raw(ctx)));
-    }
+    guarded((), || {
+        if !ctx.is_null() {
+            drop(Box::from_raw(ctx));
+        }
+    })
 }
 
 // Returns the next 64 random bits.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u64) -> LustroError {
-    if ctx.is_null() || out.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let prng = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| prng.next_u64())) {
-        Ok(val) => {
-            core::ptr::write_unaligned(out, val);
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() || out.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let prng = &mut *ctx;
+
+        let val = prng.next_u64();
+        core::ptr::write_unaligned(out, val);
+        LustroError::Ok
+    })
 }
 
 // Returns the next 128 random bits as 16 bytes (LE).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, 16) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let prng = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| prng.next_u128())) {
-        Ok(val) => {
-            output.copy_from_slice(&val.to_le_bytes());
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let output = match buf_out(out, 16) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let prng = &mut *ctx;
+
+        let val = prng.next_u128();
+        output.copy_from_slice(&val.to_le_bytes());
+        LustroError::Ok
+    })
 }
 
 // Returns one full 32-byte engine block.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_block(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, 32) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let prng = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| prng.next_block())) {
-        Ok(val) => {
-            output.copy_from_slice(&val);
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let output = match buf_out(out, 32) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let prng = &mut *ctx;
+
+        let val = prng.next_block();
+        output.copy_from_slice(&val);
+        LustroError::Ok
+    })
 }
 
 // Fills `out` with `out_len` random bytes.
@@ -111,33 +104,31 @@ pub unsafe extern "C" fn lustro_prng_fill(
     out: *mut u8,
     out_len: usize,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, out_len) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let prng = &mut *ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| prng.fill_bytes(output))) {
-        Ok(()) => LustroError::Ok,
-        Err(_) => LustroError::InternalPanic,
-    }
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !fits_slice::<u8>(out_len) {
+            return LustroError::InvalidLength;
+        }
+        let output = match buf_out(out, out_len) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        (*ctx).fill_bytes(output);
+        LustroError::Ok
+    })
 }
 
 // Clones the PRNG context and returns a new independent instance.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_clone(ctx: *const LustroPrng) -> *mut LustroPrng {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let prng = &*ctx;
-
-    match catch_unwind(|| prng.clone()) {
-        Ok(cloned) => Box::into_raw(Box::new(cloned)),
-        Err(_) => std::ptr::null_mut(),
-    }
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        Box::into_raw(Box::new((*ctx).clone()))
+    })
 }
 
 // Derives a child PRNG from the current state and 128-bit identifier.
@@ -149,16 +140,15 @@ pub unsafe extern "C" fn lustro_prng_fork(
     id_hi: u64,
     id_lo: u64,
 ) -> *mut LustroPrng {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let prng = &*ctx;
-    let id = ((id_hi as u128) << 64) | (id_lo as u128);
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let prng = &*ctx;
+        let id = ((id_hi as u128) << 64) | (id_lo as u128);
 
-    match catch_unwind(|| prng.fork(StreamId(id))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(prng.fork(StreamId(id))))
+    })
 }
 
 // Derives a PRNG from a 32-byte seed along a path of `n` identifiers.
@@ -175,28 +165,31 @@ pub unsafe extern "C" fn lustro_prng_derive_path(
     ids_lo: *const u64,
     n: usize,
 ) -> *mut LustroPrng {
-    let seed_bytes = match buf_in(seed, 32) {
-        Some(s) if s.len() == 32 => s,
-        _ => return std::ptr::null_mut(),
-    };
-    if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
-        return std::ptr::null_mut();
-    }
-    let his = std::slice::from_raw_parts(ids_hi, n);
-    let los = std::slice::from_raw_parts(ids_lo, n);
-    let path: Vec<StreamId> = his
-        .iter()
-        .zip(los.iter())
-        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-        .collect();
+    guarded(std::ptr::null_mut(), || {
+        let seed_bytes = match buf_in(seed, 32) {
+            Some(s) if s.len() == 32 => s,
+            _ => return std::ptr::null_mut(),
+        };
+        if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
+            return std::ptr::null_mut();
+        }
+        let his = match slice_in(ids_hi, n) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let los = match slice_in(ids_lo, n) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        let path: Vec<StreamId> = his
+            .iter()
+            .zip(los.iter())
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+            .collect();
 
-    match catch_unwind(|| {
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrng::derive_path(&seed256, &path)
-    }) {
-        Ok(prng) => Box::into_raw(Box::new(prng)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroPrng::derive_path(&seed256, &path)))
+    })
 }
 
 // Exports the current PRNG snapshot into `out`.
@@ -206,44 +199,39 @@ pub unsafe extern "C" fn lustro_prng_export_snapshot(
     ctx: *const LustroPrng,
     out: *mut u8,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let output = match buf_out(out, 56) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-    let prng = &*ctx;
-
-    match catch_unwind(AssertUnwindSafe(|| prng.export_snapshot())) {
-        Ok(snapshot) => {
-            output.copy_from_slice(&snapshot.to_le_bytes());
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let output = match buf_out(out, 56) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        let prng = &*ctx;
+
+        let snapshot = prng.export_snapshot();
+        output.copy_from_slice(&snapshot.to_le_bytes());
+        LustroError::Ok
+    })
 }
 
 // Restores a PRNG context from a 56-byte snapshot.
 // Returns null on invalid input or decoding failure.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_import_snapshot(bytes: *const u8) -> *mut LustroPrng {
-    let snapshot_bytes = match buf_in(bytes, 56) {
-        Some(s) if s.len() == 56 => s,
-        _ => return std::ptr::null_mut(),
-    };
-    let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
+    guarded(std::ptr::null_mut(), || {
+        let snapshot_bytes = match buf_in(bytes, 56) {
+            Some(s) if s.len() == 56 => s,
+            _ => return std::ptr::null_mut(),
+        };
+        let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
 
-    match catch_unwind(|| {
         if let Ok(snapshot) = crate::types::LustroPrngSnapshot::from_le_bytes(array_ref) {
-            Some(LustroPrng::import_snapshot(snapshot))
+            Box::into_raw(Box::new(LustroPrng::import_snapshot(snapshot)))
         } else {
-            None
+            std::ptr::null_mut()
         }
-    }) {
-        Ok(Some(prng)) => Box::into_raw(Box::new(prng)),
-        _ => std::ptr::null_mut(),
-    }
+    })
 }
 
 // ==========================================
@@ -263,37 +251,40 @@ pub unsafe extern "C" fn lustro_prng_batch_new(
     ids_lo: *const u64,
     n: usize,
 ) -> *mut LustroPrngBatch {
-    let seed_bytes = match buf_in(seed, 32) {
-        Some(s) if s.len() == 32 => s,
-        _ => return std::ptr::null_mut(),
-    };
+    guarded(std::ptr::null_mut(), || {
+        let seed_bytes = match buf_in(seed, 32) {
+            Some(s) if s.len() == 32 => s,
+            _ => return std::ptr::null_mut(),
+        };
 
-    let stream_ids: Vec<StreamId> = if n == 0 {
-        Vec::new()
-    } else {
-        if ids_hi.is_null() || ids_lo.is_null() {
-            return std::ptr::null_mut();
-        }
-        let his = std::slice::from_raw_parts(ids_hi, n);
-        let los = std::slice::from_raw_parts(ids_lo, n);
-        his.iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect()
-    };
+        let stream_ids: Vec<StreamId> = if n == 0 {
+            Vec::new()
+        } else {
+            if ids_hi.is_null() || ids_lo.is_null() {
+                return std::ptr::null_mut();
+            }
+            let his = match slice_in(ids_hi, n) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            let los = match slice_in(ids_lo, n) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            his.iter()
+                .zip(los.iter())
+                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+                .collect()
+        };
 
-    match catch_unwind(|| {
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrngBatch::new(&seed256, &stream_ids)
-    }) {
-        Ok(batch) => Box::into_raw(Box::new(batch)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroPrngBatch::new(&seed256, &stream_ids)))
+    })
 }
 
 // Creates `count` streams with sequential IDs starting at `first_stream_id`.
 // `first_stream_id` is passed as `(hi, lo)` u64 values.
-// Returns null on invalid input.
+// Returns null on invalid input or allocation failure.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_new_range(
     seed: *const u8,
@@ -301,27 +292,29 @@ pub unsafe extern "C" fn lustro_prng_batch_new_range(
     first_lo: u64,
     count: usize,
 ) -> *mut LustroPrngBatch {
-    let seed_bytes = match buf_in(seed, 32) {
-        Some(s) if s.len() == 32 => s,
-        _ => return std::ptr::null_mut(),
-    };
-    let first_id = ((first_hi as u128) << 64) | (first_lo as u128);
+    guarded(std::ptr::null_mut(), || {
+        let seed_bytes = match buf_in(seed, 32) {
+            Some(s) if s.len() == 32 => s,
+            _ => return std::ptr::null_mut(),
+        };
+        let first_id = ((first_hi as u128) << 64) | (first_lo as u128);
 
-    match catch_unwind(|| {
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrngBatch::new_range(&seed256, StreamId(first_id), count)
-    }) {
-        Ok(batch) => Box::into_raw(Box::new(batch)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        match LustroPrngBatch::try_new_range(&seed256, StreamId(first_id), count) {
+            Ok(batch) => Box::into_raw(Box::new(batch)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 // Frees a batch context. Passing null is safe (no-op).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_free(ctx: *mut LustroPrngBatch) {
-    if !ctx.is_null() {
-        let _ = catch_unwind(|| drop(Box::from_raw(ctx)));
-    }
+    guarded((), || {
+        if !ctx.is_null() {
+            drop(Box::from_raw(ctx));
+        }
+    })
 }
 
 // Returns the number of streams, or 0 for null `ctx`.
@@ -344,35 +337,41 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
     out_len: usize,
     steps: usize,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let batch = &mut *ctx;
-    let n = batch.len();
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let batch = &mut *ctx;
+        let n = batch.len();
 
-    let expected_len = match n.checked_mul(steps).and_then(|v| v.checked_mul(32)) {
-        Some(v) => v,
-        None => return LustroError::InvalidLength,
-    };
-    if out_len != expected_len {
-        return LustroError::InvalidLength;
-    }
-    if n == 0 || steps == 0 {
-        return LustroError::Ok;
-    }
-    if out.is_null() {
-        return LustroError::InvalidPointer;
-    }
+        let expected_len = match n.checked_mul(steps).and_then(|v| v.checked_mul(32)) {
+            Some(v) => v,
+            None => return LustroError::InvalidLength,
+        };
+        if out_len != expected_len {
+            return LustroError::InvalidLength;
+        }
+        if n == 0 || steps == 0 {
+            return LustroError::Ok;
+        }
+        if out.is_null() {
+            return LustroError::InvalidPointer;
+        }
 
-    let n_blocks = n * steps;
-    // SAFETY: `out` is non-null and `out_len` was validated for `n * steps * 32` bytes.
-    let out_blocks: &mut [[u8; 32]] =
-        std::slice::from_raw_parts_mut(out as *mut [u8; 32], n_blocks);
+        if !fits_slice::<u8>(out_len) {
+            return LustroError::InvalidLength;
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fill_blocks(out_blocks, steps))) {
-        Ok(()) => LustroError::Ok,
-        Err(_) => LustroError::InternalPanic,
-    }
+        let n_blocks = n * steps;
+        // SAFETY: `out_len` was validated for `n * steps * 32` bytes.
+        let out_blocks: &mut [[u8; 32]] = match slice_out(out as *mut [u8; 32], n_blocks) {
+            Some(v) => v,
+            None => return LustroError::InvalidPointer,
+        };
+
+        batch.fill_blocks(out_blocks, steps);
+        LustroError::Ok
+    })
 }
 
 // Derives one child PRNG per lane from `n` child identifiers.
@@ -389,38 +388,43 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
     ids_lo: *const u64,
     n: usize,
 ) -> *mut LustroPrngBatch {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let batch = &*ctx;
-    if n != batch.len() {
-        return std::ptr::null_mut();
-    }
-
-    let stream_ids: Vec<StreamId> = if n == 0 {
-        Vec::new()
-    } else {
-        if ids_hi.is_null() || ids_lo.is_null() {
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
             return std::ptr::null_mut();
         }
-        let his = std::slice::from_raw_parts(ids_hi, n);
-        let los = std::slice::from_raw_parts(ids_lo, n);
-        his.iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect()
-    };
+        let batch = &*ctx;
+        if n != batch.len() {
+            return std::ptr::null_mut();
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fork(&stream_ids))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let stream_ids: Vec<StreamId> = if n == 0 {
+            Vec::new()
+        } else {
+            if ids_hi.is_null() || ids_lo.is_null() {
+                return std::ptr::null_mut();
+            }
+            let his = match slice_in(ids_hi, n) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            let los = match slice_in(ids_lo, n) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            his.iter()
+                .zip(los.iter())
+                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+                .collect()
+        };
+
+        Box::into_raw(Box::new(batch.fork(&stream_ids)))
+    })
 }
 
 // Derives `k` children per lane. Output is parent-major:
 // child `j` of lane `i` is at index `i * k + j`.
 // IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
-// Returns null on invalid input, including on `len() * k` overflow.
+// Returns null on invalid input, `len() * k` overflow, or allocation failure.
 //
 // # Safety
 // `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
@@ -431,32 +435,40 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     ids_lo: *const u64,
     k: usize,
 ) -> *mut LustroPrngBatch {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let batch = &*ctx;
-    if batch.len().checked_mul(k).is_none() {
-        return std::ptr::null_mut();
-    }
-
-    let ids: Vec<StreamId> = if k == 0 {
-        Vec::new()
-    } else {
-        if ids_hi.is_null() || ids_lo.is_null() {
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
             return std::ptr::null_mut();
         }
-        let his = std::slice::from_raw_parts(ids_hi, k);
-        let los = std::slice::from_raw_parts(ids_lo, k);
-        his.iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect()
-    };
+        let batch = &*ctx;
+        if batch.len().checked_mul(k).is_none() {
+            return std::ptr::null_mut();
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fork_many(&ids))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        let ids: Vec<StreamId> = if k == 0 {
+            Vec::new()
+        } else {
+            if ids_hi.is_null() || ids_lo.is_null() {
+                return std::ptr::null_mut();
+            }
+            let his = match slice_in(ids_hi, k) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            let los = match slice_in(ids_lo, k) {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            his.iter()
+                .zip(los.iter())
+                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+                .collect()
+        };
+
+        match batch.try_fork_many(&ids) {
+            Ok(child) => Box::into_raw(Box::new(child)),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 // Derives a canonical batch: one lane per root, each walked along a path
@@ -479,38 +491,45 @@ pub unsafe extern "C" fn lustro_prng_batch_derive_path(
     path_lo: *const u64,
     n_path: usize,
 ) -> *mut LustroPrngBatch {
-    let seed_bytes = match buf_in(seed, 32) {
-        Some(s) if s.len() == 32 => s,
-        _ => return std::ptr::null_mut(),
-    };
-    if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
-        return std::ptr::null_mut();
-    }
-    if n_roots > 0 && (roots_hi.is_null() || roots_lo.is_null()) {
-        return std::ptr::null_mut();
-    }
-
-    let ids_from_parts = |hi: *const u64, lo: *const u64, n: usize| -> Vec<StreamId> {
-        if n == 0 {
-            return Vec::new();
+    guarded(std::ptr::null_mut(), || {
+        let seed_bytes = match buf_in(seed, 32) {
+            Some(s) if s.len() == 32 => s,
+            _ => return std::ptr::null_mut(),
+        };
+        if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
+            return std::ptr::null_mut();
         }
-        let his = std::slice::from_raw_parts(hi, n);
-        let los = std::slice::from_raw_parts(lo, n);
-        his.iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect()
-    };
-    let roots = ids_from_parts(roots_hi, roots_lo, n_roots);
-    let path = ids_from_parts(path_hi, path_lo, n_path);
+        if n_roots > 0 && (roots_hi.is_null() || roots_lo.is_null()) {
+            return std::ptr::null_mut();
+        }
 
-    match catch_unwind(AssertUnwindSafe(|| {
+        let ids_from_parts = |hi: *const u64, lo: *const u64, n: usize| -> Option<Vec<StreamId>> {
+            if n == 0 {
+                return Some(Vec::new());
+            }
+            let his = slice_in(hi, n)?;
+            let los = slice_in(lo, n)?;
+            Some(
+                his.iter()
+                    .zip(los.iter())
+                    .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+                    .collect(),
+            )
+        };
+        let roots = match ids_from_parts(roots_hi, roots_lo, n_roots) {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        };
+        let path = match ids_from_parts(path_hi, path_lo, n_path) {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        };
+
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrngBatch::derive_path(&seed256, &roots, &path)
-    })) {
-        Ok(batch) => Box::into_raw(Box::new(batch)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(LustroPrngBatch::derive_path(
+            &seed256, &roots, &path,
+        )))
+    })
 }
 
 // Derives one child PRNG per lane with sequential IDs starting at `first`.
@@ -522,16 +541,15 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_range(
     first_hi: u64,
     first_lo: u64,
 ) -> *mut LustroPrngBatch {
-    if ctx.is_null() {
-        return std::ptr::null_mut();
-    }
-    let batch = &*ctx;
-    let first = ((first_hi as u128) << 64) | (first_lo as u128);
+    guarded(std::ptr::null_mut(), || {
+        if ctx.is_null() {
+            return std::ptr::null_mut();
+        }
+        let batch = &*ctx;
+        let first = ((first_hi as u128) << 64) | (first_lo as u128);
 
-    match catch_unwind(AssertUnwindSafe(|| batch.fork_range(StreamId(first)))) {
-        Ok(child) => Box::into_raw(Box::new(child)),
-        Err(_) => std::ptr::null_mut(),
-    }
+        Box::into_raw(Box::new(batch.fork_range(StreamId(first))))
+    })
 }
 
 // Returns the snapshot size in bytes, or 0 for null `ctx`.
@@ -553,30 +571,28 @@ pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
     out: *mut u8,
     out_len: usize,
 ) -> LustroError {
-    if ctx.is_null() {
-        return LustroError::InvalidPointer;
-    }
-    let batch = &*ctx;
-
-    let expected_len = match crate::types::batch_snapshot_encoded_len(batch.len()) {
-        Some(v) => v,
-        None => return LustroError::InvalidLength,
-    };
-    if out_len != expected_len {
-        return LustroError::InvalidLength;
-    }
-    let output = match buf_out(out, expected_len) {
-        Some(s) => s,
-        None => return LustroError::InvalidPointer,
-    };
-
-    match catch_unwind(AssertUnwindSafe(|| batch.export_snapshot())) {
-        Ok(snapshot) => {
-            output.copy_from_slice(&snapshot.to_le_bytes());
-            LustroError::Ok
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
         }
-        Err(_) => LustroError::InternalPanic,
-    }
+        let batch = &*ctx;
+
+        let expected_len = match crate::types::batch_snapshot_encoded_len(batch.len()) {
+            Some(v) => v,
+            None => return LustroError::InvalidLength,
+        };
+        if out_len != expected_len {
+            return LustroError::InvalidLength;
+        }
+        let output = match buf_out(out, expected_len) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+
+        let snapshot = batch.export_snapshot();
+        output.copy_from_slice(&snapshot.to_le_bytes());
+        LustroError::Ok
+    })
 }
 
 // Restores a PRNG batch from `len` snapshot bytes.
@@ -589,17 +605,16 @@ pub unsafe extern "C" fn lustro_prng_batch_import_snapshot(
     bytes: *const u8,
     len: usize,
 ) -> *mut LustroPrngBatch {
-    let snapshot_bytes = match buf_in(bytes, len) {
-        Some(s) => s,
-        None => return std::ptr::null_mut(),
-    };
+    guarded(std::ptr::null_mut(), || {
+        let snapshot_bytes = match buf_in(bytes, len) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
 
-    match catch_unwind(|| {
-        crate::types::LustroPrngBatchSnapshot::from_le_bytes(snapshot_bytes)
-            .ok()
-            .map(LustroPrngBatch::import_snapshot)
-    }) {
-        Ok(Some(batch)) => Box::into_raw(Box::new(batch)),
-        _ => std::ptr::null_mut(),
-    }
+        if let Ok(snapshot) = crate::types::LustroPrngBatchSnapshot::from_le_bytes(snapshot_bytes) {
+            Box::into_raw(Box::new(LustroPrngBatch::import_snapshot(snapshot)))
+        } else {
+            std::ptr::null_mut()
+        }
+    })
 }

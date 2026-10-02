@@ -1,7 +1,7 @@
 //! Python bindings for Lustro PRNG.
 //! Each instance is an independent stream.
 
-use numpy::{PyReadwriteArray3, PyUntypedArrayMethods};
+use numpy::{PyArray3, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes};
 
@@ -46,10 +46,18 @@ impl LustroPrngPy {
     }
 
     // Returns `size` random bytes.
-    pub fn fill<'py>(&mut self, py: Python<'py>, size: usize) -> Bound<'py, PyBytes> {
-        let mut buf = vec![0u8; size];
-        py.allow_threads(|| self.inner.fill_bytes(&mut buf));
-        PyBytes::new_bound(py, &buf)
+    // Raises OverflowError if `size` exceeds isize::MAX, MemoryError if the
+    // buffer cannot be allocated.
+    pub fn fill<'py>(&mut self, py: Python<'py>, size: usize) -> PyResult<Bound<'py, PyBytes>> {
+        if size > isize::MAX as usize {
+            return Err(pyo3::exceptions::PyOverflowError::new_err(
+                "size exceeds isize::MAX",
+            ));
+        }
+        PyBytes::new_bound_with(py, size, |buf| {
+            py.allow_threads(|| self.inner.fill_bytes(buf));
+            Ok(())
+        })
     }
 
     // Fills an existing bytearray in-place without allocation.
@@ -142,11 +150,10 @@ impl LustroPrngBatchPy {
         }
         let seed256 = Seed256::from_bytes(seed.try_into().unwrap());
         let ids: Vec<StreamId> = stream_ids.into_iter().map(StreamId).collect();
-        let count = ids.len();
         let inner = LustroPrngBatch::new(&seed256, &ids);
         Ok(Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         })
     }
 
@@ -158,10 +165,11 @@ impl LustroPrngBatchPy {
             ));
         }
         let seed256 = Seed256::from_bytes(seed.try_into().unwrap());
-        let inner = LustroPrngBatch::new_range(&seed256, StreamId(first_stream_id), count);
+        let inner = LustroPrngBatch::try_new_range(&seed256, StreamId(first_stream_id), count)
+            .map_err(|_| crate::python::alloc_error())?;
         Ok(Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         })
     }
 
@@ -178,9 +186,13 @@ impl LustroPrngBatchPy {
     pub fn fill_blocks(
         &mut self,
         py: Python<'_>,
-        mut out: PyReadwriteArray3<'_, u64>,
+        out: &Bound<'_, PyArray3<u64>>,
         steps: usize,
     ) -> PyResult<()> {
+        // Read before borrowing: `try_readwrite` itself does not touch the data.
+        let misaligned = (out.data() as usize) % std::mem::align_of::<u64>() != 0;
+        // Use the non-panicking mutable borrow API so read-only or conflicting borrows become Python errors.
+        let mut out = out.try_readwrite()?;
         let n = self.inner.len();
         if out.shape() != [steps, n, 4] {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -191,6 +203,19 @@ impl LustroPrngBatchPy {
         let needed = n.checked_mul(steps).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("n_streams * steps overflows usize")
         })?;
+
+        // Empty output: nothing to write. NumPy reports zero strides here.
+        if needed == 0 {
+            return Ok(());
+        }
+
+        // A misaligned buffer must not become a `&mut [u64]`.
+        if misaligned {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "out must be aligned for uint64 (got a misaligned buffer, \
+                 e.g. from np.frombuffer with an odd offset — copy it first)",
+            ));
+        }
 
         // Validate contiguity first; the scope drops the borrow before allow_threads.
         {
@@ -204,6 +229,10 @@ impl LustroPrngBatchPy {
         }
 
         if self.blocks_buf.len() < needed {
+            let additional = needed - self.blocks_buf.len();
+            self.blocks_buf
+                .try_reserve_exact(additional)
+                .map_err(|_| crate::python::alloc_error())?;
             self.blocks_buf.resize(needed, [0u8; 32]);
         }
         let buf = &mut self.blocks_buf[..needed];
@@ -238,10 +267,9 @@ impl LustroPrngBatchPy {
         }
         let stream_ids: Vec<StreamId> = ids.into_iter().map(StreamId).collect();
         let inner = self.inner.fork(&stream_ids);
-        let count = inner.len();
         Ok(Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         })
     }
 
@@ -252,11 +280,13 @@ impl LustroPrngBatchPy {
             pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")
         })?;
         let stream_ids: Vec<StreamId> = ids.into_iter().map(StreamId).collect();
-        let inner = self.inner.fork_many(&stream_ids);
-        let count = inner.len();
+        let inner = self
+            .inner
+            .try_fork_many(&stream_ids)
+            .map_err(|_| crate::python::alloc_error())?;
         Ok(Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         })
     }
 
@@ -278,20 +308,18 @@ impl LustroPrngBatchPy {
         let root_ids: Vec<StreamId> = roots.into_iter().map(StreamId).collect();
         let path_ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
         let inner = LustroPrngBatch::derive_path(&seed256, &root_ids, &path_ids);
-        let count = inner.len();
         Ok(Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         })
     }
 
     // Derives sequential child identifiers starting at `first`.
     pub fn fork_range(&self, first: u128) -> Self {
         let inner = self.inner.fork_range(StreamId(first));
-        let count = inner.len();
         Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         }
     }
 
@@ -309,10 +337,9 @@ impl LustroPrngBatchPy {
             .map_err(crate::python::snapshot_error)?;
 
         let inner = LustroPrngBatch::import_snapshot(snapshot);
-        let count = inner.len();
         Ok(Self {
             inner,
-            blocks_buf: vec![[0u8; 32]; count],
+            blocks_buf: Vec::new(),
         })
     }
 }

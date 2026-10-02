@@ -6,6 +6,10 @@ pub mod xof;
 
 use pyo3::prelude::*;
 
+// PyO3 turns panics into exceptions only when unwinding.
+#[cfg(panic = "abort")]
+compile_error!("lustro Python bindings require panic = \"unwind\"");
+
 #[pyfunction]
 pub fn lustro_api_version() -> u32 {
     crate::api::LUSTRO_API_VERSION
@@ -28,4 +32,9 @@ pub(crate) fn snapshot_error(err: crate::types::SnapshotError) -> pyo3::PyErr {
             pyo3::exceptions::PyValueError::new_err("invalid snapshot length")
         }
     }
+}
+
+// Maps an allocation failure to MemoryError.
+pub(crate) fn alloc_error() -> pyo3::PyErr {
+    pyo3::exceptions::PyMemoryError::new_err("allocation failed")
 }

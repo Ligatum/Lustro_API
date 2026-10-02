@@ -5,6 +5,7 @@ use crate::api::{derive_branch_stream, derive_path_lane, fork_lane, prepare_base
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, StreamLane};
 use crate::types::{LustroPrngBatchSnapshot, LustroPrngSnapshot, Seed256, StreamId};
+use std::collections::TryReserveError;
 
 // RngCore
 #[cfg(feature = "rand")]
@@ -124,20 +125,31 @@ impl LustroPrngBatch {
     }
 
     // Creates a batch from a sequential stream ID range.
+    // Panics if the lane buffer cannot be allocated.
     pub fn new_range(seed: &Seed256, first_stream_id: StreamId, count: usize) -> Self {
+        Self::try_new_range(seed, first_stream_id, count)
+            .expect("new_range: lane allocation failed")
+    }
+
+    // As `new_range`, reporting allocation failure as `Err`.
+    pub(crate) fn try_new_range(
+        seed: &Seed256,
+        first_stream_id: StreamId,
+        count: usize,
+    ) -> Result<Self, TryReserveError> {
         let first_stream_id = first_stream_id.get();
         let (s0, s1) = seed.to_state();
         let (base_s0, base_s1) = prepare_base(s0, s1, Domain::Prng as u128);
 
-        let streams = (0..count)
-            .map(|i| {
-                let stream_id = first_stream_id.wrapping_add(i as u128);
-                let (s0, s1) = derive_branch_stream(base_s0, base_s1, stream_id);
-                StreamLane { s0, s1, step: 0 }
-            })
-            .collect();
+        let mut streams = Vec::new();
+        streams.try_reserve_exact(count)?;
+        for i in 0..count {
+            let stream_id = first_stream_id.wrapping_add(i as u128);
+            let (s0, s1) = derive_branch_stream(base_s0, base_s1, stream_id);
+            streams.push(StreamLane { s0, s1, step: 0 });
+        }
 
-        Self { streams }
+        Ok(Self { streams })
     }
 
     #[inline]
@@ -192,14 +204,24 @@ impl LustroPrngBatch {
     // Derives `ids.len()` children per lane. Output is parent-major:
     // child `j` of lane `i` is at index `i * ids.len() + j`.
     // Empty `ids` produces an empty batch.
+    // Panics if `len() * ids.len()` overflows usize or the lane buffer
+    // cannot be allocated.
     pub fn fork_many(&self, ids: &[StreamId]) -> Self {
+        self.try_fork_many(ids)
+            .expect("fork_many: lane allocation failed")
+    }
+
+    // As `fork_many`, reporting allocation failure as `Err`.
+    // Still panics if `len() * ids.len()` overflows usize.
+    pub(crate) fn try_fork_many(&self, ids: &[StreamId]) -> Result<Self, TryReserveError> {
         let child_count = self
             .streams
             .len()
             .checked_mul(ids.len())
             .expect("fork_many: len() * ids.len() overflows usize");
 
-        let mut streams = Vec::with_capacity(child_count);
+        let mut streams = Vec::new();
+        streams.try_reserve_exact(child_count)?;
         for lane in &self.streams {
             for &id in ids {
                 let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Prng as u128, id.get());
@@ -208,7 +230,7 @@ impl LustroPrngBatch {
             }
         }
 
-        Self { streams }
+        Ok(Self { streams })
     }
 
     // Derives a canonical batch: one lane per root, each walked along `path`.

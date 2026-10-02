@@ -11,7 +11,6 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 default = []
 python  = ["dep:pyo3", "dep:numpy"]
 ffi     = []
-thread-pinning = []
 rand    = ["dep:rand_core"]
 
 [dependencies]
@@ -31,3 +30,11 @@ panic         = "unwind"
 strip         = true
 debug         = false
 incremental   = false
+
+[profile.release-python]
+inherits = "release"
+panic    = "unwind"
+
+[profile.release-ffi]
+inherits = "release"
+panic    = "unwind"

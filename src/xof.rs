@@ -5,6 +5,7 @@ use crate::api::{absorb_with_domain, derive_path_lane, fork_lane, StreamState};
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, StreamLane};
 use crate::types::{LustroXofBatchSnapshot, LustroXofSnapshot, StreamId};
+use std::collections::TryReserveError;
 
 // ==========================================
 // RUST XOF API
@@ -164,14 +165,24 @@ impl LustroXofBatch {
     // Derives `ids.len()` children per lane. Output is parent-major:
     // child `j` of lane `i` is at index `i * ids.len() + j`.
     // Empty `ids` produces an empty batch.
+    // Panics if `len() * ids.len()` overflows usize or the lane buffer
+    // cannot be allocated.
     pub fn fork_many(&self, ids: &[StreamId]) -> Self {
+        self.try_fork_many(ids)
+            .expect("fork_many: lane allocation failed")
+    }
+
+    // As `fork_many`, reporting allocation failure as `Err`.
+    // Still panics if `len() * ids.len()` overflows usize.
+    pub(crate) fn try_fork_many(&self, ids: &[StreamId]) -> Result<Self, TryReserveError> {
         let child_count = self
             .streams
             .len()
             .checked_mul(ids.len())
             .expect("fork_many: len() * ids.len() overflows usize");
 
-        let mut streams = Vec::with_capacity(child_count);
+        let mut streams = Vec::new();
+        streams.try_reserve_exact(child_count)?;
         for lane in &self.streams {
             for &id in ids {
                 let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, id.get());
@@ -180,7 +191,7 @@ impl LustroXofBatch {
             }
         }
 
-        Self { streams }
+        Ok(Self { streams })
     }
 
     // Derives a canonical batch: one lane per message, each walked along `path`.

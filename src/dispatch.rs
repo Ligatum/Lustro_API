@@ -1,255 +1,276 @@
-//! Lustro V1 — Parallel and Scalar Engine Dispatcher.
+//! Lustro V1 — Parallel, Scalar and AVX2 Engine Dispatcher.
 
 #![allow(non_snake_case)]
 
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
 // ==========================================
 // CONFIG
 // ==========================================
 
-// HASH THRESHOLDS
-const MT_THRESHOLD_MESSAGES: usize = 1664;
-const MT_THRESHOLD_BYTES: usize = 64 * 1024;
+// HASH POLICY PARAMETERS
+// Hashing is scalar on every CPU. This may change in a future update.
 
-// STREAM CHUNK SIZE (lanes per worker; keep a multiple of 16 for SIMD)
-const PARALLEL_CHUNK_STATES: usize = 64;
-const _: () = assert!(PARALLEL_CHUNK_STATES.is_multiple_of(16));
-
-// STREAM THRESHOLD (lanes * steps)
-const MT_THRESHOLD_WORK: usize = 1536;
-
-// ==========================================
-// THREAD TOPOLOGY FLAGS
-// ==========================================
-
-/// Whether to exclude SMT siblings from the worker pool.
-const HT_BLOCK: bool = false;
-
-/// Whether to pin Rayon workers to physical cores.
-const PIN_THREADS: bool = false;
-
-// ==========================================
-// CPU TOPOLOGY
-// ==========================================
-
-/// Cached SMT ratio from CPUID leaf 0xB.
-static HT_RATIO: OnceLock<usize> = OnceLock::new();
-
-fn ht_ratio() -> usize {
-    *HT_RATIO.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        {
-            detect_ht_ratio_x86()
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            1
-        }
-    })
+// Tunable hash parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HashParams {
+    /// Minimum message count to use pool.
+    pub(crate) mt_threshold_messages: usize,
+    /// Minimum total input bytes to use pool.
+    pub(crate) mt_threshold_bytes: usize,
 }
+
+const HASH_PARAMS: HashParams = HashParams {
+    mt_threshold_messages: 1664,
+    mt_threshold_bytes: 64 * 1024,
+};
+
+// STREAM POLICY PARAMETERS
+// `chunk` must be non-zero, and a multiple of 4 for the AVX2 x4 kernel.
+
+/// Tunable stream parameters of one backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamParams {
+    // Lanes per Rayon work item.
+    pub(crate) chunk: usize,
+    // Minimum `lanes * steps` required for Rayon.
+    pub(crate) mt_threshold_work: usize,
+}
+
+const SCALAR_STREAM: StreamParams = StreamParams {
+    chunk: 162,
+    mt_threshold_work: 1536,
+};
+const _: () = assert!(SCALAR_STREAM.chunk > 0);
 
 #[cfg(target_arch = "x86_64")]
-fn detect_ht_ratio_x86() -> usize {
-    use std::arch::x86_64::{__cpuid, __cpuid_count};
-    unsafe {
-        let max_leaf = __cpuid(0).eax;
-        if max_leaf < 0xB {
-            return 1;
+const AVX2_STREAM: StreamParams = StreamParams {
+    chunk: 216,
+    mt_threshold_work: 2048,
+};
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(AVX2_STREAM.chunk > 0 && AVX2_STREAM.chunk.is_multiple_of(4));
+
+// AVX2 BACKEND SELECTION
+// Minimum lanes for one x4 kernel group.
+#[cfg(target_arch = "x86_64")]
+const AVX2_MIN_LANES: usize = 4;
+
+// ==========================================
+// RUNTIME CONFIG
+// ==========================================
+
+const ENV_DISABLE_MT: &str = "LUSTRO_DISABLE_MT";
+const ENV_DISABLE_SIMD: &str = "LUSTRO_DISABLE_SIMD";
+const ENV_NUM_THREADS: &str = "LUSTRO_NUM_THREADS";
+
+// Process-wide settings, read once. They affect execution only; outputs do not depend on them.
+//
+// - `LUSTRO_DISABLE_MT`: present (any value, `0` included) = never enter the pool.
+// - `LUSTRO_DISABLE_SIMD`: present = scalar backend for streams.
+// - `LUSTRO_NUM_THREADS=N`: pool size, capped at the logical CPU count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeConfig {
+    disable_mt: bool,
+    disable_simd: bool,
+    threads: Option<NonZeroUsize>,
+}
+
+impl RuntimeConfig {
+    // Parses runtime settings. `logical` is the logical CPU count.
+    fn parse(get: impl Fn(&str) -> Option<OsString>, logical: usize) -> Self {
+        let threads = get(ENV_NUM_THREADS)
+            .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
+            .filter(|&n| n > 0)
+            .map(|n| n.min(logical.max(1)))
+            .and_then(NonZeroUsize::new);
+
+        RuntimeConfig {
+            disable_mt: get(ENV_DISABLE_MT).is_some() || threads.map(NonZeroUsize::get) == Some(1),
+            disable_simd: get(ENV_DISABLE_SIMD).is_some(),
+            threads,
         }
-        let mut level: u32 = 0;
-        loop {
-            let res = __cpuid_count(0xB, level);
-            let level_type = (res.ecx >> 8) & 0xFF;
-            let count = (res.ebx & 0xFFFF) as usize;
-            if level_type == 1 && count > 0 {
-                return count;
-            }
-            if count == 0 {
-                break;
-            }
-            level += 1;
-            if level > 8 {
-                break;
-            }
+    }
+
+    // Build plan restrictions from the runtime flags.
+    fn overrides(self) -> Overrides {
+        Overrides {
+            backend: if self.disable_simd {
+                BackendPref::Scalar
+            } else {
+                BackendPref::Auto
+            },
+            parallel: if self.disable_mt {
+                ParallelPref::Single
+            } else {
+                ParallelPref::Auto
+            },
         }
-        1
     }
 }
 
-// ==========================================
-// THREAD PINNING
-// ==========================================
-
-#[cfg(all(target_os = "windows", feature = "thread-pinning"))]
-fn pin_thread_to_core(core_id: usize) {
-    extern "system" {
-        fn GetCurrentThread() -> *mut core::ffi::c_void;
-        fn SetThreadAffinityMask(
-            h_thread: *mut core::ffi::c_void,
-            dw_thread_affinity_mask: usize,
-        ) -> usize;
-    }
-    let mask = match 1usize.checked_shl(core_id as u32) {
-        Some(m) if m != 0 => m,
-        _ => return,
-    };
-    unsafe {
-        let result = SetThreadAffinityMask(GetCurrentThread(), mask);
-        debug_assert_ne!(result, 0, "SetThreadAffinityMask failed");
-    }
+fn logical_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
-#[cfg(not(all(target_os = "windows", feature = "thread-pinning")))]
-#[inline(always)]
-fn pin_thread_to_core(_core_id: usize) {}
+static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
+
+// Settings from the environment, read on first use only.
+fn runtime_config() -> RuntimeConfig {
+    *RUNTIME_CONFIG
+        .get_or_init(|| RuntimeConfig::parse(|name| std::env::var_os(name), logical_cpus()))
+}
 
 // ==========================================
 // RAYON POOL
 // ==========================================
 
-/// Assumes a uniform SMT ratio; hybrid P/E-core topologies may differ.
-static RAYON_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static RAYON_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
-/// Initializes the global Rayon thread pool once.
+// Initializes the dispatcher's Rayon pool once.
 pub(crate) fn init_pool() {
     RAYON_POOL.get_or_init(|| {
-        let logical = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let workers = runtime_config()
+            .threads
+            .map_or_else(logical_cpus, NonZeroUsize::get);
 
-        let ht_active = HT_BLOCK && std::env::var_os("LUSTRO_DISABLE_HT").is_none();
-        let ratio = if ht_active { ht_ratio() } else { 1 };
-        let physical = (logical / ratio).max(1);
-
-        if physical <= 1 {
-            return ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("Failed to create fallback pool");
-        }
-
-        let pin_active = PIN_THREADS && std::env::var_os("LUSTRO_DISABLE_AFFINITY").is_none();
-
-        ThreadPoolBuilder::new()
-            .num_threads(physical)
-            .start_handler(move |thread_id| {
-                if !pin_active {
-                    return;
-                }
-                let core_id = thread_id.saturating_mul(ratio);
-                if core_id < logical {
-                    pin_thread_to_core(core_id);
-                }
-            })
-            .build()
-            .expect("Failed to create Rayon pool")
+        ThreadPoolBuilder::new().num_threads(workers).build().ok()
     });
 }
 
-fn get_or_init_pool() -> &'static rayon::ThreadPool {
-    match RAYON_POOL.get() {
-        Some(pool) => pool,
-        None => {
-            init_pool();
-            RAYON_POOL.get().unwrap()
-        }
-    }
+fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
+    init_pool();
+    RAYON_POOL.get().and_then(|opt| opt.as_ref())
 }
 
 // ==========================================
 // INTERNAL STATE API
 // ==========================================
 
-/// Dispatches 256-bit hashing directly into `out`.
+// Dispatches 256-bit hashing directly into `out`.
 pub(crate) fn dispatch_hash256_batch_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 32]]) {
     assert_eq!(
         messages.len(),
         out.len(),
         "dispatch_hash256_batch_into: length mismatch"
     );
-
-    #[inline(always)]
-    fn absorb_into(m: &[u8], domain: u128, out: &mut [u8; 32]) {
-        let (s0, s1) = crate::api::absorb_with_domain(m, domain);
-        out[..16].copy_from_slice(&s0.to_le_bytes());
-        out[16..].copy_from_slice(&s1.to_le_bytes());
-    }
-
-    let len = messages.len();
-    if len == 0 {
-        return;
-    }
-    if len == 1 {
-        absorb_into(messages[0], domain, &mut out[0]);
-        return;
-    }
-
-    let total_bytes: usize = messages
-        .iter()
-        .map(|m| m.len())
-        .fold(0, usize::saturating_add);
-
-    if len >= MT_THRESHOLD_MESSAGES || total_bytes >= MT_THRESHOLD_BYTES {
-        let pool = get_or_init_pool();
-        pool.install(|| {
-            messages
-                .par_iter()
-                .copied()
-                .zip(out.par_iter_mut())
-                .for_each(|(m, o)| absorb_into(m, domain, o));
-        });
-    } else {
-        for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
-            absorb_into(m, domain, o);
-        }
-    }
+    let plan = plan_hash_messages(messages, runtime_config().overrides().parallel);
+    execute_hash(plan, messages, domain, out, hash256_into);
 }
 
-/// Dispatches 128-bit hashing directly into `out`.
-/// Serializes only s0.
+// Dispatches 128-bit hashing directly into `out`.
+// Serializes only s0.
 pub(crate) fn dispatch_hash128_batch_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
     assert_eq!(
         messages.len(),
         out.len(),
         "dispatch_hash128_batch_into: length mismatch"
     );
+    let plan = plan_hash_messages(messages, runtime_config().overrides().parallel);
+    execute_hash(plan, messages, domain, out, hash128_into);
+}
 
-    #[inline(always)]
-    fn absorb_into(m: &[u8], domain: u128, out: &mut [u8; 16]) {
-        let (s0, _) = crate::api::absorb_with_domain(m, domain);
-        out.copy_from_slice(&s0.to_le_bytes());
-    }
+#[inline(always)]
+fn hash256_into(m: &[u8], domain: u128, out: &mut [u8; 32]) {
+    let (s0, s1) = crate::api::absorb_with_domain(m, domain);
+    out[..16].copy_from_slice(&s0.to_le_bytes());
+    out[16..].copy_from_slice(&s1.to_le_bytes());
+}
 
-    let len = messages.len();
-    if len == 0 {
-        return;
-    }
-    if len == 1 {
-        absorb_into(messages[0], domain, &mut out[0]);
-        return;
-    }
+#[inline(always)]
+fn hash128_into(m: &[u8], domain: u128, out: &mut [u8; 16]) {
+    let (s0, _) = crate::api::absorb_with_domain(m, domain);
+    out.copy_from_slice(&s0.to_le_bytes());
+}
 
-    let total_bytes: usize = messages
+// ==========================================
+// HASH PLAN
+// ==========================================
+
+// How a hash batch is executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HashParallel {
+    // Calling thread only.
+    Single,
+    // Rayon pool, one message per work item.
+    Rayon,
+}
+
+// Execution mode chosen for hash batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HashPlan {
+    pub(crate) parallel: HashParallel,
+}
+
+// Counts messages and sums their lengths before planning.
+fn plan_hash_messages(messages: &[&[u8]], parallel: ParallelPref) -> HashPlan {
+    let total_bytes = messages
         .iter()
         .map(|m| m.len())
         .fold(0, usize::saturating_add);
+    plan_hash_with(parallel, messages.len(), total_bytes)
+}
 
-    if len >= MT_THRESHOLD_MESSAGES || total_bytes >= MT_THRESHOLD_BYTES {
-        let pool = get_or_init_pool();
-        pool.install(|| {
-            messages
-                .par_iter()
-                .copied()
-                .zip(out.par_iter_mut())
-                .for_each(|(m, o)| absorb_into(m, domain, o));
-        });
+// Chooses the execution mode for `count` messages of `total_bytes` bytes.
+// Pure: no pool access.
+pub(crate) fn plan_hash(count: usize, total_bytes: usize) -> HashPlan {
+    let p = HASH_PARAMS;
+    let big = count >= p.mt_threshold_messages || total_bytes >= p.mt_threshold_bytes;
+    // One message gives the pool nothing to parallelize.
+    let parallel = if count < 2 || !big {
+        HashParallel::Single
     } else {
-        for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
-            absorb_into(m, domain, o);
+        HashParallel::Rayon
+    };
+    HashPlan { parallel }
+}
+
+// As `plan_hash`, with the caller's restriction.
+pub(crate) fn plan_hash_with(parallel: ParallelPref, count: usize, total_bytes: usize) -> HashPlan {
+    match parallel {
+        ParallelPref::Auto => plan_hash(count, total_bytes),
+        ParallelPref::Single => HashPlan {
+            parallel: HashParallel::Single,
+        },
+    }
+}
+
+// Runs a hash batch under `plan`. `absorb_into` writes the digest of a message.
+fn execute_hash<const N: usize>(
+    plan: HashPlan,
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) {
+    match plan.parallel {
+        HashParallel::Single => {
+            for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
+                absorb_into(m, domain, o);
+            }
         }
+        HashParallel::Rayon => match get_or_init_pool() {
+            Some(pool) => {
+                pool.install(|| {
+                    messages
+                        .par_iter()
+                        .copied()
+                        .zip(out.par_iter_mut())
+                        .for_each(|(m, o)| absorb_into(m, domain, o));
+                });
+            }
+            None => {
+                for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
+                    absorb_into(m, domain, o);
+                }
+            }
+        },
     }
 }
 
@@ -264,8 +285,8 @@ pub(crate) struct StreamLane {
     pub(crate) step: u64,
 }
 
-/// Raw output pointer shared between workers.
-/// Workers write disjoint blocks only (see `dispatch_streams`).
+// Raw output pointer shared between workers.
+// Workers write disjoint blocks only (see `dispatch_streams`).
 #[derive(Clone, Copy)]
 struct OutPtr(*mut [u8; 32]);
 
@@ -280,11 +301,11 @@ impl OutPtr {
     }
 }
 
-/// Advances `lanes` by `steps` rounds. The block of lane `first + i` at
-/// step `s` is written to `out[s * n + first + i]`.
-///
-/// SAFETY: `out` must be valid for `n * steps` blocks, `first + lanes.len() <= n`,
-/// and no other thread may write to this lane range.
+// Advances `lanes` by `steps` rounds. The block of lane `first + i` at
+// step `s` is written to `out[s * n + first + i]`.
+//
+// SAFETY: `out` must be valid for `n * steps` blocks, `first + lanes.len() <= n`,
+// and no other thread may write to this lane range.
 #[inline(always)]
 unsafe fn process_lanes_scalar(
     lanes: &mut [StreamLane],
@@ -308,9 +329,213 @@ unsafe fn process_lanes_scalar(
     }
 }
 
-/// Advances every lane by `steps` rounds.
-/// Output is step-major: `out[step * n + lane]`, with `n = lanes.len()`.
+// ==========================================
+// BACKEND
+// ==========================================
+
+// AVX2 capability.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Avx2Cap {
+    _proof: (),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Avx2Cap {
+    pub(crate) fn detect() -> Option<Self> {
+        std::arch::is_x86_feature_detected!("avx2").then_some(Self { _proof: () })
+    }
+}
+
+// Execution backend for stream lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2(Avx2Cap),
+}
+
+impl Backend {
+    // Stream policy parameters of this backend.
+    pub(crate) fn stream_params(self) -> StreamParams {
+        match self {
+            Backend::Scalar => SCALAR_STREAM,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2(_) => AVX2_STREAM,
+        }
+    }
+}
+
+// CPU capabilities that select a backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Caps {
+    #[cfg(target_arch = "x86_64")]
+    avx2: Option<Avx2Cap>,
+}
+
+impl Caps {
+    // Detect CPU capabilities.
+    pub(crate) fn detect() -> Self {
+        Caps {
+            #[cfg(target_arch = "x86_64")]
+            avx2: Avx2Cap::detect(),
+        }
+    }
+}
+
+// Backend for a workload of `n` lanes.
+// AVX2 needs the capability and one full x4 group of lanes.
+#[cfg(target_arch = "x86_64")]
+fn choose_backend(caps: Caps, n: usize) -> Backend {
+    match caps.avx2 {
+        Some(cap) if n >= AVX2_MIN_LANES => Backend::Avx2(cap),
+        _ => Backend::Scalar,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn choose_backend(_caps: Caps, _n: usize) -> Backend {
+    Backend::Scalar
+}
+
+// Runs one lane range on `backend`. AVX2 handles the largest multiple-of-4 prefix;
+// the remaining 0..=3 lanes use scalar. Same contract as `process_lanes_scalar`.
+#[inline(always)]
+unsafe fn process_lanes(
+    backend: Backend,
+    lanes: &mut [StreamLane],
+    out: *mut [u8; 32],
+    n: usize,
+    first: usize,
+    steps: usize,
+) {
+    match backend {
+        Backend::Scalar => process_lanes_scalar(lanes, out, n, first, steps),
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2(_) => {
+            let simd_len = lanes.len() & !3;
+            let (head, tail) = lanes.split_at_mut(simd_len);
+            if !head.is_empty() {
+                // SAFETY: `Avx2Cap` exists only after AVX2 detection.
+                crate::core_avx2::process_lanes_x4(head, out, n, first, steps);
+            }
+            if !tail.is_empty() {
+                process_lanes_scalar(tail, out, n, first + simd_len, steps);
+            }
+        }
+    }
+}
+
+// ==========================================
+// DISPATCH PLAN
+// ==========================================
+
+// How a stream workload is executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Parallel {
+    // Calling thread only.
+    Single,
+    // Rayon pool, `chunk` lanes per work item.
+    Rayon { chunk: usize },
+}
+
+// Backend and execution mode for one stream workload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DispatchPlan {
+    pub(crate) backend: Backend,
+    pub(crate) parallel: Parallel,
+}
+
+// Execution mode of `backend` for `n` lanes and `work = lanes * steps`.
+// `single` keeps the workload on the calling thread.
+fn plan_for(backend: Backend, single: bool, n: usize, work: usize) -> DispatchPlan {
+    let params = backend.stream_params();
+    let parallel = if single || n.div_ceil(params.chunk) < 2 || work < params.mt_threshold_work {
+        Parallel::Single
+    } else {
+        Parallel::Rayon {
+            chunk: params.chunk,
+        }
+    };
+    DispatchPlan { backend, parallel }
+}
+
+// ==========================================
+// PLAN OVERRIDES
+// ==========================================
+
+// Backend requested by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackendPref {
+    // Planner chooses.
+    Auto,
+    Scalar,
+}
+
+// Execution mode requested by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParallelPref {
+    // Planner chooses.
+    Auto,
+    // Calling thread only; the pool is never entered.
+    Single,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Overrides {
+    pub(crate) backend: BackendPref,
+    pub(crate) parallel: ParallelPref,
+}
+
+// Chooses backend and execution mode for `n` lanes and `steps` rounds, within the
+// caller's restrictions. Parallelism uses the stream parameters of the chosen backend.
+// Pure: no CPU detection, no pool access.
+pub(crate) fn plan_streams_with(
+    caps: Caps,
+    overrides: Overrides,
+    n: usize,
+    steps: usize,
+) -> DispatchPlan {
+    let work = n.saturating_mul(steps);
+    let backend = match overrides.backend {
+        BackendPref::Auto => choose_backend(caps, n),
+        BackendPref::Scalar => Backend::Scalar,
+    };
+    let single = overrides.parallel == ParallelPref::Single;
+    plan_for(backend, single, n, work)
+}
+
+// Advances every lane by `steps` rounds, planned for the capabilities of CPU and the runtime config.
+// Output is step-major: `out[step * n + lane]`, with `n = lanes.len()`.
 pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]], steps: usize) {
+    dispatch_streams_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        lanes,
+        out,
+        steps,
+    );
+}
+
+// As `dispatch_streams` for the given capability and restriction.
+fn dispatch_streams_with(
+    caps: Caps,
+    overrides: Overrides,
+    lanes: &mut [StreamLane],
+    out: &mut [[u8; 32]],
+    steps: usize,
+) {
+    let plan = plan_streams_with(caps, overrides, lanes.len(), steps);
+    execute_streams(plan, lanes, out, steps);
+}
+
+// Runs `plan`. Panics unless `out.len() == lanes.len() * steps`.
+fn execute_streams(
+    plan: DispatchPlan,
+    lanes: &mut [StreamLane],
+    out: &mut [[u8; 32]],
+    steps: usize,
+) {
     let n = lanes.len();
     let expected = n
         .checked_mul(steps)
@@ -325,24 +550,34 @@ pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]], s
         return;
     }
 
+    let backend = plan.backend;
     let out_ptr = OutPtr(out.as_mut_ptr());
 
-    if n.div_ceil(PARALLEL_CHUNK_STATES) < 2 || expected < MT_THRESHOLD_WORK {
-        // SAFETY: one call covers all lanes; out holds n * steps blocks.
-        unsafe { process_lanes_scalar(lanes, out_ptr.get(), n, 0, steps) };
-        return;
+    match plan.parallel {
+        Parallel::Single => {
+            // SAFETY: one call covers all lanes; out holds n * steps blocks.
+            unsafe { process_lanes(backend, lanes, out_ptr.get(), n, 0, steps) };
+        }
+        Parallel::Rayon { chunk } => match get_or_init_pool() {
+            Some(pool) => {
+                pool.install(|| {
+                    lanes
+                        .par_chunks_mut(chunk)
+                        .enumerate()
+                        .for_each(|(k, l_chunk)| {
+                            let first = k * chunk;
+                            // SAFETY: chunks cover disjoint lane ranges, and (step, lane)
+                            // maps to a unique index, so no two workers write the same block.
+                            unsafe {
+                                process_lanes(backend, l_chunk, out_ptr.get(), n, first, steps)
+                            };
+                        });
+                });
+            }
+            None => {
+                // SAFETY: fallback to single thread when pool creation fails.
+                unsafe { process_lanes(backend, lanes, out_ptr.get(), n, 0, steps) };
+            }
+        },
     }
-
-    let pool = get_or_init_pool();
-    pool.install(|| {
-        lanes
-            .par_chunks_mut(PARALLEL_CHUNK_STATES)
-            .enumerate()
-            .for_each(|(k, l_chunk)| {
-                let first = k * PARALLEL_CHUNK_STATES;
-                // SAFETY: chunks cover disjoint lane ranges, and (step, lane)
-                // maps to a unique index, so no two workers write the same block.
-                unsafe { process_lanes_scalar(l_chunk, out_ptr.get(), n, first, steps) };
-            });
-    });
 }

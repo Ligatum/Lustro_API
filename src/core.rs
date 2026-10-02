@@ -2,10 +2,10 @@
 // LUSTRO CORE V1 (SSOT) REFERENCE IMPLEMENTATION
 // ====================================================
 
-const PHI_64: u64 = 0x9E3779B97F4A7C15;
+pub(crate) const PHI_64: u64 = 0x9E3779B97F4A7C15;
 
-const PHI_64_ROT_23: u64 = PHI_64.rotate_left(23);
-const PHI_64_ROT_17: u64 = PHI_64.rotate_left(17);
+pub(crate) const PHI_64_ROT_23: u64 = PHI_64.rotate_left(23);
+pub(crate) const PHI_64_ROT_17: u64 = PHI_64.rotate_left(17);
 
 // ====================================================
 // IDM (SCALAR) (COMPONENT OF LUSTRO CORE, SSOT)
