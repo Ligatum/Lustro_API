@@ -1,4 +1,4 @@
-Please note this is still considered a beta release. I plan to release the final functional API by 05.10.2026.
+**Please note this is still considered a beta release. I plan to release the final API shortly. I am still due at least two major functionality updates.**
 
 # Lustro API
 
