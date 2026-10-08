@@ -101,6 +101,8 @@ void lustro_prng_batch_free(struct LustroPrngBatch *ctx);
 
 uintptr_t lustro_prng_batch_len(const struct LustroPrngBatch *ctx);
 
+uintptr_t lustro_prng_batch_suggested_steps(const struct LustroPrngBatch *ctx);
+
 LustroError lustro_prng_batch_fill_blocks(struct LustroPrngBatch *ctx,
                                           uint8_t *out,
                                           uintptr_t out_len,
@@ -169,6 +171,8 @@ struct LustroXofBatch *lustro_xof_batch_new(const uint8_t *const *message_ptrs,
 void lustro_xof_batch_free(struct LustroXofBatch *ctx);
 
 uintptr_t lustro_xof_batch_len(const struct LustroXofBatch *ctx);
+
+uintptr_t lustro_xof_batch_suggested_steps(const struct LustroXofBatch *ctx);
 
 LustroError lustro_xof_batch_fill_blocks(struct LustroXofBatch *ctx,
                                          uint8_t *out,

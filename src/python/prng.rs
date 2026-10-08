@@ -3,7 +3,7 @@
 
 use numpy::{PyArray3, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes};
+use pyo3::types::PyBytes;
 
 use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
@@ -13,14 +13,22 @@ use crate::types::{Seed256, StreamId};
 // STREAM SINGLE API
 // ==========================================
 
-#[pyclass]
+/// Deterministic random stream selected by `(seed, stream_id)`.
+///
+/// One instance is one stream. An instance must not be used by several threads
+/// at the same time: an overlapping call raises RuntimeError ("Already borrowed").
+/// Use `fork()` or separate instances for independent streams.
+#[pyclass(name = "LustroPrng")]
 pub struct LustroPrngPy {
     inner: LustroPrng,
 }
 
 #[pymethods]
 impl LustroPrngPy {
+    /// `seed` must be exactly 32 bytes (ValueError otherwise).
+    /// `stream_id` is an integer in `[0, 2**128)`, default 0.
     #[new]
+    #[pyo3(signature = (seed, stream_id=0))]
     pub fn new(seed: &[u8], stream_id: u128) -> PyResult<Self> {
         if seed.len() != 32 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -33,21 +41,25 @@ impl LustroPrngPy {
         })
     }
 
+    /// Next 8 bytes of the stream as an unsigned integer.
     pub fn next_u64(&mut self) -> u64 {
         self.inner.next_u64()
     }
 
+    /// Next 16 bytes of the stream as an unsigned integer.
     pub fn next_u128(&mut self) -> u128 {
         self.inner.next_u128()
     }
 
+    /// Next 32 bytes of the stream.
     pub fn next_block<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new_bound(py, &self.inner.next_block())
     }
 
-    // Returns `size` random bytes.
-    // Raises OverflowError if `size` exceeds isize::MAX, MemoryError if the
-    // buffer cannot be allocated.
+    /// Returns the next `size` bytes of the stream. The GIL is released while generating.
+    ///
+    /// Raises OverflowError if `size` exceeds isize::MAX, MemoryError if the
+    /// buffer cannot be allocated.
     pub fn fill<'py>(&mut self, py: Python<'py>, size: usize) -> PyResult<Bound<'py, PyBytes>> {
         if size > isize::MAX as usize {
             return Err(pyo3::exceptions::PyOverflowError::new_err(
@@ -58,31 +70,49 @@ impl LustroPrngPy {
             py.allow_threads(|| self.inner.fill_bytes(buf));
             Ok(())
         })
+        .map_err(|e| {
+            if e.is_instance_of::<pyo3::exceptions::PyMemoryError>(py) {
+                crate::python::alloc_error()
+            } else {
+                e
+            }
+        })
     }
 
-    // Fills an existing bytearray in-place without allocation.
-    pub fn fill_into(&mut self, _py: Python<'_>, buf: &Bound<'_, PyByteArray>) {
-        // SAFETY: GIL prevents concurrent resize or drop of the buffer.
-        let slice = unsafe { buf.as_bytes_mut() };
-        self.inner.fill_bytes(slice);
+    /// Fills a writable, C-contiguous byte buffer (bytearray, writable memoryview,
+    /// numpy uint8 array) in place with the next `len(buf)` bytes of the stream.
+    /// The GIL is held while writing. Raises TypeError for any other object, a
+    /// read-only or non-contiguous buffer, or a buffer whose items are not bytes.
+    pub fn fill_into(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<()> {
+        crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
 
-    // Returns a generator with identical stream state.
-    pub fn clone_rng(&self) -> Self {
+    /// Returns an independent generator with identical stream state.
+    pub fn copy(&self) -> Self {
         Self {
             inner: self.inner.clone(),
         }
     }
 
-    // Derives a child generator from the current state and identifier.
+    pub fn __copy__(&self) -> Self {
+        self.copy()
+    }
+
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy()
+    }
+
+    /// Derives a child generator from the current state and `id`.
+    /// The parent is not advanced.
     pub fn fork(&self, id: u128) -> Self {
         Self {
             inner: self.inner.fork(StreamId(id)),
         }
     }
 
-    // Derives a generator from `seed` along `path`.
-    // `path` must not be empty.
+    /// Derives a generator from `seed` along `path`:
+    /// `LustroPrng(seed, path[0]).fork(path[1]).fork(path[2])...`
+    /// `path` must not be empty (ValueError).
     #[staticmethod]
     pub fn derive_path(seed: &[u8], path: Vec<u128>) -> PyResult<Self> {
         if seed.len() != 32 {
@@ -102,17 +132,19 @@ impl LustroPrngPy {
         })
     }
 
+    // State is not printed.
     pub fn __repr__(&self) -> String {
-        format!("{:?}", self.inner)
+        "LustroPrng(<redacted>)".to_string()
     }
 
-    // Exports the current snapshot as 56 bytes.
+    /// Exports the current state as 56 bytes.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
         PyBytes::new_bound(py, &snapshot.to_le_bytes())
     }
 
-    /// Restores a generator from snapshot bytes.
+    /// Restores a generator from `export_snapshot()` bytes.
+    /// Raises ValueError for a wrong length, version, kind or cursor.
     #[staticmethod]
     pub fn import_snapshot(bytes: &[u8]) -> PyResult<Self> {
         let array_ref: &[u8; 56] = bytes.try_into().map_err(|_| {
@@ -132,7 +164,14 @@ impl LustroPrngPy {
 // STREAM BATCH API
 // ==========================================
 
-#[pyclass]
+/// Many independent streams of one seed, advanced together.
+///
+/// Lane `i` is the same stream as `LustroPrng(seed, stream_ids[i])`. Output is
+/// written by `fill_blocks()`. The batch keeps an internal buffer the size of its
+/// largest `fill_blocks()` call until it is dropped; `release_buffer()` frees it
+/// earlier. An instance must not be used by several threads at the same time: an
+/// overlapping call raises RuntimeError ("Already borrowed").
+#[pyclass(name = "LustroPrngBatch")]
 pub struct LustroPrngBatchPy {
     inner: LustroPrngBatch,
     blocks_buf: Vec<[u8; 32]>,
@@ -140,8 +179,9 @@ pub struct LustroPrngBatchPy {
 
 #[pymethods]
 impl LustroPrngBatchPy {
-    // Creates a batch from explicit stream identifiers.
-    #[staticmethod]
+    /// Creates a batch with one lane per entry of `stream_ids`.
+    /// `seed` must be exactly 32 bytes (ValueError otherwise).
+    #[new]
     pub fn new(seed: &[u8], stream_ids: Vec<u128>) -> PyResult<Self> {
         if seed.len() != 32 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -157,6 +197,8 @@ impl LustroPrngBatchPy {
         })
     }
 
+    /// Creates `count` lanes with ids `first_stream_id`, `first_stream_id + 1`, ...
+    /// (modulo 2**128). Raises MemoryError if the lanes cannot be allocated.
     #[staticmethod]
     pub fn new_range(seed: &[u8], first_stream_id: u128, count: usize) -> PyResult<Self> {
         if seed.len() != 32 {
@@ -173,22 +215,72 @@ impl LustroPrngBatchPy {
         })
     }
 
+    /// Number of lanes.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    /// True if there are no lanes.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    // Advances all streams by `steps` rounds.
-    // Output is step-major, shape `(steps, n_streams, 4)`.
+    pub fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    // Length only; stream state is not printed.
+    pub fn __repr__(&self) -> String {
+        format!("LustroPrngBatch(len={})", self.inner.len())
+    }
+
+    /// Returns an independent batch with identical lane states.
+    pub fn copy(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            blocks_buf: Vec::new(),
+        }
+    }
+
+    pub fn __copy__(&self) -> Self {
+        self.copy()
+    }
+
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy()
+    }
+
+    /// Frees the internal buffer kept by `fill_blocks()`. The next call allocates
+    /// it again if needed. It does not change the state of the lanes.
+    pub fn release_buffer(&mut self) {
+        self.blocks_buf = Vec::new();
+    }
+
+    /// Suggested `steps` for `fill_blocks()` at the current `len()`.
+    /// A speed hint: it does not change the output or the state.
+    pub fn suggested_steps(&self) -> usize {
+        self.inner.suggested_steps()
+    }
+
+    /// Advances every lane by `steps` stream steps and writes the blocks to `out`.
+    ///
+    /// `out` is a writable, C-contiguous, aligned uint64 array of shape
+    /// `(steps, len(self), 4)`. Output is step-major: `out[s, i]` is block `s` of
+    /// lane `i` (32 bytes as 4 little-endian uint64). The bytes do not depend on
+    /// how steps are split across calls. The GIL is released while generating.
+    ///
+    /// Raises ValueError for a wrong shape or a non-contiguous or misaligned array.
+    /// TypeError is raised for a wrong type, dtype or ndim. Read-only or conflicting
+    /// borrows raise the corresponding Python error.
     pub fn fill_blocks(
         &mut self,
         py: Python<'_>,
-        out: &Bound<'_, PyArray3<u64>>,
+        out: &Bound<'_, PyAny>,
         steps: usize,
     ) -> PyResult<()> {
+        let out = out.downcast::<PyArray3<u64>>().map_err(|_| {
+            crate::python::array_type_error("out", "a 3D numpy.ndarray of dtype uint64")
+        })?;
         // Read before borrowing: `try_readwrite` itself does not touch the data.
         let misaligned = (out.data() as usize) % std::mem::align_of::<u64>() != 0;
         // Use the non-panicking mutable borrow API so read-only or conflicting borrows become Python errors.
@@ -248,17 +340,11 @@ impl LustroPrngBatchPy {
                  e.g. from slicing or transposing — call np.ascontiguousarray() first)",
             )
         })?;
-        for (block, words) in buf.iter().zip(flat.chunks_exact_mut(4)) {
-            words[0] = u64::from_le_bytes(block[0..8].try_into().unwrap());
-            words[1] = u64::from_le_bytes(block[8..16].try_into().unwrap());
-            words[2] = u64::from_le_bytes(block[16..24].try_into().unwrap());
-            words[3] = u64::from_le_bytes(block[24..32].try_into().unwrap());
-        }
+        crate::python::blocks_to_words(buf, flat);
         Ok(())
     }
 
-    // Derives one child generator per lane.
-    // `ids.len()` must equal `len()`.
+    /// Derives one child per lane; `len(ids)` must equal `len(self)` (ValueError).
     pub fn fork(&self, ids: Vec<u128>) -> PyResult<Self> {
         if ids.len() != self.inner.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -273,8 +359,8 @@ impl LustroPrngBatchPy {
         })
     }
 
-    // Derives `len(ids)` children per lane. Output is parent-major:
-    // child `j` of lane `i` is at index `i * len(ids) + j`.
+    /// Derives `len(ids)` children per lane. Parent-major order:
+    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result.
     pub fn fork_many(&self, ids: Vec<u128>) -> PyResult<Self> {
         self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")
@@ -290,8 +376,9 @@ impl LustroPrngBatchPy {
         })
     }
 
-    // Derives a canonical batch: one lane per root, each walked along `path`.
-    // `path` must not be empty. Empty `roots` produces an empty batch.
+    /// One lane per root, each walked along `path`; lane `i` equals
+    /// `LustroPrng.derive_path(seed, [roots[i], *path])`.
+    /// `path` must not be empty (ValueError). Empty `roots` gives an empty batch.
     #[staticmethod]
     pub fn derive_path(seed: &[u8], roots: Vec<u128>, path: Vec<u128>) -> PyResult<Self> {
         if seed.len() != 32 {
@@ -314,7 +401,7 @@ impl LustroPrngBatchPy {
         })
     }
 
-    // Derives sequential child identifiers starting at `first`.
+    /// Derives one child per lane with ids `first`, `first + 1`, ... (modulo 2**128).
     pub fn fork_range(&self, first: u128) -> Self {
         let inner = self.inner.fork_range(StreamId(first));
         Self {
@@ -323,14 +410,14 @@ impl LustroPrngBatchPy {
         }
     }
 
-    // Exports the current batch snapshot.
-    // Length: `16 + len() * 48` bytes.
+    /// Exports the current state as `16 + len(self) * 48` bytes.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
         PyBytes::new_bound(py, &snapshot.to_le_bytes())
     }
 
-    /// Restores a batch from snapshot bytes.
+    /// Restores a batch from `export_snapshot()` bytes.
+    /// Raises ValueError for a wrong length, version, kind or lane count.
     #[staticmethod]
     pub fn import_snapshot(bytes: &[u8]) -> PyResult<Self> {
         let snapshot = crate::types::LustroPrngBatchSnapshot::from_le_bytes(bytes)

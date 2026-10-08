@@ -25,14 +25,21 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use pyo3::wrap_pyfunction;
 
+/// Diffusion-based hash, PRNG and XOF engine.
 #[cfg(feature = "python")]
 #[pymodule]
 fn lustro(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<python::hash::LustroHashPy>()?;
+    m.add_function(wrap_pyfunction!(python::hash::hash256_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash128_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash256_many_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash128_many_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash256_many_var_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_py, m)?)?;
     m.add_class::<python::prng::LustroPrngPy>()?;
     m.add_class::<python::prng::LustroPrngBatchPy>()?;
     m.add_class::<python::xof::LustroXofPy>()?;
     m.add_class::<python::xof::LustroXofBatchPy>()?;
     m.add_function(wrap_pyfunction!(python::lustro_api_version, m)?)?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

@@ -1,9 +1,9 @@
-//! Lustro V1 — pure Rust PRNG API.
+//! Lustro V1 — PRNG API.
 //! Each instance is an independent stream.
 
 use crate::api::{derive_branch_stream, derive_path_lane, fork_lane, prepare_base, StreamState};
 use crate::constants::Domain;
-use crate::dispatch::{dispatch_streams, StreamLane};
+use crate::dispatch::{dispatch_streams, suggested_steps, StreamLane};
 use crate::types::{LustroPrngBatchSnapshot, LustroPrngSnapshot, Seed256, StreamId};
 use std::collections::TryReserveError;
 
@@ -54,7 +54,7 @@ impl LustroPrng {
         self.state.read_full_block()
     }
 
-    // Fills `out` with random bytes while preserving stream continuity.
+    // Fills `out` and advances the stream.
     pub fn fill_bytes(&mut self, out: &mut [u8]) {
         self.state.fill_bytes(out);
     }
@@ -162,6 +162,12 @@ impl LustroPrngBatch {
         self.streams.is_empty()
     }
 
+    // Suggested `steps` for `fill_blocks` at the current `len()`.
+    #[inline]
+    pub fn suggested_steps(&self) -> usize {
+        suggested_steps(self.streams.len())
+    }
+
     // Fills `out` with `steps` blocks per stream.
     // Output is step-major: `out[step * len() + lane]`.
     pub fn fill_blocks(&mut self, out: &mut [[u8; 32]], steps: usize) {
@@ -233,10 +239,8 @@ impl LustroPrngBatch {
         Ok(Self { streams })
     }
 
-    // Derives a canonical batch: one lane per root, each walked along `path`.
-    // Lane `i` equals `LustroPrng::new(seed, roots[i])` followed by `fork`
-    // for each id in `path`. Depends only on `seed`, `roots`, and `path` —
-    // independent of any other stream's state.
+    // Derives one lane per root by walking each root along `path`.
+    // Equivalent to `new(seed, roots[i])` followed by `fork` for each id.
     // Panics if `path` is empty. Empty `roots` produces an empty batch.
     pub fn derive_path(seed: &Seed256, roots: &[StreamId], path: &[StreamId]) -> Self {
         assert!(!path.is_empty(), "derive_path: path must not be empty");

@@ -21,9 +21,6 @@ pub unsafe extern "C" fn lustro_hash256(
         if !fits_slice::<u8>(data_len) {
             return LustroError::InvalidLength;
         }
-        if !fits_slice::<u8>(data_len) {
-            return LustroError::InvalidLength;
-        }
         match ranges_overlap(data, data_len, out as *const u8, 32) {
             Some(true) => return LustroError::InvalidPointer,
             Some(false) => {}
@@ -53,9 +50,6 @@ pub unsafe extern "C" fn lustro_hash128(
     out: *mut u8,
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {
-        if !fits_slice::<u8>(data_len) {
-            return LustroError::InvalidLength;
-        }
         if !fits_slice::<u8>(data_len) {
             return LustroError::InvalidLength;
         }

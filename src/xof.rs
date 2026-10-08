@@ -1,9 +1,9 @@
-//! Lustro V1 — pure Rust XOF API.
+//! Lustro V1 — XOF API.
 //! Output stream is derived from an absorbed message.
 
 use crate::api::{absorb_with_domain, derive_path_lane, fork_lane, StreamState};
 use crate::constants::Domain;
-use crate::dispatch::{dispatch_streams, StreamLane};
+use crate::dispatch::{dispatch_streams, suggested_steps, StreamLane};
 use crate::types::{LustroXofBatchSnapshot, LustroXofSnapshot, StreamId};
 use std::collections::TryReserveError;
 
@@ -46,7 +46,7 @@ impl LustroXof {
         self.state.read_full_block()
     }
 
-    // Fills `out` with output bytes while preserving stream continuity.
+    // Fills `out` and advances the stream.
     pub fn fill_bytes(&mut self, out: &mut [u8]) {
         self.state.fill_bytes(out);
     }
@@ -123,6 +123,12 @@ impl LustroXofBatch {
         self.streams.is_empty()
     }
 
+    // Suggested `steps` for `fill_blocks` at the current `len()`.
+    #[inline]
+    pub fn suggested_steps(&self) -> usize {
+        suggested_steps(self.streams.len())
+    }
+
     // Fills `out` with `steps` blocks per stream.
     // Output is step-major: `out[step * len() + lane]`.
     pub fn fill_blocks(&mut self, out: &mut [[u8; 32]], steps: usize) {
@@ -194,10 +200,8 @@ impl LustroXofBatch {
         Ok(Self { streams })
     }
 
-    // Derives a canonical batch: one lane per message, each walked along `path`.
-    // Lane `i` equals `LustroXof::new(messages[i])` followed by `fork` for
-    // each id in `path`. Depends only on `messages` and `path` — independent
-    // of any other stream's state.
+    // Derives one lane per message by walking each stream along `path`.
+    // Equivalent to `new(messages[i])` followed by `fork` for each id.
     // Panics if `path` is empty. Empty `messages` produces an empty batch.
     pub fn derive_path(messages: &[&[u8]], path: &[StreamId]) -> Self {
         assert!(!path.is_empty(), "derive_path: path must not be empty");

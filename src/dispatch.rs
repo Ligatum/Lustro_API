@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 // ==========================================
@@ -42,14 +43,14 @@ pub(crate) struct StreamParams {
 }
 
 const SCALAR_STREAM: StreamParams = StreamParams {
-    chunk: 162,
+    chunk: 32,
     mt_threshold_work: 1536,
 };
 const _: () = assert!(SCALAR_STREAM.chunk > 0);
 
 #[cfg(target_arch = "x86_64")]
 const AVX2_STREAM: StreamParams = StreamParams {
-    chunk: 216,
+    chunk: 64,
     mt_threshold_work: 2048,
 };
 #[cfg(target_arch = "x86_64")]
@@ -59,6 +60,49 @@ const _: () = assert!(AVX2_STREAM.chunk > 0 && AVX2_STREAM.chunk.is_multiple_of(
 // Minimum lanes for one x4 kernel group.
 #[cfg(target_arch = "x86_64")]
 const AVX2_MIN_LANES: usize = 4;
+
+// Suggested `steps` by lane count. Same policy for PRNG and XOF.
+// Each entry is `(max_n, steps)`; `tail` applies above the last entry.
+// Larger `steps` amortizes call cost; for larger batches, reduce `steps`
+// to limit cache pressure. Small-N entries also avoid premature MT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StepsPolicy {
+    table: &'static [(usize, usize)],
+    tail: usize,
+}
+
+impl StepsPolicy {
+    fn steps_for(self, n: usize) -> usize {
+        self.table
+            .iter()
+            .find(|&&(max_n, _)| n <= max_n)
+            .map_or(self.tail, |&(_, steps)| steps)
+    }
+}
+
+const SCALAR_STEPS: StepsPolicy = StepsPolicy {
+    table: &[(95, 16), (111, 12)],
+    tail: 32,
+};
+
+#[cfg(target_arch = "x86_64")]
+const AVX2_STEPS: StepsPolicy = StepsPolicy {
+    table: &[
+        (64, 32),
+        (85, 24),
+        (127, 16),
+        (159, 12),
+        (11_800, 32),
+        (14_500, 24),
+        (23_500, 16),
+        (28_500, 12),
+        (43_000, 8),
+        (75_000, 4),
+        (118_000, 2),
+        (180_000, 1),
+    ],
+    tail: 32,
+};
 
 // ==========================================
 // RUNTIME CONFIG
@@ -133,19 +177,36 @@ fn runtime_config() -> RuntimeConfig {
 
 static RAYON_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
+// PID of the process that owns pool initialization. 0 = unclaimed.
+static POOL_OWNER: AtomicU32 = AtomicU32::new(0);
+
 // Initializes the dispatcher's Rayon pool once.
+// A process that inherited the pool through `fork` uses the single-threaded fallback.
 pub(crate) fn init_pool() {
+    let pid = std::process::id();
+    let _ = POOL_OWNER.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire);
+    if POOL_OWNER.load(Ordering::Acquire) != pid {
+        return;
+    }
     RAYON_POOL.get_or_init(|| {
         let workers = runtime_config()
             .threads
             .map_or_else(logical_cpus, NonZeroUsize::get);
 
-        ThreadPoolBuilder::new().num_threads(workers).build().ok()
+        ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .ok()
     });
 }
 
+// None if the pool could not be built or this process inherited it through `fork`.
+// Callers then use the calling thread.
 fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
     init_pool();
+    if POOL_OWNER.load(Ordering::Acquire) != std::process::id() {
+        return None;
+    }
     RAYON_POOL.get().and_then(|opt| opt.as_ref())
 }
 
@@ -301,7 +362,7 @@ impl OutPtr {
     }
 }
 
-// Advances `lanes` by `steps` rounds. The block of lane `first + i` at
+// Advances `lanes` by `steps` stream steps. The block of lane `first + i` at
 // step `s` is written to `out[s * n + first + i]`.
 //
 // SAFETY: `out` must be valid for `n * steps` blocks, `first + lanes.len() <= n`,
@@ -362,6 +423,15 @@ impl Backend {
             Backend::Scalar => SCALAR_STREAM,
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2(_) => AVX2_STREAM,
+        }
+    }
+
+    // Suggested `steps` table of this backend.
+    fn steps_policy(self) -> StepsPolicy {
+        match self {
+            Backend::Scalar => SCALAR_STEPS,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2(_) => AVX2_STEPS,
         }
     }
 }
@@ -487,7 +557,7 @@ pub(crate) struct Overrides {
     pub(crate) parallel: ParallelPref,
 }
 
-// Chooses backend and execution mode for `n` lanes and `steps` rounds, within the
+// Chooses backend and execution mode for `n` lanes and `steps` stream steps, within the
 // caller's restrictions. Parallelism uses the stream parameters of the chosen backend.
 // Pure: no CPU detection, no pool access.
 pub(crate) fn plan_streams_with(
@@ -497,15 +567,31 @@ pub(crate) fn plan_streams_with(
     steps: usize,
 ) -> DispatchPlan {
     let work = n.saturating_mul(steps);
-    let backend = match overrides.backend {
-        BackendPref::Auto => choose_backend(caps, n),
-        BackendPref::Scalar => Backend::Scalar,
-    };
+    let backend = backend_for(caps, overrides, n);
     let single = overrides.parallel == ParallelPref::Single;
     plan_for(backend, single, n, work)
 }
 
-// Advances every lane by `steps` rounds, planned for the capabilities of CPU and the runtime config.
+// Backend for `n` lanes within the caller's restriction.
+fn backend_for(caps: Caps, overrides: Overrides, n: usize) -> Backend {
+    match overrides.backend {
+        BackendPref::Auto => choose_backend(caps, n),
+        BackendPref::Scalar => Backend::Scalar,
+    }
+}
+
+// Suggested `steps` for `n` lanes under the selected backend.
+// Pure: no CPU detection or pool access.
+pub(crate) fn suggested_steps_with(caps: Caps, overrides: Overrides, n: usize) -> usize {
+    backend_for(caps, overrides, n).steps_policy().steps_for(n)
+}
+
+// Suggested `steps` for the current CPU and runtime config.
+pub(crate) fn suggested_steps(n: usize) -> usize {
+    suggested_steps_with(Caps::detect(), runtime_config().overrides(), n)
+}
+
+// Advances every lane by `steps` stream steps, planned for the capabilities of CPU and the runtime config.
 // Output is step-major: `out[step * n + lane]`, with `n = lanes.len()`.
 pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]], steps: usize) {
     dispatch_streams_with(
@@ -568,9 +654,7 @@ fn execute_streams(
                             let first = k * chunk;
                             // SAFETY: chunks cover disjoint lane ranges, and (step, lane)
                             // maps to a unique index, so no two workers write the same block.
-                            unsafe {
-                                process_lanes(backend, l_chunk, out_ptr.get(), n, first, steps)
-                            };
+                            unsafe { process_lanes(backend, l_chunk, out_ptr.get(), n, first, steps) };
                         });
                 });
             }

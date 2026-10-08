@@ -6,3 +6,9 @@ build-backend = "maturin"
 bindings = "pyo3"
 features = ["python"]
 profile  = "release"
+
+[project]
+name = "lustro"
+readme = "README.md"
+dependencies = ["numpy"]
+dynamic = ["version"]

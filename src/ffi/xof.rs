@@ -70,7 +70,7 @@ pub unsafe extern "C" fn lustro_xof_next_u128(ctx: *mut LustroXof, out: *mut u8)
     })
 }
 
-// Returns one full 32-byte engine block.
+// Returns the next 32-byte block and advances the stream.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_block(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -296,7 +296,17 @@ pub unsafe extern "C" fn lustro_xof_batch_len(ctx: *const LustroXofBatch) -> usi
     (*ctx).len()
 }
 
-// Advances all streams by `steps` rounds.
+// Returns the suggested `steps` for `fill_blocks` at the batch length,
+// or 0 for null `ctx`. Speed hint only.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_suggested_steps(ctx: *const LustroXofBatch) -> usize {
+    if ctx.is_null() {
+        return 0;
+    }
+    (*ctx).suggested_steps()
+}
+
+// Advances all streams by `steps` stream steps.
 // `out_len` must equal `batch_len * steps * 32`.
 // Output is step-major: the block of `lane` at `step` starts at
 // byte offset `(step * batch_len + lane) * 32`.
@@ -441,10 +451,10 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     })
 }
 
-// Derives a canonical batch: one lane per message, each walked along a path
+// Derives one lane per message by walking each stream along a path
 // of `n_path` identifiers. Messages are passed as parallel pointer/length
-// arrays; path IDs as parallel `(hi, lo)` u64 arrays. `n_path` must be
-// nonzero; `n_messages` may be zero.
+// arrays; path IDs as parallel `(hi, lo)` u64 arrays.
+// `n_path` must be nonzero; `n_messages` may be zero.
 // Returns null on invalid input, including an empty path.
 //
 // # Safety

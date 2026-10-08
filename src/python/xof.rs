@@ -3,7 +3,7 @@
 
 use numpy::{PyArray3, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes};
+use pyo3::types::{PyBytes, PyList};
 
 use crate::types::StreamId;
 use crate::xof::{LustroXof, LustroXofBatch};
@@ -12,13 +12,19 @@ use crate::xof::{LustroXof, LustroXofBatch};
 // XOF SINGLE API
 // ==========================================
 
-#[pyclass]
+/// Deterministic output stream derived from an absorbed message.
+///
+/// One instance is one stream. An instance must not be used by several threads
+/// at the same time: an overlapping call raises RuntimeError ("Already borrowed").
+/// Use `fork()` or separate instances for independent streams.
+#[pyclass(name = "LustroXof")]
 pub struct LustroXofPy {
     inner: LustroXof,
 }
 
 #[pymethods]
 impl LustroXofPy {
+    /// `message` is a bytes object of any length, including empty.
     #[new]
     pub fn new(message: &[u8]) -> Self {
         Self {
@@ -26,21 +32,25 @@ impl LustroXofPy {
         }
     }
 
+    /// Next 8 bytes of the stream as an unsigned integer.
     pub fn next_u64(&mut self) -> u64 {
         self.inner.next_u64()
     }
 
+    /// Next 16 bytes of the stream as an unsigned integer.
     pub fn next_u128(&mut self) -> u128 {
         self.inner.next_u128()
     }
 
+    /// Next 32 bytes of the stream.
     pub fn next_block<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new_bound(py, &self.inner.next_block())
     }
 
-    // Returns `size` output bytes.
-    // Raises OverflowError if `size` exceeds isize::MAX, MemoryError if the
-    // buffer cannot be allocated.
+    /// Returns the next `size` bytes of the stream. The GIL is released while generating.
+    ///
+    /// Raises OverflowError if `size` exceeds isize::MAX, MemoryError if the
+    /// buffer cannot be allocated.
     pub fn fill<'py>(&mut self, py: Python<'py>, size: usize) -> PyResult<Bound<'py, PyBytes>> {
         if size > isize::MAX as usize {
             return Err(pyo3::exceptions::PyOverflowError::new_err(
@@ -51,31 +61,49 @@ impl LustroXofPy {
             py.allow_threads(|| self.inner.fill_bytes(buf));
             Ok(())
         })
+        .map_err(|e| {
+            if e.is_instance_of::<pyo3::exceptions::PyMemoryError>(py) {
+                crate::python::alloc_error()
+            } else {
+                e
+            }
+        })
     }
 
-    // Fills an existing bytearray in-place without allocation.
-    pub fn fill_into(&mut self, _py: Python<'_>, buf: &Bound<'_, PyByteArray>) {
-        // SAFETY: GIL prevents concurrent resize or drop of the buffer.
-        let slice = unsafe { buf.as_bytes_mut() };
-        self.inner.fill_bytes(slice);
+    /// Fills a writable, C-contiguous byte buffer (bytearray, writable memoryview,
+    /// numpy uint8 array) in place with the next `len(buf)` bytes of the stream.
+    /// The GIL is held while writing. Raises TypeError for any other object, a
+    /// read-only or non-contiguous buffer, or a buffer whose items are not bytes.
+    pub fn fill_into(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<()> {
+        crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
 
-    // Returns an XOF with identical stream state.
-    pub fn clone_xof(&self) -> Self {
+    /// Returns an independent XOF with identical stream state.
+    pub fn copy(&self) -> Self {
         Self {
             inner: self.inner.clone(),
         }
     }
 
-    // Derives a child XOF from the current state and identifier.
+    pub fn __copy__(&self) -> Self {
+        self.copy()
+    }
+
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy()
+    }
+
+    /// Derives a child XOF from the current state and `id`.
+    /// The parent is not advanced.
     pub fn fork(&self, id: u128) -> Self {
         Self {
             inner: self.inner.fork(StreamId(id)),
         }
     }
 
-    // Derives an XOF from `message` along `path`.
-    // `path` must not be empty.
+    /// Derives an XOF from `message` along `path`:
+    /// `LustroXof(message).fork(path[0]).fork(path[1])...`
+    /// `path` must not be empty (ValueError).
     #[staticmethod]
     pub fn derive_path(message: &[u8], path: Vec<u128>) -> PyResult<Self> {
         if path.is_empty() {
@@ -89,17 +117,19 @@ impl LustroXofPy {
         })
     }
 
+    // State is not printed.
     pub fn __repr__(&self) -> String {
-        format!("{:?}", self.inner)
+        "LustroXof(<redacted>)".to_string()
     }
 
-    // Exports the current snapshot as 56 bytes.
+    /// Exports the current state as 56 bytes.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
         PyBytes::new_bound(py, &snapshot.to_le_bytes())
     }
 
-    // Restores a generator from snapshot bytes.
+    /// Restores an XOF from `export_snapshot()` bytes.
+    /// Raises ValueError for a wrong length, version, kind or cursor.
     #[staticmethod]
     pub fn import_snapshot(bytes: &[u8]) -> PyResult<Self> {
         let array_ref: &[u8; 56] = bytes.try_into().map_err(|_| {
@@ -118,7 +148,14 @@ impl LustroXofPy {
 // XOF BATCH API
 // ==========================================
 
-#[pyclass]
+/// Many independent XOF streams, advanced together.
+///
+/// Lane `i` is the same stream as `LustroXof(messages[i])`. Output is written by
+/// `fill_blocks()`. The batch keeps an internal buffer the size of its largest
+/// `fill_blocks()` call until it is dropped; `release_buffer()` frees it earlier.
+/// An instance must not be used by several threads at the same time: an
+/// overlapping call raises RuntimeError ("Already borrowed").
+#[pyclass(name = "LustroXofBatch")]
 pub struct LustroXofBatchPy {
     inner: LustroXofBatch,
     blocks_buf: Vec<[u8; 32]>,
@@ -126,32 +163,85 @@ pub struct LustroXofBatchPy {
 
 #[pymethods]
 impl LustroXofBatchPy {
-    #[staticmethod]
-    pub fn new(messages: Vec<Vec<u8>>) -> Self {
-        let refs: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
+    /// Creates a batch with one lane per message. `messages` is a list of bytes
+    /// objects (TypeError for any other container or item type).
+    #[new]
+    pub fn new(messages: &Bound<'_, PyList>) -> PyResult<Self> {
+        let items = crate::python::list_items(messages)?;
+        let refs: Vec<&[u8]> = items.iter().map(|b| b.as_bytes()).collect();
         let inner = LustroXofBatch::new(&refs);
-        Self {
+        Ok(Self {
             inner,
             blocks_buf: Vec::new(),
-        }
+        })
     }
 
+    /// Number of lanes.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    /// True if there are no lanes.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    // Advances all streams by `steps` rounds.
-    // Output is step-major, shape `(steps, n_streams, 4)`.
+    pub fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    // Length only; stream state is not printed.
+    pub fn __repr__(&self) -> String {
+        format!("LustroXofBatch(len={})", self.inner.len())
+    }
+
+    /// Returns an independent batch with identical lane states.
+    pub fn copy(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            blocks_buf: Vec::new(),
+        }
+    }
+
+    pub fn __copy__(&self) -> Self {
+        self.copy()
+    }
+
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy()
+    }
+
+    /// Frees the internal buffer kept by `fill_blocks()`. The next call allocates
+    /// it again if needed. It does not change the state of the lanes.
+    pub fn release_buffer(&mut self) {
+        self.blocks_buf = Vec::new();
+    }
+
+    /// Suggested `steps` for `fill_blocks()` at the current `len()`.
+    /// A speed hint: it does not change the output or the state.
+    pub fn suggested_steps(&self) -> usize {
+        self.inner.suggested_steps()
+    }
+
+    /// Advances every lane by `steps` stream steps and writes the blocks to `out`.
+    ///
+    /// `out` is a writable, C-contiguous, aligned uint64 array of shape
+    /// `(steps, len(self), 4)`. Output is step-major: `out[s, i]` is block `s` of
+    /// lane `i` (32 bytes as 4 little-endian uint64). The bytes do not depend on
+    /// how steps are split across calls. The GIL is released while generating.
+    ///
+    /// Raises ValueError for a wrong shape or a non-contiguous or misaligned array.
+    /// TypeError is raised for a wrong type, dtype or ndim. Read-only or conflicting
+    /// borrows raise the corresponding Python error.
     pub fn fill_blocks(
         &mut self,
         py: Python<'_>,
-        out: &Bound<'_, PyArray3<u64>>,
+        out: &Bound<'_, PyAny>,
         steps: usize,
     ) -> PyResult<()> {
+        let out = out.downcast::<PyArray3<u64>>().map_err(|_| {
+            crate::python::array_type_error("out", "a 3D numpy.ndarray of dtype uint64")
+        })?;
         // Read before borrowing: `try_readwrite` itself does not touch the data.
         let misaligned = (out.data() as usize) % std::mem::align_of::<u64>() != 0;
         // Use the non-panicking mutable borrow API so read-only or conflicting borrows become Python errors.
@@ -211,17 +301,11 @@ impl LustroXofBatchPy {
                  e.g. from slicing or transposing — call np.ascontiguousarray() first)",
             )
         })?;
-        for (block, words) in buf.iter().zip(flat.chunks_exact_mut(4)) {
-            words[0] = u64::from_le_bytes(block[0..8].try_into().unwrap());
-            words[1] = u64::from_le_bytes(block[8..16].try_into().unwrap());
-            words[2] = u64::from_le_bytes(block[16..24].try_into().unwrap());
-            words[3] = u64::from_le_bytes(block[24..32].try_into().unwrap());
-        }
+        crate::python::blocks_to_words(buf, flat);
         Ok(())
     }
 
-    // Derives one child XOF per lane.
-    // `ids.len()` must equal `len()`.
+    /// Derives one child per lane; `len(ids)` must equal `len(self)` (ValueError).
     pub fn fork(&self, ids: Vec<u128>) -> PyResult<Self> {
         if ids.len() != self.inner.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -236,8 +320,8 @@ impl LustroXofBatchPy {
         })
     }
 
-    // Derives `len(ids)` children per lane. Output is parent-major:
-    // child `j` of lane `i` is at index `i * len(ids) + j`.
+    /// Derives `len(ids)` children per lane. Parent-major order:
+    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result.
     pub fn fork_many(&self, ids: Vec<u128>) -> PyResult<Self> {
         self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")
@@ -253,16 +337,19 @@ impl LustroXofBatchPy {
         })
     }
 
-    // Derives a canonical batch: one lane per message, each walked along `path`.
-    // `path` must not be empty. Empty `messages` produces an empty batch.
+    /// One lane per message, each walked along `path`; lane `i` equals
+    /// `LustroXof.derive_path(messages[i], path)`.
+    /// `messages` is a list of bytes objects. `path` must not be empty (ValueError).
+    /// Empty `messages` gives an empty batch.
     #[staticmethod]
-    pub fn derive_path(messages: Vec<Vec<u8>>, path: Vec<u128>) -> PyResult<Self> {
+    pub fn derive_path(messages: &Bound<'_, PyList>, path: Vec<u128>) -> PyResult<Self> {
         if path.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "path must not be empty",
             ));
         }
-        let refs: Vec<&[u8]> = messages.iter().map(Vec::as_slice).collect();
+        let items = crate::python::list_items(messages)?;
+        let refs: Vec<&[u8]> = items.iter().map(|b| b.as_bytes()).collect();
         let path_ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
         let inner = LustroXofBatch::derive_path(&refs, &path_ids);
         Ok(Self {
@@ -271,7 +358,7 @@ impl LustroXofBatchPy {
         })
     }
 
-    // Derives sequential child identifiers starting at `first`.
+    /// Derives one child per lane with ids `first`, `first + 1`, ... (modulo 2**128).
     pub fn fork_range(&self, first: u128) -> Self {
         let inner = self.inner.fork_range(StreamId(first));
         Self {
@@ -280,14 +367,14 @@ impl LustroXofBatchPy {
         }
     }
 
-    // Exports the current batch snapshot.
-    // Length: `16 + len() * 48` bytes.
+    /// Exports the current state as `16 + len(self) * 48` bytes.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
         PyBytes::new_bound(py, &snapshot.to_le_bytes())
     }
 
-    /// Restores a batch from snapshot bytes.
+    /// Restores a batch from `export_snapshot()` bytes.
+    /// Raises ValueError for a wrong length, version, kind or lane count.
     #[staticmethod]
     pub fn import_snapshot(bytes: &[u8]) -> PyResult<Self> {
         let snapshot = crate::types::LustroXofBatchSnapshot::from_le_bytes(bytes)

@@ -78,7 +78,7 @@ pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u
     })
 }
 
-// Returns one full 32-byte engine block.
+// Returns the next 32-byte block and advances the stream.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_block(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -326,7 +326,17 @@ pub unsafe extern "C" fn lustro_prng_batch_len(ctx: *const LustroPrngBatch) -> u
     (*ctx).len()
 }
 
-// Advances all streams by `steps` rounds.
+// Returns the suggested `steps` for `fill_blocks` at the batch length,
+// or 0 for null `ctx`. Speed hint only.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_batch_suggested_steps(ctx: *const LustroPrngBatch) -> usize {
+    if ctx.is_null() {
+        return 0;
+    }
+    (*ctx).suggested_steps()
+}
+
+// Advances all streams by `steps` stream steps.
 // `out_len` must equal `batch_len * steps * 32`.
 // Output is step-major: the block of `lane` at `step` starts at
 // byte offset `(step * batch_len + lane) * 32`.
@@ -471,9 +481,10 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     })
 }
 
-// Derives a canonical batch: one lane per root, each walked along a path
-// of `n_path` identifiers. Root and path IDs are each passed as parallel
-// `(hi, lo)` u64 arrays. `n_path` must be nonzero; `n_roots` may be zero.
+// Derives one lane per root by walking each root along a path
+// of `n_path` identifiers.
+// Root and path IDs are passed as parallel `(hi, lo)` u64 arrays.
+// `n_path` must be nonzero; `n_roots` may be zero.
 // Returns null on invalid input, including an empty path.
 //
 // # Safety
