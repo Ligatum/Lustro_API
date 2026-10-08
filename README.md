@@ -1,3 +1,5 @@
+**Please note the API is currently in its beta stage. I'm still working on a list of functionality updates.**
+
 # Lustro API
 
 Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
