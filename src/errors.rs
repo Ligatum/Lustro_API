@@ -1,14 +1,24 @@
+//! Lustro V1 — error codes of the C ABI.
+
 // NOTE: If you add a variant here, you MUST also update the manual
 // typedef enum definition in build.rs (generate_header fn).
+/// Status code returned by the C ABI. Values are fixed.
 #[repr(i32)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LustroError {
+    /// Success.
     Ok = 0,
+    /// Length or size argument is invalid.
     InvalidLength = 1,
+    /// Required pointer is NULL or misaligned (hash functions: ranges overlap).
     InvalidPointer = 2,
+    /// Reserved, not returned by V1 (`InvalidLength` is used instead).
     OutputTooSmall = 3,
+    /// Reserved, not returned by V1.
     AlreadyFinalised = 4,
+    /// Reserved, not returned by V1.
     VerificationFailed = 5,
+    /// Panic caught at the FFI boundary.
     InternalPanic = 6,
 }
 

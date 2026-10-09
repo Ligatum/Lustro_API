@@ -406,6 +406,24 @@ See [§7 Batch Model](#7-batch-model-streamlane).
 Specific functions, arguments, and types for each are listed per binding
 below.
 
+### Operation Names Across Layers
+
+| Operation | Rust | Python | C |
+|---|---|---|---|
+| Fill bytes | `fill_bytes(out)` | `fill(size)` → `bytes`, `fill_into(buf)` | `lustro_*_fill(ctx, out, out_len)` |
+| Typed reads | `next_u64()`, `next_u128()`, `next_block()` | same | `lustro_*_next_u64`, `_next_u128`, `_next_block` (write to `out`) |
+| Copy | `clone()` | `copy()`, `copy.copy()` | `lustro_prng_clone`, `lustro_xof_clone` (no batch variant) |
+| Release | `Drop` | garbage collection | `lustro_*_free` |
+| Batch constructor | `new(seed, stream_ids)`, `new_range(...)` | `LustroPrngBatch(seed, stream_ids)`, `new_range(...)` | `lustro_prng_batch_new`, `_new_range` |
+| Batch length | `len()`, `is_empty()` | `len()`, `is_empty()`, `len(batch)` | `lustro_*_batch_len` |
+| Batch output | `fill_blocks(out, steps)` | `fill_blocks(out, steps)` | `lustro_*_batch_fill_blocks(ctx, out, out_len, steps)` |
+| Snapshot | `export_snapshot()` → snapshot type, `to_le_bytes()` | `export_snapshot()` → `bytes` | `lustro_*_export_snapshot`; batch: `_batch_snapshot_size` first |
+| Restore | `import_snapshot(snapshot)` | `import_snapshot(bytes)` | `lustro_*_import_snapshot` |
+| Hash, batch | `hash256_many(&[&[u8]])` (variable length) | `hash256_many` (2D array, fixed length), `hash256_many_var` | `lustro_hash256_many` (fixed length), `_many_var` |
+
+`fork`, `fork_many`, `fork_range`, `derive_path` and `suggested_steps` have the
+same name in all three layers (C functions carry the `lustro_<type>_` prefix).
+
 ---
 
 ## 12. Language Bindings
@@ -718,12 +736,12 @@ is determined by `n` may be `NULL`:
 
 - **`LustroError`-returning functions** (`*_many`, `*_many_var`,
   `*_batch_fill_blocks`): with `n == 0`, the `*_many*` functions return
-  `LustroError::Ok` without dereferencing the data/output pointers.
+  `LustroError::Ok` without dereferencing the data/output pointers; these
+  pointers may be `NULL`.
   `*_batch_fill_blocks` first checks `out_len == n_lanes × steps × 32`
   (so `out_len` must be 0 when the batch is empty or `steps == 0`), then
-  returns `Ok` without dereferencing `out`.
-  Those pointers may be `NULL`. For `n > 0`, a required `NULL` pointer returns
-  `InvalidPointer`.
+  returns `Ok` without dereferencing `out`; in that case only `out` may be
+  `NULL`. For `n > 0`, a required `NULL` pointer returns `InvalidPointer`.
 - **Batch constructors and batch fork operations** (`*_batch_new`,
   `*_batch_new_range`, `*_batch_fork_many`, etc.): with the relevant count
   at 0 (`n`, `count`, or `k` for `*_batch_fork_many`), the function returns a

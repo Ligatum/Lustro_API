@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 // ==========================================
 
 // HASH POLICY PARAMETERS
-// Hashing is scalar on every CPU. This may change in a future update.
+// Hashing uses the scalar implementation on every CPU; batches can still run in Rayon.
 
 // Tunable hash parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +112,9 @@ const ENV_DISABLE_MT: &str = "LUSTRO_DISABLE_MT";
 const ENV_DISABLE_SIMD: &str = "LUSTRO_DISABLE_SIMD";
 const ENV_NUM_THREADS: &str = "LUSTRO_NUM_THREADS";
 
-// Process-wide settings, read once. They affect execution only; outputs do not depend on them.
+// Process-wide settings, read once at the first use of the dispatcher (batch calls,
+// `suggested_steps()`). Later changes to the environment have no effect.
+// They affect execution only; outputs do not depend on them.
 //
 // - `LUSTRO_DISABLE_MT`: present (any value, `0` included) = never enter the pool.
 // - `LUSTRO_DISABLE_SIMD`: present = scalar backend for streams.

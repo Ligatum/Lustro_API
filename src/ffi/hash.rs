@@ -9,8 +9,8 @@ use crate::hash::{hash128, hash256};
 // FFI HASH API
 // ==========================================
 
-// Computes a 256-bit hash into `out`.
-// `out` must point to at least 32 bytes.
+/// Computes a 256-bit hash into `out`.
+/// `out` must point to at least 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256(
     data: *const u8,
@@ -41,8 +41,8 @@ pub unsafe extern "C" fn lustro_hash256(
     })
 }
 
-// Computes a 128-bit hash into `out`.
-// `out` must point to at least 16 bytes.
+/// Computes a 128-bit hash into `out`.
+/// `out` must point to at least 16 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128(
     data: *const u8,
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn lustro_hash128(
 // FFI HASH BATCH API
 // ==========================================
 
-// Hashes `n` fixed-length messages into `out_ptr`.
+/// Hashes `n` fixed-length messages into `out_ptr`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256_many(
     data_ptr: *const u8,
@@ -136,7 +136,7 @@ pub unsafe extern "C" fn lustro_hash256_many(
     })
 }
 
-// Hashes `n` fixed-length messages into 128-bit digests.
+/// Hashes `n` fixed-length messages into 128-bit digests.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128_many(
     data_ptr: *const u8,

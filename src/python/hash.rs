@@ -141,9 +141,9 @@ pub fn hash128_py<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
 /// TypeError if `data` is not a 2D numpy.ndarray of dtype uint8.
 ///
 /// Views whose rows are contiguous (`a[::2]`, `a[:, :16]`) are accepted. If any row
-/// is not contiguous (`a[:, ::2]`, `a.T`), ValueError is raised. The input is
-/// copied before the GIL is released, so another thread changing the array
-/// during the call cannot race with the hashing (the digests reflect the copy).
+/// is not contiguous (`a[:, ::2]`, `a.T`), ValueError is raised. The input is copied
+/// before the GIL is released, so hashing reads from the copy rather than the
+/// original NumPy array.
 #[pyfunction]
 #[pyo3(name = "hash256_many")]
 pub fn hash256_many_py<'py>(

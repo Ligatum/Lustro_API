@@ -1,8 +1,11 @@
 use crate::constants::STREAM_INIT_MASK;
 use crate::core::{erd_round_scalar_ref, idm_scalar_ref};
 
+/// Native API version, returned by `lustro_api_version()`.
+// Independent of the crate version (`Cargo.toml`, Python `__version__`) and of `SNAPSHOT_VERSION`.
 pub const LUSTRO_API_VERSION: u32 = 1;
 
+/// Returns the native API version.
 #[inline]
 pub fn lustro_api_version() -> u32 {
     LUSTRO_API_VERSION
@@ -227,7 +230,7 @@ impl StreamState {
         out
     }
 
-    // Returns the next 32-byte output block.
+    // Returns the next full 32-byte block; the unread rest of the current one is discarded.
     #[inline]
     pub(crate) fn read_full_block(&mut self) -> [u8; 32] {
         self.refill();
@@ -253,7 +256,7 @@ impl StreamState {
     }
 
     // Reconstructs StreamState from internal state components.
-    // Panics if `cursor > 32`.
+    // Panics unless `cursor` is in `1..=32`.
     #[inline]
     pub(crate) fn from_parts(s0: u128, s1: u128, step: u64, cursor: u8) -> Self {
         assert!(

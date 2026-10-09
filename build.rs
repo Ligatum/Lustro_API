@@ -42,6 +42,7 @@ fn generate_header() {
          \tLUSTRO_ERROR_OK                  = 0,\n\
          \tLUSTRO_ERROR_INVALID_LENGTH      = 1,\n\
          \tLUSTRO_ERROR_INVALID_POINTER     = 2,\n\
+         \t/* 3..5: part of the ABI, not returned by V1 functions */\n\
          \tLUSTRO_ERROR_OUTPUT_TOO_SMALL    = 3,\n\
          \tLUSTRO_ERROR_ALREADY_FINALISED   = 4,\n\
          \tLUSTRO_ERROR_VERIFICATION_FAILED = 5,\n\

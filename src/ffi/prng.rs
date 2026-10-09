@@ -13,9 +13,9 @@ use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
 // FFI STREAM SINGLE API
 // ==========================================
 
-// Creates a PRNG context from a 32-byte seed and 128-bit stream ID.
-// `stream_id` is passed as `(hi, lo)` u64 values.
-// Returns null on invalid input.
+/// Creates a PRNG context from a 32-byte seed and 128-bit stream ID.
+/// `stream_id` is passed as `(hi, lo)` u64 values.
+/// Returns null on invalid input.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_new(
     seed: *const u8,
@@ -34,7 +34,7 @@ pub unsafe extern "C" fn lustro_prng_new(
     })
 }
 
-// Frees a PRNG context. Passing null is safe (no-op).
+/// Frees a PRNG context. Passing null is safe (no-op).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_free(ctx: *mut LustroPrng) {
     guarded((), || {
@@ -44,7 +44,7 @@ pub unsafe extern "C" fn lustro_prng_free(ctx: *mut LustroPrng) {
     })
 }
 
-// Returns the next 64 random bits.
+/// Returns the next 64 random bits.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u64) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -59,7 +59,7 @@ pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u6
     })
 }
 
-// Returns the next 128 random bits as 16 bytes (LE).
+/// Returns the next 128 random bits as 16 bytes (LE).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -78,7 +78,7 @@ pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u
     })
 }
 
-// Returns the next 32-byte block and advances the stream.
+/// Writes the next full 32-byte block. Unread bytes of the current block are discarded.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_next_block(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn lustro_prng_next_block(ctx: *mut LustroPrng, out: *mut 
     })
 }
 
-// Fills `out` with `out_len` random bytes.
+/// Fills `out` with `out_len` random bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fill(
     ctx: *mut LustroPrng,
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn lustro_prng_fill(
     })
 }
 
-// Clones the PRNG context and returns a new independent instance.
+/// Clones the PRNG context and returns a new independent instance.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_clone(ctx: *const LustroPrng) -> *mut LustroPrng {
     guarded(std::ptr::null_mut(), || {
@@ -131,9 +131,9 @@ pub unsafe extern "C" fn lustro_prng_clone(ctx: *const LustroPrng) -> *mut Lustr
     })
 }
 
-// Derives a child PRNG from the current state and 128-bit identifier.
-// `id` is passed as `(hi, lo)` u64 values.
-// Returns null on null `ctx`.
+/// Derives a child PRNG from the current state and 128-bit identifier.
+/// `id` is passed as `(hi, lo)` u64 values.
+/// Returns null on null `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fork(
     ctx: *const LustroPrng,
@@ -151,13 +151,13 @@ pub unsafe extern "C" fn lustro_prng_fork(
     })
 }
 
-// Derives a PRNG from a 32-byte seed along a path of `n` identifiers.
-// IDs are passed as parallel `(hi, lo)` u64 arrays.
-// Returns null on invalid input, including `n == 0`.
-//
-// # Safety
-// `seed` must be valid for 32 bytes.
-// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+/// Derives a PRNG from a 32-byte seed along a path of `n` identifiers.
+/// IDs are passed as parallel `(hi, lo)` u64 arrays.
+/// Returns null on invalid input, including `n == 0`.
+///
+/// # Safety
+/// `seed` must be valid for 32 bytes.
+/// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_derive_path(
     seed: *const u8,
@@ -192,8 +192,8 @@ pub unsafe extern "C" fn lustro_prng_derive_path(
     })
 }
 
-// Exports the current PRNG snapshot into `out`.
-// `out` must provide at least 56 writable bytes.
+/// Exports the current PRNG snapshot into `out`.
+/// `out` must provide at least 56 writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_export_snapshot(
     ctx: *const LustroPrng,
@@ -215,8 +215,8 @@ pub unsafe extern "C" fn lustro_prng_export_snapshot(
     })
 }
 
-// Restores a PRNG context from a 56-byte snapshot.
-// Returns null on invalid input or decoding failure.
+/// Restores a PRNG context from a 56-byte snapshot.
+/// Returns null on invalid input or decoding failure.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_import_snapshot(bytes: *const u8) -> *mut LustroPrng {
     guarded(std::ptr::null_mut(), || {
@@ -238,12 +238,12 @@ pub unsafe extern "C" fn lustro_prng_import_snapshot(bytes: *const u8) -> *mut L
 // FFI STREAM BATCH API
 // ==========================================
 
-// Creates a PRNG batch from `n` stream identifiers.
-// IDs are passed as parallel `(hi, lo)` u64 arrays.
-// Returns null on invalid input.
-//
-// # Safety
-// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+/// Creates a PRNG batch from `n` stream identifiers.
+/// IDs are passed as parallel `(hi, lo)` u64 arrays.
+/// Returns null on invalid input.
+///
+/// # Safety
+/// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_new(
     seed: *const u8,
@@ -282,9 +282,9 @@ pub unsafe extern "C" fn lustro_prng_batch_new(
     })
 }
 
-// Creates `count` streams with sequential IDs starting at `first_stream_id`.
-// `first_stream_id` is passed as `(hi, lo)` u64 values.
-// Returns null on invalid input or allocation failure.
+/// Creates `count` streams with sequential IDs starting at `first_stream_id`.
+/// IDs wrap modulo 2^128. `first_stream_id` is passed as `(hi, lo)` u64 values.
+/// Returns null on invalid input or allocation failure.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_new_range(
     seed: *const u8,
@@ -307,7 +307,7 @@ pub unsafe extern "C" fn lustro_prng_batch_new_range(
     })
 }
 
-// Frees a batch context. Passing null is safe (no-op).
+/// Frees a batch context. Passing null is safe (no-op).
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_free(ctx: *mut LustroPrngBatch) {
     guarded((), || {
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn lustro_prng_batch_free(ctx: *mut LustroPrngBatch) {
     })
 }
 
-// Returns the number of streams, or 0 for null `ctx`.
+/// Returns the number of streams, or 0 for null `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_len(ctx: *const LustroPrngBatch) -> usize {
     if ctx.is_null() {
@@ -326,8 +326,8 @@ pub unsafe extern "C" fn lustro_prng_batch_len(ctx: *const LustroPrngBatch) -> u
     (*ctx).len()
 }
 
-// Returns the suggested `steps` for `fill_blocks` at the batch length,
-// or 0 for null `ctx`. Speed hint only.
+/// Returns the suggested `steps` for `fill_blocks` at the batch length,
+/// or 0 for null `ctx`. Speed hint only.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_suggested_steps(ctx: *const LustroPrngBatch) -> usize {
     if ctx.is_null() {
@@ -336,10 +336,10 @@ pub unsafe extern "C" fn lustro_prng_batch_suggested_steps(ctx: *const LustroPrn
     (*ctx).suggested_steps()
 }
 
-// Advances all streams by `steps` stream steps.
-// `out_len` must equal `batch_len * steps * 32`.
-// Output is step-major: the block of `lane` at `step` starts at
-// byte offset `(step * batch_len + lane) * 32`.
+/// Advances all streams by `steps` stream steps.
+/// `out_len` must equal `batch_len * steps * 32`.
+/// Output is step-major: the block of `lane` at `step` starts at
+/// byte offset `(step * batch_len + lane) * 32`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
     ctx: *mut LustroPrngBatch,
@@ -384,13 +384,13 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
     })
 }
 
-// Derives one child PRNG per lane from `n` child identifiers.
-// IDs are passed as parallel `(hi, lo)` u64 arrays.
-// `n` must equal the batch length.
-// Returns null on invalid input.
-//
-// # Safety
-// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+/// Derives one child PRNG per lane from `n` child identifiers.
+/// IDs are passed as parallel `(hi, lo)` u64 arrays.
+/// `n` must equal the batch length.
+/// Returns null on invalid input.
+///
+/// # Safety
+/// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork(
     ctx: *const LustroPrngBatch,
@@ -431,13 +431,13 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
     })
 }
 
-// Derives `k` children per lane. Output is parent-major:
-// child `j` of lane `i` is at index `i * k + j`.
-// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
-// Returns null on invalid input, `len() * k` overflow, or allocation failure.
-//
-// # Safety
-// `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
+/// Derives `k` children per lane. Output is parent-major:
+/// child `j` of lane `i` is at index `i * k + j`.
+/// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
+/// Returns null on invalid input, `len() * k` overflow, or allocation failure.
+///
+/// # Safety
+/// `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     ctx: *const LustroPrngBatch,
@@ -481,17 +481,17 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     })
 }
 
-// Derives one lane per root by walking each root along a path
-// of `n_path` identifiers.
-// Root and path IDs are passed as parallel `(hi, lo)` u64 arrays.
-// `n_path` must be nonzero; `n_roots` may be zero.
-// Returns null on invalid input, including an empty path.
-//
-// # Safety
-// `seed` must be valid for 32 bytes.
-// `roots_hi` and `roots_lo` must each be valid for `n_roots` elements when
-// `n_roots > 0`. `path_hi` and `path_lo` must each be valid for `n_path`
-// elements when `n_path > 0`.
+/// Derives one lane per root by walking each root along a path
+/// of `n_path` identifiers.
+/// Root and path IDs are passed as parallel `(hi, lo)` u64 arrays.
+/// `n_path` must be nonzero; `n_roots` may be zero.
+/// Returns null on invalid input, including an empty path.
+///
+/// # Safety
+/// `seed` must be valid for 32 bytes.
+/// `roots_hi` and `roots_lo` must each be valid for `n_roots` elements when
+/// `n_roots > 0`. `path_hi` and `path_lo` must each be valid for `n_path`
+/// elements when `n_path > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_derive_path(
     seed: *const u8,
@@ -543,9 +543,9 @@ pub unsafe extern "C" fn lustro_prng_batch_derive_path(
     })
 }
 
-// Derives one child PRNG per lane with sequential IDs starting at `first`.
-// `first` is passed as `(hi, lo)` u64 values.
-// Returns null on null `ctx`.
+/// Derives one child PRNG per lane with sequential IDs starting at `first`.
+/// IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
+/// Returns null on null `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork_range(
     ctx: *const LustroPrngBatch,
@@ -563,8 +563,8 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_range(
     })
 }
 
-// Returns the snapshot size in bytes, or 0 for null `ctx`.
-// Size: `16 + batch_len * 48`.
+/// Returns the snapshot size in bytes, or 0 for null `ctx`.
+/// Size: `16 + batch_len * 48`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_snapshot_size(ctx: *const LustroPrngBatch) -> usize {
     if ctx.is_null() {
@@ -574,8 +574,8 @@ pub unsafe extern "C" fn lustro_prng_batch_snapshot_size(ctx: *const LustroPrngB
     crate::types::batch_snapshot_encoded_len(batch.len()).unwrap_or(0)
 }
 
-// Exports the current batch snapshot.
-// `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`.
+/// Exports the current batch snapshot.
+/// `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
     ctx: *const LustroPrngBatch,
@@ -606,11 +606,11 @@ pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
     })
 }
 
-// Restores a PRNG batch from `len` snapshot bytes.
-// Returns null on invalid input or decoding failure.
-//
-// # Safety
-// `bytes` must be valid for `len` bytes when `len > 0`.
+/// Restores a PRNG batch from `len` snapshot bytes.
+/// Returns null on invalid input or decoding failure.
+///
+/// # Safety
+/// `bytes` must be valid for `len` bytes when `len > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_import_snapshot(
     bytes: *const u8,

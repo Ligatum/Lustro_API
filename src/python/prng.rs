@@ -51,7 +51,7 @@ impl LustroPrngPy {
         self.inner.next_u128()
     }
 
-    /// Next 32 bytes of the stream.
+    /// Next full 32-byte block. Unread bytes of the current block are discarded.
     pub fn next_block<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new_bound(py, &self.inner.next_block())
     }
@@ -82,7 +82,8 @@ impl LustroPrngPy {
     /// Fills a writable, C-contiguous byte buffer (bytearray, writable memoryview,
     /// numpy uint8 array) in place with the next `len(buf)` bytes of the stream.
     /// The GIL is held while writing. Raises TypeError for any other object, a
-    /// read-only or non-contiguous buffer, or a buffer whose items are not bytes.
+    /// read-only or non-contiguous buffer, or a buffer whose items are not bytes
+    /// (for other numpy dtypes pass `arr.view(numpy.uint8)`).
     pub fn fill_into(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<()> {
         crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
@@ -264,14 +265,15 @@ impl LustroPrngBatchPy {
 
     /// Advances every lane by `steps` stream steps and writes the blocks to `out`.
     ///
-    /// `out` is a writable, C-contiguous, aligned uint64 array of shape
-    /// `(steps, len(self), 4)`. Output is step-major: `out[s, i]` is block `s` of
-    /// lane `i` (32 bytes as 4 little-endian uint64). The bytes do not depend on
-    /// how steps are split across calls. The GIL is released while generating.
+    /// `out` must be a writable uint64 array of shape `(steps, len(self), 4)`.
+    /// Non-empty output must also be C-contiguous and aligned. Output is step-major:
+    /// `out[s, i]` is block `s` of lane `i` (32 bytes as 4 little-endian uint64).
+    /// The bytes do not depend on how steps are split across calls. The GIL is
+    /// released while generating.
     ///
-    /// Raises ValueError for a wrong shape or a non-contiguous or misaligned array.
-    /// TypeError is raised for a wrong type, dtype or ndim. Read-only or conflicting
-    /// borrows raise the corresponding Python error.
+    /// Raises ValueError for a wrong shape, or for non-contiguous or misaligned
+    /// non-empty output. TypeError is raised for a wrong type, dtype or ndim.
+    /// Read-only or conflicting borrows raise the corresponding Python error.
     pub fn fill_blocks(
         &mut self,
         py: Python<'_>,

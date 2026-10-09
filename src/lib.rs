@@ -1,3 +1,5 @@
+//! Lustro V1 — Hash, PRNG and XOF engine.
+
 pub mod constants;
 pub mod errors;
 pub mod types;
@@ -25,7 +27,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use pyo3::wrap_pyfunction;
 
-/// Diffusion-based hash, PRNG and XOF engine.
+/// Hash, PRNG and XOF engine.
 #[cfg(feature = "python")]
 #[pymodule]
 fn lustro(m: &Bound<'_, PyModule>) -> PyResult<()> {

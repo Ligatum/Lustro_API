@@ -4,18 +4,20 @@
 // HASH OUTPUT TYPES
 //=================================
 
+/// 128-bit digest, equal to the first 16 bytes of `Hash256`.
 #[must_use]
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Hash128(pub [u8; 16]);
 
+/// 256-bit digest as 32 little-endian bytes (`s0 || s1`).
 #[must_use]
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Hash256(pub [u8; 32]);
 
-// Identifies a PRNG stream.
-// Different IDs derive independent streams from the same seed.
+/// Identifies a PRNG stream.
+/// Different IDs derive independent streams from the same seed.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct StreamId(pub u128);
@@ -25,6 +27,7 @@ pub struct StreamId(pub u128);
 //=================================
 
 impl StreamId {
+    /// Returns the raw 128-bit identifier.
     #[inline]
     pub fn get(self) -> u128 {
         self.0
@@ -35,8 +38,8 @@ impl StreamId {
 // SEED & KEY MATERIAL
 //=================================
 
-// 256-bit seed or key material.
-// Debug output is redacted; `Copy` is intentional.
+/// 256-bit seed or key material.
+/// Debug output is redacted; `Copy` is intentional.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Seed256(pub [u8; 32]);
 
@@ -50,23 +53,33 @@ impl core::fmt::Debug for Seed256 {
 // PRNG/XOF SNAPSHOT TYPES
 //==========================
 
+// Byte 0 of every snapshot. Independent of the API and crate versions.
 const SNAPSHOT_VERSION: u8 = 1;
 
-// Identifies the generator family encoded in a snapshot.
+/// Identifies the generator family encoded in a snapshot.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SnapshotKind {
+    /// Single PRNG stream.
     Prng = 0x01,
+    /// Single XOF stream.
     Xof = 0x02,
+    /// PRNG batch.
     PrngBatch = 0x03,
+    /// XOF batch.
     XofBatch = 0x04,
 }
 
+/// Why a snapshot could not be decoded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SnapshotError {
+    /// Version byte is not supported.
     UnsupportedVersion,
+    /// Kind byte does not match the expected type.
     InvalidKind,
+    /// Cursor is outside `1..=32`.
     InvalidCursor,
+    /// Length does not match the format.
     InvalidLength,
 }
 
@@ -114,8 +127,8 @@ fn decode_single_snapshot(
     Ok((s0, s1, step, cursor))
 }
 
-// Serialized PRNG stream state.
-// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+/// Serialized PRNG stream state.
+/// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LustroPrngSnapshot {
     s0: u128,
@@ -150,14 +163,14 @@ impl LustroPrngSnapshot {
         (self.s0, self.s1, self.step, self.cursor)
     }
 
-    // Serializes the snapshot to the stable 56-byte format.
+    /// Serializes the snapshot to the stable 56-byte format.
     #[must_use]
     #[inline]
     pub fn to_le_bytes(&self) -> [u8; SINGLE_SNAPSHOT_LEN] {
         encode_single_snapshot(SnapshotKind::Prng, self.s0, self.s1, self.step, self.cursor)
     }
 
-    // Deserializes a PRNG snapshot from the 56-byte format.
+    /// Deserializes a PRNG snapshot from the 56-byte format.
     #[inline]
     pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
         let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Prng)?;
@@ -170,8 +183,8 @@ impl LustroPrngSnapshot {
     }
 }
 
-// Serialized XOF stream state.
-// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+/// Serialized XOF stream state.
+/// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LustroXofSnapshot {
     s0: u128,
@@ -206,14 +219,14 @@ impl LustroXofSnapshot {
         (self.s0, self.s1, self.step, self.cursor)
     }
 
-    // Serializes the snapshot to the stable 56-byte format.
+    /// Serializes the snapshot to the stable 56-byte format.
     #[must_use]
     #[inline]
     pub fn to_le_bytes(&self) -> [u8; SINGLE_SNAPSHOT_LEN] {
         encode_single_snapshot(SnapshotKind::Xof, self.s0, self.s1, self.step, self.cursor)
     }
 
-    // Deserializes a XOF snapshot from the 56-byte format.
+    /// Deserializes a XOF snapshot from the 56-byte format.
     #[inline]
     pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
         let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Xof)?;
@@ -296,8 +309,8 @@ fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64,
     Ok(lane_count)
 }
 
-// Serialized PRNG batch state.
-// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+/// Serialized PRNG batch state.
+/// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LustroPrngBatchSnapshot {
     lanes: Vec<(u128, u128, u64)>,
@@ -323,7 +336,7 @@ impl LustroPrngBatchSnapshot {
         self.lanes
     }
 
-    // Serializes the batch snapshot to its variable-length format.
+    /// Serializes the batch snapshot to its variable-length format.
     #[must_use]
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let lane_count = self.lanes.len() as u64;
@@ -337,8 +350,8 @@ impl LustroPrngBatchSnapshot {
         out
     }
 
-    // Deserializes a PRNG batch snapshot.
-    // Rejects trailing or missing bytes.
+    /// Deserializes a PRNG batch snapshot.
+    /// Rejects trailing or missing bytes.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let lane_count = decode_batch_header(bytes, SnapshotKind::PrngBatch)?;
         let mut lanes = Vec::with_capacity(lane_count as usize);
@@ -350,8 +363,8 @@ impl LustroPrngBatchSnapshot {
     }
 }
 
-// Serialized XOF batch state.
-// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+/// Serialized XOF batch state.
+/// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LustroXofBatchSnapshot {
     lanes: Vec<(u128, u128, u64)>,
@@ -377,7 +390,7 @@ impl LustroXofBatchSnapshot {
         self.lanes
     }
 
-    // Serializes the batch snapshot to its variable-length format.
+    /// Serializes the batch snapshot to its variable-length format.
     #[must_use]
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let lane_count = self.lanes.len() as u64;
@@ -391,8 +404,8 @@ impl LustroXofBatchSnapshot {
         out
     }
 
-    // Deserializes a XOF batch snapshot.
-    // Rejects trailing or missing bytes.
+    /// Deserializes a XOF batch snapshot.
+    /// Rejects trailing or missing bytes.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let lane_count = decode_batch_header(bytes, SnapshotKind::XofBatch)?;
         let mut lanes = Vec::with_capacity(lane_count as usize);
@@ -409,6 +422,7 @@ impl LustroXofBatchSnapshot {
 //=================================
 
 impl Hash128 {
+    /// Returns the digest bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
@@ -446,6 +460,7 @@ impl TryFrom<&[u8]> for Hash128 {
 }
 
 impl Hash256 {
+    /// Returns the digest bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
@@ -486,12 +501,13 @@ impl TryFrom<&[u8]> for Hash256 {
 }
 
 impl Seed256 {
-    // Constructs Seed256 from a raw 32-byte array.
+    /// Constructs Seed256 from a raw 32-byte array.
     #[inline]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Returns the seed bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0

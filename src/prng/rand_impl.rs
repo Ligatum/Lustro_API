@@ -1,3 +1,6 @@
+// rand_core 0.6 integration (feature `rand`).
+// Only LustroPrng implements RngCore/SeedableRng; LustroXof does not.
+// CryptoRng is not implemented.
 use super::LustroPrng;
 use crate::types::{Seed256, StreamId};
 use rand_core::{Error, RngCore, SeedableRng};
@@ -27,6 +30,8 @@ impl RngCore for LustroPrng {
     }
 }
 
+// `seed_from_u64` uses rand_core's default to expand the `u64` into the 32-byte
+// seed; the expansion is defined by rand_core, not by Lustro.
 impl SeedableRng for LustroPrng {
     type Seed = [u8; 32];
 
