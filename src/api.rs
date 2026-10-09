@@ -116,7 +116,7 @@ fn finalize_terminator(s0: u128, s1: u128, remainder: &[u8]) -> (u128, u128) {
     buf[remainder.len()] = 0x80;
     let b0 = u128::from_le_bytes(buf[..16].try_into().unwrap());
     let mut b1 = u128::from_le_bytes(buf[16..].try_into().unwrap());
-    // Fold low-half terminator into the high half.
+    // Fold the low half into the high half for short remainders.
     if remainder.len() < 16 {
         b1 ^= b0;
     }

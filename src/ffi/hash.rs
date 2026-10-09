@@ -11,6 +11,11 @@ use crate::hash::{hash128, hash256};
 
 /// Computes a 256-bit hash into `out`.
 /// `out` must point to at least 32 bytes.
+///
+/// # Safety
+/// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+/// `out` must be valid for 32 writable bytes. The input and output regions
+/// must not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256(
     data: *const u8,
@@ -43,6 +48,11 @@ pub unsafe extern "C" fn lustro_hash256(
 
 /// Computes a 128-bit hash into `out`.
 /// `out` must point to at least 16 bytes.
+///
+/// # Safety
+/// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+/// `out` must be valid for 16 writable bytes. The input and output regions
+/// must not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128(
     data: *const u8,
@@ -78,6 +88,13 @@ pub unsafe extern "C" fn lustro_hash128(
 // ==========================================
 
 /// Hashes `n` fixed-length messages into `out_ptr`.
+///
+/// # Safety
+/// If `n * message_len` is nonzero and representable, `data_ptr` must be
+/// valid for `n * message_len` readable bytes.
+/// If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
+/// for `n * 16` writable bytes.
+/// The input and output regions must not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256_many(
     data_ptr: *const u8,
@@ -137,6 +154,13 @@ pub unsafe extern "C" fn lustro_hash256_many(
 }
 
 /// Hashes `n` fixed-length messages into 128-bit digests.
+///
+/// # Safety
+/// If `n * message_len` is nonzero and representable, `data_ptr` must be
+/// valid for `n * message_len` readable bytes.
+/// If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
+/// for `n * 16` writable bytes.
+/// The input and output regions must not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128_many(
     data_ptr: *const u8,
@@ -198,6 +222,15 @@ pub unsafe extern "C" fn lustro_hash128_many(
 /// Hashes `n` variable-length messages.
 /// `message_ptrs[i]` must reference `message_lens[i]` bytes.
 /// A null pointer is allowed when `message_lens[i] == 0`.
+///
+/// # Safety
+/// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
+/// `n` readable elements.
+/// Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
+/// when `message_lens[i] > 0`.
+/// `out_ptr` must be valid for `n * 32` writable bytes when that size is
+/// representable.
+/// The output region must not overlap either table or any nonempty message.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256_many_var(
     message_ptrs: *const *const u8,
@@ -297,6 +330,15 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
 
 /// Hashes `n` variable-length messages into 128-bit digests.
 /// Same pointer conventions as `lustro_hash256_many_var`.
+///
+/// # Safety
+/// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
+/// `n` readable elements.
+/// Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
+/// when `message_lens[i] > 0`.
+/// `out_ptr` must be valid for `n * 16` writable bytes when that size is
+/// representable.
+/// The output region must not overlap either table or any nonempty message.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128_many_var(
     message_ptrs: *const *const u8,

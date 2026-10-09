@@ -1,7 +1,15 @@
 [package]
-name    = "lustro"
-version = "1.0.0"
-edition = "2021"
+name         = "lustro"
+version      = "1.0.0"
+edition      = "2021"
+rust-version = "1.87"
+description  = "Lustro V1 is a 256-bit deterministic, single-pass diffusion engine with HASH/PRNG/XOF capabilities, providing live state-forking (stream tree branching)"
+license-file = "LICENSE.md"
+repository   = "https://github.com/Ligatum/Lustro_API"
+homepage     = "https://github.com/Ligatum/Lustro"
+readme       = "README.md"
+keywords     = ["prng", "hash", "xof", "rng", "forking"]
+categories   = ["algorithms", "game-development", "simulation"]
 
 [lib]
 name       = "lustro"

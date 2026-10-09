@@ -17,6 +17,41 @@ typedef enum {
 } LustroError;
 
 /**
+ * Seed length in bytes.
+ */
+#define LUSTRO_SEED_LEN 32
+
+/**
+ * Output block length in bytes.
+ */
+#define LUSTRO_BLOCK_LEN 32
+
+/**
+ * `Hash128` length in bytes.
+ */
+#define LUSTRO_HASH128_LEN 16
+
+/**
+ * `Hash256` length in bytes.
+ */
+#define LUSTRO_HASH256_LEN 32
+
+/**
+ * Single-stream snapshot length in bytes.
+ */
+#define LUSTRO_SNAPSHOT_LEN 56
+
+/**
+ * Batch snapshot header length in bytes.
+ */
+#define LUSTRO_BATCH_SNAPSHOT_HEADER_LEN 16
+
+/**
+ * Batch snapshot length per lane in bytes.
+ */
+#define LUSTRO_BATCH_SNAPSHOT_LANE_LEN 48
+
+/**
  * Native API version, returned by `lustro_api_version()`.
  */
 #define LUSTRO_API_VERSION 1
@@ -44,19 +79,42 @@ typedef struct LustroXofBatch LustroXofBatch;
 uint32_t lustro_api_version(void);
 
 /**
+ * Returns a static NUL-terminated description of an error code.
+ * Unknown codes give "unknown error code". Never NULL; do not free.
+ */
+const char *lustro_strerror(int32_t code);
+
+/**
  * Computes a 256-bit hash into `out`.
  * `out` must point to at least 32 bytes.
+ *
+ * # Safety
+ * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+ * `out` must be valid for 32 writable bytes. The input and output regions
+ * must not overlap.
  */
 LustroError lustro_hash256(const uint8_t *data, uintptr_t data_len, uint8_t *out);
 
 /**
  * Computes a 128-bit hash into `out`.
  * `out` must point to at least 16 bytes.
+ *
+ * # Safety
+ * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+ * `out` must be valid for 16 writable bytes. The input and output regions
+ * must not overlap.
  */
 LustroError lustro_hash128(const uint8_t *data, uintptr_t data_len, uint8_t *out);
 
 /**
  * Hashes `n` fixed-length messages into `out_ptr`.
+ *
+ * # Safety
+ * If `n * message_len` is nonzero and representable, `data_ptr` must be
+ * valid for `n * message_len` readable bytes.
+ * If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
+ * for `n * 16` writable bytes.
+ * The input and output regions must not overlap.
  */
 LustroError lustro_hash256_many(const uint8_t *data_ptr,
                                 uintptr_t n,
@@ -65,6 +123,13 @@ LustroError lustro_hash256_many(const uint8_t *data_ptr,
 
 /**
  * Hashes `n` fixed-length messages into 128-bit digests.
+ *
+ * # Safety
+ * If `n * message_len` is nonzero and representable, `data_ptr` must be
+ * valid for `n * message_len` readable bytes.
+ * If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
+ * for `n * 16` writable bytes.
+ * The input and output regions must not overlap.
  */
 LustroError lustro_hash128_many(const uint8_t *data_ptr,
                                 uintptr_t n,
@@ -75,6 +140,15 @@ LustroError lustro_hash128_many(const uint8_t *data_ptr,
  * Hashes `n` variable-length messages.
  * `message_ptrs[i]` must reference `message_lens[i]` bytes.
  * A null pointer is allowed when `message_lens[i] == 0`.
+ *
+ * # Safety
+ * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
+ * `n` readable elements.
+ * Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
+ * when `message_lens[i] > 0`.
+ * `out_ptr` must be valid for `n * 32` writable bytes when that size is
+ * representable.
+ * The output region must not overlap either table or any nonempty message.
  */
 LustroError lustro_hash256_many_var(const uint8_t *const *message_ptrs,
                                     uintptr_t n,
@@ -84,6 +158,15 @@ LustroError lustro_hash256_many_var(const uint8_t *const *message_ptrs,
 /**
  * Hashes `n` variable-length messages into 128-bit digests.
  * Same pointer conventions as `lustro_hash256_many_var`.
+ *
+ * # Safety
+ * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
+ * `n` readable elements.
+ * Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
+ * when `message_lens[i] > 0`.
+ * `out_ptr` must be valid for `n * 16` writable bytes when that size is
+ * representable.
+ * The output region must not overlap either table or any nonempty message.
  */
 LustroError lustro_hash128_many_var(const uint8_t *const *message_ptrs,
                                     uintptr_t n,
@@ -94,6 +177,9 @@ LustroError lustro_hash128_many_var(const uint8_t *const *message_ptrs,
  * Creates a PRNG context from a 32-byte seed and 128-bit stream ID.
  * `stream_id` is passed as `(hi, lo)` u64 values.
  * Returns null on invalid input.
+ *
+ * # Safety
+ * If `seed` is non-null, it must be valid for 32 readable bytes.
  */
 struct LustroPrng *lustro_prng_new(const uint8_t *seed,
                                    uint64_t stream_id_hi,
@@ -101,31 +187,72 @@ struct LustroPrng *lustro_prng_new(const uint8_t *seed,
 
 /**
  * Frees a PRNG context. Passing null is safe (no-op).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context
+ * allocated by this API. It must not have been freed already or be in use
+ * concurrently.
  */
 void lustro_prng_free(struct LustroPrng *ctx);
 
 /**
+ * Returns the next 32 random bits.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ * If `out` is non-null, it must be valid for 4 writable bytes and must not
+ * overlap the context.
+ */
+LustroError lustro_prng_next_u32(struct LustroPrng *ctx, uint32_t *out);
+
+/**
  * Returns the next 64 random bits.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ * If `out` is non-null, it must be valid for 8 writable bytes and must not
+ * overlap the context.
  */
 LustroError lustro_prng_next_u64(struct LustroPrng *ctx, uint64_t *out);
 
 /**
  * Returns the next 128 random bits as 16 bytes (LE).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ * `out` must be valid for 16 writable bytes and must not overlap the context.
  */
 LustroError lustro_prng_next_u128(struct LustroPrng *ctx, uint8_t *out);
 
 /**
  * Writes the next full 32-byte block. Unread bytes of the current block are discarded.
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ * `out` must be valid for 32 writable bytes and must not overlap the context.
  */
 LustroError lustro_prng_next_block(struct LustroPrng *ctx, uint8_t *out);
 
 /**
  * Fills `out` with `out_len` random bytes.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ * If `out_len > 0`, `out` must be valid for `out_len` writable bytes and
+ * must not overlap the context.
  */
 LustroError lustro_prng_fill(struct LustroPrng *ctx, uint8_t *out, uintptr_t out_len);
 
 /**
  * Clones the PRNG context and returns a new independent instance.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
  */
 struct LustroPrng *lustro_prng_clone(const struct LustroPrng *ctx);
 
@@ -133,6 +260,10 @@ struct LustroPrng *lustro_prng_clone(const struct LustroPrng *ctx);
  * Derives a child PRNG from the current state and 128-bit identifier.
  * `id` is passed as `(hi, lo)` u64 values.
  * Returns null on null `ctx`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
  */
 struct LustroPrng *lustro_prng_fork(const struct LustroPrng *ctx, uint64_t id_hi, uint64_t id_lo);
 
@@ -153,12 +284,20 @@ struct LustroPrng *lustro_prng_derive_path(const uint8_t *seed,
 /**
  * Exports the current PRNG snapshot into `out`.
  * `out` must provide at least 56 writable bytes.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
+ * `out` must be valid for 56 writable bytes and must not overlap the context.
  */
 LustroError lustro_prng_export_snapshot(const struct LustroPrng *ctx, uint8_t *out);
 
 /**
  * Restores a PRNG context from a 56-byte snapshot.
  * Returns null on invalid input or decoding failure.
+ *
+ * # Safety
+ * If `bytes` is non-null, it must be valid for 56 readable bytes.
  */
 struct LustroPrng *lustro_prng_import_snapshot(const uint8_t *bytes);
 
@@ -168,7 +307,9 @@ struct LustroPrng *lustro_prng_import_snapshot(const uint8_t *bytes);
  * Returns null on invalid input.
  *
  * # Safety
- * `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+ * `seed` must be valid for 32 readable bytes.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements
+ * when `n > 0`.
  */
 struct LustroPrngBatch *lustro_prng_batch_new(const uint8_t *seed,
                                               const uint64_t *ids_hi,
@@ -179,6 +320,9 @@ struct LustroPrngBatch *lustro_prng_batch_new(const uint8_t *seed,
  * Creates `count` streams with sequential IDs starting at `first_stream_id`.
  * IDs wrap modulo 2^128. `first_stream_id` is passed as `(hi, lo)` u64 values.
  * Returns null on invalid input or allocation failure.
+ *
+ * # Safety
+ * `seed` must be valid for 32 readable bytes.
  */
 struct LustroPrngBatch *lustro_prng_batch_new_range(const uint8_t *seed,
                                                     uint64_t first_hi,
@@ -187,17 +331,30 @@ struct LustroPrngBatch *lustro_prng_batch_new_range(const uint8_t *seed,
 
 /**
  * Frees a batch context. Passing null is safe (no-op).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * allocated by this API. It must not have been freed already or be in use
+ * concurrently.
  */
 void lustro_prng_batch_free(struct LustroPrngBatch *ctx);
 
 /**
  * Returns the number of streams, or 0 for null `ctx`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_prng_batch_len(const struct LustroPrngBatch *ctx);
 
 /**
  * Returns the suggested `steps` for `fill_blocks` at the batch length,
- * or 0 for null `ctx`. Speed hint only.
+ * or 0 for null `ctx` or a caught panic. Speed hint only.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_prng_batch_suggested_steps(const struct LustroPrngBatch *ctx);
 
@@ -206,6 +363,12 @@ uintptr_t lustro_prng_batch_suggested_steps(const struct LustroPrngBatch *ctx);
  * `out_len` must equal `batch_len * steps * 32`.
  * Output is step-major: the block of `lane` at `step` starts at
  * byte offset `(step * batch_len + lane) * 32`.
+ *
+ * # Safety
+ * `ctx` must point to a live `LustroPrngBatch` context and be exclusively
+ * accessible for the duration of the call.
+ * When the expected output length is nonzero, `out` must be valid for
+ * that many writable bytes and must not overlap the context.
  */
 LustroError lustro_prng_batch_fill_blocks(struct LustroPrngBatch *ctx,
                                           uint8_t *out,
@@ -219,7 +382,10 @@ LustroError lustro_prng_batch_fill_blocks(struct LustroPrngBatch *ctx,
  * Returns null on invalid input.
  *
  * # Safety
- * `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements
+ * when `n > 0`.
  */
 struct LustroPrngBatch *lustro_prng_batch_fork(const struct LustroPrngBatch *ctx,
                                                const uint64_t *ids_hi,
@@ -233,7 +399,10 @@ struct LustroPrngBatch *lustro_prng_batch_fork(const struct LustroPrngBatch *ctx
  * Returns null on invalid input, `len() * k` overflow, or allocation failure.
  *
  * # Safety
- * `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `k` readable elements
+ * when `k > 0`.
  */
 struct LustroPrngBatch *lustro_prng_batch_fork_many(const struct LustroPrngBatch *ctx,
                                                     const uint64_t *ids_hi,
@@ -265,6 +434,10 @@ struct LustroPrngBatch *lustro_prng_batch_derive_path(const uint8_t *seed,
  * Derives one child PRNG per lane with sequential IDs starting at `first`.
  * IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
  * Returns null on null `ctx`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 struct LustroPrngBatch *lustro_prng_batch_fork_range(const struct LustroPrngBatch *ctx,
                                                      uint64_t first_hi,
@@ -273,12 +446,22 @@ struct LustroPrngBatch *lustro_prng_batch_fork_range(const struct LustroPrngBatc
 /**
  * Returns the snapshot size in bytes, or 0 for null `ctx`.
  * Size: `16 + batch_len * 48`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_prng_batch_snapshot_size(const struct LustroPrngBatch *ctx);
 
 /**
  * Exports the current batch snapshot.
  * `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
+ * `out` must be valid for `out_len` writable bytes and must not overlap
+ * the context. `out_len` must equal the expected snapshot size.
  */
 LustroError lustro_prng_batch_export_snapshot(const struct LustroPrngBatch *ctx,
                                               uint8_t *out,
@@ -296,36 +479,81 @@ struct LustroPrngBatch *lustro_prng_batch_import_snapshot(const uint8_t *bytes, 
 /**
  * Creates an XOF context by absorbing a message.
  * Returns null on invalid input.
+ *
+ * # Safety
+ * If `message_len > 0`, `message` must be valid for `message_len` readable
+ * bytes.
  */
 struct LustroXof *lustro_xof_new(const uint8_t *message, uintptr_t message_len);
 
 /**
  * Frees an XOF context. Passing null is safe (no-op).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context
+ * allocated by this API. It must not have been freed already or be in use
+ * concurrently.
  */
 void lustro_xof_free(struct LustroXof *ctx);
 
 /**
+ * Returns the next 32 output bits.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ * If `out` is non-null, it must be valid for 4 writable bytes and must not
+ * overlap the context.
+ */
+LustroError lustro_xof_next_u32(struct LustroXof *ctx, uint32_t *out);
+
+/**
  * Returns the next 64 output bits.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ * If `out` is non-null, it must be valid for 8 writable bytes and must not
+ * overlap the context.
  */
 LustroError lustro_xof_next_u64(struct LustroXof *ctx, uint64_t *out);
 
 /**
  * Returns the next 128 output bits as 16 bytes (LE).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ * `out` must be valid for 16 writable bytes and must not overlap the context.
  */
 LustroError lustro_xof_next_u128(struct LustroXof *ctx, uint8_t *out);
 
 /**
  * Writes the next full 32-byte block. Unread bytes of the current block are discarded.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ * `out` must be valid for 32 writable bytes and must not overlap the context.
  */
 LustroError lustro_xof_next_block(struct LustroXof *ctx, uint8_t *out);
 
 /**
  * Fills `out` with `out_len` output bytes.
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ * If `out_len > 0`, `out` must be valid for `out_len` writable bytes and
+ * must not overlap the context.
  */
 LustroError lustro_xof_fill(struct LustroXof *ctx, uint8_t *out, uintptr_t out_len);
 
 /**
  * Clones the XOF context and returns a new independent instance.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
  */
 struct LustroXof *lustro_xof_clone(const struct LustroXof *ctx);
 
@@ -333,6 +561,10 @@ struct LustroXof *lustro_xof_clone(const struct LustroXof *ctx);
  * Derives a child XOF from the current state and 128-bit identifier.
  * `id` is passed as `(hi, lo)` u64 values.
  * Returns null on null `ctx`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
  */
 struct LustroXof *lustro_xof_fork(const struct LustroXof *ctx, uint64_t id_hi, uint64_t id_lo);
 
@@ -354,12 +586,20 @@ struct LustroXof *lustro_xof_derive_path(const uint8_t *message,
 /**
  * Exports the current XOF snapshot into `out`.
  * `out` must provide at least 56 writable bytes.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
+ * `out` must be valid for 56 writable bytes and must not overlap the context.
  */
 LustroError lustro_xof_export_snapshot(const struct LustroXof *ctx, uint8_t *out);
 
 /**
  * Restores an XOF context from a 56-byte snapshot.
  * Returns null on invalid input or decoding failure.
+ *
+ * # Safety
+ * If `bytes` is non-null, it must be valid for 56 readable bytes.
  */
 struct LustroXof *lustro_xof_import_snapshot(const uint8_t *bytes);
 
@@ -369,9 +609,10 @@ struct LustroXof *lustro_xof_import_snapshot(const uint8_t *bytes);
  * Returns null on invalid input.
  *
  * # Safety
- * `message_ptrs` and `message_lens` must each be valid for `n` elements.
- * Each `message_ptrs[i]` must be valid for `message_lens[i]` bytes if
- * `message_lens[i] > 0`.
+ * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
+ * `n` readable elements.
+ * Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
+ * when `message_lens[i] > 0`.
  */
 struct LustroXofBatch *lustro_xof_batch_new(const uint8_t *const *message_ptrs,
                                             const uintptr_t *message_lens,
@@ -379,17 +620,30 @@ struct LustroXofBatch *lustro_xof_batch_new(const uint8_t *const *message_ptrs,
 
 /**
  * Frees a batch context. Passing null is safe (no-op).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * allocated by this API. It must not have been freed already or be in use
+ * concurrently.
  */
 void lustro_xof_batch_free(struct LustroXofBatch *ctx);
 
 /**
  * Returns the number of streams, or 0 for null `ctx`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_xof_batch_len(const struct LustroXofBatch *ctx);
 
 /**
  * Returns the suggested `steps` for `fill_blocks` at the batch length,
- * or 0 for null `ctx`. Speed hint only.
+ * or 0 for null `ctx` or a caught panic. Speed hint only.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_xof_batch_suggested_steps(const struct LustroXofBatch *ctx);
 
@@ -398,6 +652,12 @@ uintptr_t lustro_xof_batch_suggested_steps(const struct LustroXofBatch *ctx);
  * `out_len` must equal `batch_len * steps * 32`.
  * Output is step-major: the block of `lane` at `step` starts at
  * byte offset `(step * batch_len + lane) * 32`.
+ *
+ * # Safety
+ * `ctx` must point to a live `LustroXofBatch` context and be exclusively
+ * accessible for the duration of the call.
+ * When the expected output length is nonzero, `out` must be valid for
+ * that many writable bytes and must not overlap the context.
  */
 LustroError lustro_xof_batch_fill_blocks(struct LustroXofBatch *ctx,
                                          uint8_t *out,
@@ -411,7 +671,10 @@ LustroError lustro_xof_batch_fill_blocks(struct LustroXofBatch *ctx,
  * Returns null on invalid input.
  *
  * # Safety
- * `ids_hi` and `ids_lo` must each be valid for `n` elements when n > 0.
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements
+ * when `n > 0`.
  */
 struct LustroXofBatch *lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
                                              const uint64_t *ids_hi,
@@ -425,7 +688,10 @@ struct LustroXofBatch *lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
  * Returns null on invalid input, `len() * k` overflow, or allocation failure.
  *
  * # Safety
- * `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `k` readable elements
+ * when `k > 0`.
  */
 struct LustroXofBatch *lustro_xof_batch_fork_many(const struct LustroXofBatch *ctx,
                                                   const uint64_t *ids_hi,
@@ -457,6 +723,10 @@ struct LustroXofBatch *lustro_xof_batch_derive_path(const uint8_t *const *messag
  * Derives one child XOF per lane with sequential IDs starting at `first`.
  * IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
  * Returns null on null `ctx`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 struct LustroXofBatch *lustro_xof_batch_fork_range(const struct LustroXofBatch *ctx,
                                                    uint64_t first_hi,
@@ -465,12 +735,22 @@ struct LustroXofBatch *lustro_xof_batch_fork_range(const struct LustroXofBatch *
 /**
  * Returns the snapshot size in bytes, or 0 for null `ctx`.
  * Size: `16 + batch_len * 48`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_xof_batch_snapshot_size(const struct LustroXofBatch *ctx);
 
 /**
  * Exports the current batch snapshot.
  * `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
+ * `out` must be valid for `out_len` writable bytes and must not overlap
+ * the context. `out_len` must equal the expected snapshot size.
  */
 LustroError lustro_xof_batch_export_snapshot(const struct LustroXofBatch *ctx,
                                              uint8_t *out,

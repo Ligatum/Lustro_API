@@ -180,7 +180,8 @@ unsafe fn rotl64_imm<const R: u32>(x: U64x4) -> U64x4 {
 }
 
 // VARIABLE ROTATE LEFT - PER-LANE, BOUNDED INPUT
-// PRECONDITION: every lane of `r` in 0..=63 (r >= 64 does not give a rotation).
+// PRECONDITION: every lane of `r` is in 0..=63.
+// AVX2 variable shifts do not reduce shift counts modulo 64.
 // lane_mix_rotate passes odd keys in 1..=63.
 #[inline(always)]
 unsafe fn rotl64_var_bounded(x: U64x4, r: U64x4, consts: &SimdConsts) -> U64x4 {

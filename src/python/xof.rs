@@ -32,6 +32,11 @@ impl LustroXofPy {
         }
     }
 
+    /// Next 4 bytes of the stream as an unsigned integer.
+    pub fn next_u32(&mut self) -> u32 {
+        self.inner.next_u32()
+    }
+
     /// Next 8 bytes of the stream as an unsigned integer.
     pub fn next_u64(&mut self) -> u64 {
         self.inner.next_u64()

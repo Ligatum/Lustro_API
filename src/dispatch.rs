@@ -195,10 +195,7 @@ pub(crate) fn init_pool() {
             .threads
             .map_or_else(logical_cpus, NonZeroUsize::get);
 
-        ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .ok()
+        ThreadPoolBuilder::new().num_threads(workers).build().ok()
     });
 }
 
@@ -656,7 +653,9 @@ fn execute_streams(
                             let first = k * chunk;
                             // SAFETY: chunks cover disjoint lane ranges, and (step, lane)
                             // maps to a unique index, so no two workers write the same block.
-                            unsafe { process_lanes(backend, l_chunk, out_ptr.get(), n, first, steps) };
+                            unsafe {
+                                process_lanes(backend, l_chunk, out_ptr.get(), n, first, steps)
+                            };
                         });
                 });
             }

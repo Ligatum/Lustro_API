@@ -5,21 +5,28 @@
 //=================================
 
 /// 128-bit digest, equal to the first 16 bytes of `Hash256`.
+/// `Display` and `LowerHex` print the bytes of `as_bytes()` as 32 lowercase hex digits,
+/// `UpperHex` as uppercase; `{:#x}` and `{:#X}` add a `0x` prefix.
+/// `Ord` compares those bytes lexicographically, not as a number.
 #[must_use]
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct Hash128(pub [u8; 16]);
 
 /// 256-bit digest as 32 little-endian bytes (`s0 || s1`).
+/// `Display` and `LowerHex` print the bytes of `as_bytes()` as 64 lowercase hex digits,
+/// `UpperHex` as uppercase; `{:#x}` and `{:#X}` add a `0x` prefix.
+/// `Ord` compares those bytes lexicographically, not as a number.
 #[must_use]
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct Hash256(pub [u8; 32]);
 
 /// Identifies a PRNG stream.
 /// Different IDs derive independent streams from the same seed.
+/// `Ord` compares the identifiers numerically.
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct StreamId(pub u128);
 
 //=================================
@@ -31,6 +38,27 @@ impl StreamId {
     #[inline]
     pub fn get(self) -> u128 {
         self.0
+    }
+}
+
+impl From<u64> for StreamId {
+    #[inline]
+    fn from(id: u64) -> Self {
+        Self(id as u128)
+    }
+}
+
+impl From<u128> for StreamId {
+    #[inline]
+    fn from(id: u128) -> Self {
+        Self(id)
+    }
+}
+
+impl From<StreamId> for u128 {
+    #[inline]
+    fn from(id: StreamId) -> Self {
+        id.0
     }
 }
 
@@ -48,6 +76,33 @@ impl core::fmt::Debug for Seed256 {
         f.debug_tuple("Seed256").field(&"[redacted]").finish()
     }
 }
+
+/// Seed length in bytes.
+pub const LUSTRO_SEED_LEN: usize = 32;
+/// Output block length in bytes.
+pub const LUSTRO_BLOCK_LEN: usize = 32;
+/// `Hash128` length in bytes.
+pub const LUSTRO_HASH128_LEN: usize = 16;
+/// `Hash256` length in bytes.
+pub const LUSTRO_HASH256_LEN: usize = 32;
+/// Single-stream snapshot length in bytes.
+pub const LUSTRO_SNAPSHOT_LEN: usize = 56;
+/// Batch snapshot header length in bytes.
+pub const LUSTRO_BATCH_SNAPSHOT_HEADER_LEN: usize = 16;
+/// Batch snapshot length per lane in bytes.
+pub const LUSTRO_BATCH_SNAPSHOT_LANE_LEN: usize = 48;
+
+const _: () = {
+    assert!(core::mem::size_of::<Seed256>() == LUSTRO_SEED_LEN);
+    assert!(core::mem::size_of::<Hash128>() == LUSTRO_HASH128_LEN);
+    assert!(core::mem::size_of::<Hash256>() == LUSTRO_HASH256_LEN);
+};
+
+// Fails to compile if the block type is no longer `[u8; LUSTRO_BLOCK_LEN]`.
+const _: fn(&mut crate::prng::LustroPrng) -> [u8; LUSTRO_BLOCK_LEN] =
+    crate::prng::LustroPrng::next_block;
+const _: fn(&mut crate::xof::LustroXof) -> [u8; LUSTRO_BLOCK_LEN] =
+    crate::xof::LustroXof::next_block;
 
 //==========================
 // PRNG/XOF SNAPSHOT TYPES
@@ -83,8 +138,84 @@ pub enum SnapshotError {
     InvalidLength,
 }
 
+impl core::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SnapshotError::UnsupportedVersion => write!(f, "unsupported snapshot version"),
+            SnapshotError::InvalidKind => write!(f, "snapshot kind does not match this type"),
+            SnapshotError::InvalidCursor => write!(f, "invalid snapshot cursor value"),
+            SnapshotError::InvalidLength => write!(f, "invalid snapshot length"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+/// Why a path derivation was rejected by a `try_derive_path` function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DerivePathError {
+    /// `path` is empty.
+    EmptyPath,
+    /// Reserving the lane buffer failed (allocator refusal or capacity overflow).
+    /// Batch functions only.
+    Reserve(std::collections::TryReserveError),
+}
+
+impl core::fmt::Display for DerivePathError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DerivePathError::EmptyPath => write!(f, "path must not be empty"),
+            DerivePathError::Reserve(_) => write!(f, "lane buffer reservation failed"),
+        }
+    }
+}
+
+impl std::error::Error for DerivePathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DerivePathError::EmptyPath => None,
+            DerivePathError::Reserve(e) => Some(e),
+        }
+    }
+}
+
+/// Why a batch could not be built by a `try_new_range` or `try_fork_many` function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BatchError {
+    /// The lane count overflows `usize`.
+    SizeOverflow,
+    /// Reserving the lane buffer failed (allocator refusal or capacity overflow).
+    Reserve(std::collections::TryReserveError),
+}
+
+impl core::fmt::Display for BatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BatchError::SizeOverflow => write!(f, "lane count overflows usize"),
+            BatchError::Reserve(_) => write!(f, "lane buffer reservation failed"),
+        }
+    }
+}
+
+impl std::error::Error for BatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BatchError::SizeOverflow => None,
+            BatchError::Reserve(e) => Some(e),
+        }
+    }
+}
+
+// Lane count of `fork_many`: `lanes * ids`.
+#[inline]
+pub(crate) fn fork_many_lane_count(lanes: usize, ids: usize) -> Result<usize, BatchError> {
+    lanes.checked_mul(ids).ok_or(BatchError::SizeOverflow)
+}
+
 // Single-stream snapshot: fixed 56-byte format.
-const SINGLE_SNAPSHOT_LEN: usize = 56;
+const SINGLE_SNAPSHOT_LEN: usize = LUSTRO_SNAPSHOT_LEN;
 
 #[inline]
 fn encode_single_snapshot(
@@ -147,6 +278,16 @@ impl core::fmt::Debug for LustroPrngSnapshot {
     }
 }
 
+impl TryFrom<&[u8]> for LustroPrngSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let bytes: &[u8; SINGLE_SNAPSHOT_LEN] =
+            bytes.try_into().map_err(|_| SnapshotError::InvalidLength)?;
+        Self::from_le_bytes(bytes)
+    }
+}
+
 impl LustroPrngSnapshot {
     #[inline]
     pub(crate) fn new(s0: u128, s1: u128, step: u64, cursor: u8) -> Self {
@@ -203,6 +344,16 @@ impl core::fmt::Debug for LustroXofSnapshot {
     }
 }
 
+impl TryFrom<&[u8]> for LustroXofSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let bytes: &[u8; SINGLE_SNAPSHOT_LEN] =
+            bytes.try_into().map_err(|_| SnapshotError::InvalidLength)?;
+        Self::from_le_bytes(bytes)
+    }
+}
+
 impl LustroXofSnapshot {
     #[inline]
     pub(crate) fn new(s0: u128, s1: u128, step: u64, cursor: u8) -> Self {
@@ -241,8 +392,8 @@ impl LustroXofSnapshot {
 
 // Batch snapshot: 16-byte header + 48 bytes per lane.
 // No cursor; batch lanes are always block-aligned.
-const BATCH_HEADER_LEN: usize = 16;
-const BATCH_LANE_LEN: usize = 48;
+const BATCH_HEADER_LEN: usize = LUSTRO_BATCH_SNAPSHOT_HEADER_LEN;
+const BATCH_LANE_LEN: usize = LUSTRO_BATCH_SNAPSHOT_LANE_LEN;
 
 // Returns the encoded batch snapshot length, or `None` on overflow.
 #[cfg(feature = "ffi")]
@@ -325,6 +476,14 @@ impl core::fmt::Debug for LustroPrngBatchSnapshot {
     }
 }
 
+impl TryFrom<&[u8]> for LustroPrngBatchSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        Self::from_le_bytes(bytes)
+    }
+}
+
 impl LustroPrngBatchSnapshot {
     #[inline]
     pub(crate) fn new(lanes: Vec<(u128, u128, u64)>) -> Self {
@@ -379,6 +538,14 @@ impl core::fmt::Debug for LustroXofBatchSnapshot {
     }
 }
 
+impl TryFrom<&[u8]> for LustroXofBatchSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        Self::from_le_bytes(bytes)
+    }
+}
+
 impl LustroXofBatchSnapshot {
     #[inline]
     pub(crate) fn new(lanes: Vec<(u128, u128, u64)>) -> Self {
@@ -421,6 +588,34 @@ impl LustroXofBatchSnapshot {
 // TYPE METHODS & CONVERSIONS
 //=================================
 
+// Writes `bytes` (at most 32) as hex through `Formatter::pad`, so width, fill,
+// alignment and precision apply as for `str`. `prefix` adds "0x".
+fn write_hex(
+    f: &mut core::fmt::Formatter<'_>,
+    bytes: &[u8],
+    upper: bool,
+    prefix: bool,
+) -> core::fmt::Result {
+    debug_assert!(bytes.len() <= 32);
+    let digits: &[u8; 16] = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut buf = [0u8; 66];
+    let mut n = 0;
+    if prefix {
+        buf[..2].copy_from_slice(b"0x");
+        n = 2;
+    }
+    for &b in bytes {
+        buf[n] = digits[(b >> 4) as usize];
+        buf[n + 1] = digits[(b & 0x0f) as usize];
+        n += 2;
+    }
+    f.pad(core::str::from_utf8(&buf[..n]).map_err(|_| core::fmt::Error)?)
+}
+
 impl Hash128 {
     /// Returns the digest bytes.
     #[inline]
@@ -456,6 +651,38 @@ impl TryFrom<&[u8]> for Hash128 {
     #[inline]
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Ok(Self(bytes.try_into()?))
+    }
+}
+
+impl From<[u8; 16]> for Hash128 {
+    #[inline]
+    fn from(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<Hash128> for [u8; 16] {
+    #[inline]
+    fn from(hash: Hash128) -> Self {
+        hash.0
+    }
+}
+
+impl core::fmt::Display for Hash128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_hex(f, &self.0, false, false)
+    }
+}
+
+impl core::fmt::LowerHex for Hash128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_hex(f, &self.0, false, f.alternate())
+    }
+}
+
+impl core::fmt::UpperHex for Hash128 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_hex(f, &self.0, true, f.alternate())
     }
 }
 
@@ -497,6 +724,38 @@ impl TryFrom<&[u8]> for Hash256 {
     #[inline]
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Ok(Self(bytes.try_into()?))
+    }
+}
+
+impl From<[u8; 32]> for Hash256 {
+    #[inline]
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<Hash256> for [u8; 32] {
+    #[inline]
+    fn from(hash: Hash256) -> Self {
+        hash.0
+    }
+}
+
+impl core::fmt::Display for Hash256 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_hex(f, &self.0, false, false)
+    }
+}
+
+impl core::fmt::LowerHex for Hash256 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_hex(f, &self.0, false, f.alternate())
+    }
+}
+
+impl core::fmt::UpperHex for Hash256 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write_hex(f, &self.0, true, f.alternate())
     }
 }
 
@@ -544,5 +803,12 @@ impl TryFrom<&[u8]> for Seed256 {
     #[inline]
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Ok(Self(bytes.try_into()?))
+    }
+}
+
+impl From<[u8; 32]> for Seed256 {
+    #[inline]
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }

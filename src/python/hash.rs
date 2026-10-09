@@ -63,9 +63,8 @@ fn non_contiguous_error() -> PyErr {
 
 // Digests go straight into the output array buffer.
 fn rows_array<'a, 'py>(data: &'a Bound<'py, PyAny>) -> PyResult<&'a Bound<'py, PyArray2<u8>>> {
-    data.downcast::<PyArray2<u8>>().map_err(|_| {
-        crate::python::array_type_error("data", "a 2D numpy.ndarray of dtype uint8")
-    })
+    data.downcast::<PyArray2<u8>>()
+        .map_err(|_| crate::python::array_type_error("data", "a 2D numpy.ndarray of dtype uint8"))
 }
 
 fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArray2<u8>>> {
@@ -79,9 +78,8 @@ fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
             )
         })?;
         // SAFETY: Hash256 is repr(transparent) over [u8; 32].
-        let out_blocks: &mut [Hash256] = unsafe {
-            std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash256, n)
-        };
+        let out_blocks: &mut [Hash256] =
+            unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash256, n) };
 
         py.allow_threads(|| hash256_many_into(rows, out_blocks));
     }
@@ -100,9 +98,8 @@ fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
             )
         })?;
         // SAFETY: Hash128 is repr(transparent) over [u8; 16].
-        let out_blocks: &mut [Hash128] = unsafe {
-            std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash128, n)
-        };
+        let out_blocks: &mut [Hash128] =
+            unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash128, n) };
 
         py.allow_threads(|| hash128_many_into(rows, out_blocks));
     }

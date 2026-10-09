@@ -14,6 +14,10 @@ use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
 
 /// Creates an XOF context by absorbing a message.
 /// Returns null on invalid input.
+///
+/// # Safety
+/// If `message_len > 0`, `message` must be valid for `message_len` readable
+/// bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_new(message: *const u8, message_len: usize) -> *mut LustroXof {
     guarded(std::ptr::null_mut(), || {
@@ -27,6 +31,11 @@ pub unsafe extern "C" fn lustro_xof_new(message: *const u8, message_len: usize) 
 }
 
 /// Frees an XOF context. Passing null is safe (no-op).
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context
+/// allocated by this API. It must not have been freed already or be in use
+/// concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_free(ctx: *mut LustroXof) {
     guarded((), || {
@@ -36,7 +45,34 @@ pub unsafe extern "C" fn lustro_xof_free(ctx: *mut LustroXof) {
     })
 }
 
+/// Returns the next 32 output bits.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+/// If `out` is non-null, it must be valid for 4 writable bytes and must not
+/// overlap the context.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_next_u32(ctx: *mut LustroXof, out: *mut u32) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() || out.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let xof = &mut *ctx;
+
+        let val = xof.next_u32();
+        core::ptr::write_unaligned(out, val);
+        LustroError::Ok
+    })
+}
+
 /// Returns the next 64 output bits.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+/// If `out` is non-null, it must be valid for 8 writable bytes and must not
+/// overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -52,6 +88,11 @@ pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64)
 }
 
 /// Returns the next 128 output bits as 16 bytes (LE).
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+/// `out` must be valid for 16 writable bytes and must not overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_u128(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -71,6 +112,11 @@ pub unsafe extern "C" fn lustro_xof_next_u128(ctx: *mut LustroXof, out: *mut u8)
 }
 
 /// Writes the next full 32-byte block. Unread bytes of the current block are discarded.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+/// `out` must be valid for 32 writable bytes and must not overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_next_block(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -90,6 +136,11 @@ pub unsafe extern "C" fn lustro_xof_next_block(ctx: *mut LustroXof, out: *mut u8
 }
 
 /// Fills `out` with `out_len` output bytes.
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+/// If `out_len > 0`, `out` must be valid for `out_len` writable bytes and
+/// must not overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fill(
     ctx: *mut LustroXof,
@@ -115,6 +166,10 @@ pub unsafe extern "C" fn lustro_xof_fill(
 }
 
 /// Clones the XOF context and returns a new independent instance.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_clone(ctx: *const LustroXof) -> *mut LustroXof {
     guarded(std::ptr::null_mut(), || {
@@ -130,6 +185,10 @@ pub unsafe extern "C" fn lustro_xof_clone(ctx: *const LustroXof) -> *mut LustroX
 /// Derives a child XOF from the current state and 128-bit identifier.
 /// `id` is passed as `(hi, lo)` u64 values.
 /// Returns null on null `ctx`.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork(
     ctx: *const LustroXof,
@@ -190,6 +249,11 @@ pub unsafe extern "C" fn lustro_xof_derive_path(
 
 /// Exports the current XOF snapshot into `out`.
 /// `out` must provide at least 56 writable bytes.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
+/// `out` must be valid for 56 writable bytes and must not overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_export_snapshot(
     ctx: *const LustroXof,
@@ -213,6 +277,9 @@ pub unsafe extern "C" fn lustro_xof_export_snapshot(
 
 /// Restores an XOF context from a 56-byte snapshot.
 /// Returns null on invalid input or decoding failure.
+///
+/// # Safety
+/// If `bytes` is non-null, it must be valid for 56 readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_import_snapshot(bytes: *const u8) -> *mut LustroXof {
     guarded(std::ptr::null_mut(), || {
@@ -239,9 +306,10 @@ pub unsafe extern "C" fn lustro_xof_import_snapshot(bytes: *const u8) -> *mut Lu
 /// Returns null on invalid input.
 ///
 /// # Safety
-/// `message_ptrs` and `message_lens` must each be valid for `n` elements.
-/// Each `message_ptrs[i]` must be valid for `message_lens[i]` bytes if
-/// `message_lens[i] > 0`.
+/// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
+/// `n` readable elements.
+/// Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
+/// when `message_lens[i] > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_new(
     message_ptrs: *const *const u8,
@@ -278,6 +346,11 @@ pub unsafe extern "C" fn lustro_xof_batch_new(
 }
 
 /// Frees a batch context. Passing null is safe (no-op).
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// allocated by this API. It must not have been freed already or be in use
+/// concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_free(ctx: *mut LustroXofBatch) {
     guarded((), || {
@@ -288,6 +361,10 @@ pub unsafe extern "C" fn lustro_xof_batch_free(ctx: *mut LustroXofBatch) {
 }
 
 /// Returns the number of streams, or 0 for null `ctx`.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_len(ctx: *const LustroXofBatch) -> usize {
     if ctx.is_null() {
@@ -297,19 +374,31 @@ pub unsafe extern "C" fn lustro_xof_batch_len(ctx: *const LustroXofBatch) -> usi
 }
 
 /// Returns the suggested `steps` for `fill_blocks` at the batch length,
-/// or 0 for null `ctx`. Speed hint only.
+/// or 0 for null `ctx` or a caught panic. Speed hint only.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_suggested_steps(ctx: *const LustroXofBatch) -> usize {
-    if ctx.is_null() {
-        return 0;
-    }
-    (*ctx).suggested_steps()
+    guarded(0, || {
+        if ctx.is_null() {
+            return 0;
+        }
+        (*ctx).suggested_steps()
+    })
 }
 
 /// Advances all streams by `steps` stream steps.
 /// `out_len` must equal `batch_len * steps * 32`.
 /// Output is step-major: the block of `lane` at `step` starts at
 /// byte offset `(step * batch_len + lane) * 32`.
+///
+/// # Safety
+/// `ctx` must point to a live `LustroXofBatch` context and be exclusively
+/// accessible for the duration of the call.
+/// When the expected output length is nonzero, `out` must be valid for
+/// that many writable bytes and must not overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
     ctx: *mut LustroXofBatch,
@@ -360,7 +449,10 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
 /// Returns null on invalid input.
 ///
 /// # Safety
-/// `ids_hi` and `ids_lo` must each be valid for `n` elements when n > 0.
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
+/// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
+/// when `n > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork(
     ctx: *const LustroXofBatch,
@@ -407,7 +499,10 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
 /// Returns null on invalid input, `len() * k` overflow, or allocation failure.
 ///
 /// # Safety
-/// `ids_hi` and `ids_lo` must each be valid for `k` elements when `k > 0`.
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
+/// `ids_hi` and `ids_lo` must each be valid for `k` readable elements
+/// when `k > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     ctx: *const LustroXofBatch,
@@ -519,6 +614,10 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
 /// Derives one child XOF per lane with sequential IDs starting at `first`.
 /// IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
 /// Returns null on null `ctx`.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_range(
     ctx: *const LustroXofBatch,
@@ -538,6 +637,10 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_range(
 
 /// Returns the snapshot size in bytes, or 0 for null `ctx`.
 /// Size: `16 + batch_len * 48`.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_snapshot_size(ctx: *const LustroXofBatch) -> usize {
     if ctx.is_null() {
@@ -549,6 +652,12 @@ pub unsafe extern "C" fn lustro_xof_batch_snapshot_size(ctx: *const LustroXofBat
 
 /// Exports the current batch snapshot.
 /// `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
+/// `out` must be valid for `out_len` writable bytes and must not overlap
+/// the context. `out_len` must equal the expected snapshot size.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_export_snapshot(
     ctx: *const LustroXofBatch,

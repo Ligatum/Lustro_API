@@ -11,4 +11,9 @@ profile  = "release"
 name = "lustro"
 readme = "README.md"
 dependencies = ["numpy"]
-dynamic = ["version"]
+dynamic = ["version", "description"]
+
+[project.urls]
+Homepage   = "https://github.com/Ligatum/Lustro"
+Repository = "https://github.com/Ligatum/Lustro_API"
+FAQ        = "https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md"

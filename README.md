@@ -46,7 +46,7 @@ Please note that the core mechanism and the API implementation are considered no
 **Rust**
 
 ```rust
-use lustro::hash::hash256;
+use lustro::hash256;
 
 let digest = hash256(b"hello world");
 ```
@@ -64,11 +64,27 @@ digest = lustro.hash256(b"hello world")
 ```c
 #include "lustro.h"
 
-uint8_t digest[32];
+uint8_t digest[LUSTRO_HASH256_LEN];
 lustro_hash256((const uint8_t *)"hello world", 11, digest);
 ```
 
-`hash128` is available in the same way and returns 16 bytes.
+`hash128` is available in the same way and returns `LUSTRO_HASH128_LEN` (16) bytes.
+
+**Printing and comparing digests (Rust)**
+
+`Hash128` and `Hash256` print as hex of the digest bytes, in the order returned by `as_bytes()`: 32 and 64 digits. Width, fill and alignment work as for strings (`{digest:>70}`, `{digest:*^70}`), and a precision shortens the output (`{digest:.8}`).
+
+```rust
+use lustro::hash256;
+
+let digest = hash256(b"hello world");
+
+println!("{digest}");     // lowercase hex, 64 digits
+println!("{digest:X}");   // uppercase
+println!("{digest:#x}");  // with a 0x prefix
+```
+
+Digests are `Hash` and `Ord`, so they work as keys in `HashMap` and `BTreeMap`. `Ord` compares the bytes lexicographically, not as a number. Conversion to and from `[u8; N]` is available through `From` / `Into`. In Python a digest is `bytes`, so use `digest.hex()`.
 
 ---
 
@@ -79,7 +95,7 @@ Hash many messages in one call.
 **Rust**
 
 ```rust
-use lustro::hash::hash256_many;
+use lustro::hash256_many;
 
 let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
 let digests = hash256_many(&messages);
@@ -106,7 +122,7 @@ digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
 
 /* Equal-length messages, stored back to back. */
 uint8_t rows[3][16] = {{0}};
-uint8_t digests[3][32];
+uint8_t digests[3][LUSTRO_HASH256_LEN];
 lustro_hash256_many((const uint8_t *)rows, 3, 16, (uint8_t *)digests);
 
 /* Messages of any length. */
@@ -129,8 +145,7 @@ Naming differs between the Rust API and the C/Python APIs. In Rust, `hash256_man
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrng;
-use lustro::types::{Seed256, StreamId};
+use lustro::{LustroPrng, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let mut rng = LustroPrng::new(&seed, StreamId(0));
@@ -152,7 +167,7 @@ value = rng.next_u64()
 ```c
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 LustroPrng *rng = lustro_prng_new(seed, 0, 0);
 
 uint64_t value;
@@ -168,7 +183,7 @@ lustro_prng_free(rng);
 **Rust**
 
 ```rust
-use lustro::xof::LustroXof;
+use lustro::LustroXof;
 
 let mut xof = LustroXof::new(b"hello world");
 let block = xof.next_block();
@@ -191,11 +206,75 @@ block = xof.next_block()
 LustroXof *xof =
     lustro_xof_new((const uint8_t *)"hello world", 11);
 
-uint8_t block[32];
+uint8_t block[LUSTRO_BLOCK_LEN];
 lustro_xof_next_block(xof, block);
 
 lustro_xof_free(xof);
 ```
+
+---
+
+### Typed Reads
+
+Read integers, a full block, or any number of bytes from a single stream. `LustroXof` has the same methods.
+
+**Rust**
+
+```rust
+use lustro::{LustroPrng, Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let mut rng = LustroPrng::new(&seed, StreamId(0));
+
+let a = rng.next_u32();
+let b = rng.next_u64();
+let c = rng.next_u128();
+let block = rng.next_block();   // [u8; 32]
+
+let mut buf = [0u8; 100];
+rng.fill_bytes(&mut buf);
+```
+
+**Python**
+
+```python
+from lustro import LustroPrng
+
+rng = LustroPrng(bytes(32), 0)
+
+a = rng.next_u32()
+b = rng.next_u64()
+c = rng.next_u128()
+block = rng.next_block()        # bytes, 32
+data = rng.fill(100)            # bytes, 100
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
+LustroPrng *rng = lustro_prng_new(seed, 0, 0);
+
+uint32_t a;
+uint64_t b;
+lustro_prng_next_u32(rng, &a);
+lustro_prng_next_u64(rng, &b);
+
+uint8_t c[16];                      /* u128, 16 bytes little-endian */
+lustro_prng_next_u128(rng, c);
+
+uint8_t block[LUSTRO_BLOCK_LEN];
+lustro_prng_next_block(rng, block);
+
+uint8_t data[100];
+lustro_prng_fill(rng, data, sizeof(data));
+
+lustro_prng_free(rng);
+```
+
+All values are little-endian and taken from the same byte stream: in the examples above `a` is bytes 0–3, `b` bytes 4–11 and `c` bytes 12–27. `next_block()` always advances to a full new 32-byte block and discards the unread rest of the current one. The XOF equivalents are `lustro_xof_next_u32` and so on (C/C++).
 
 ---
 
@@ -227,8 +306,7 @@ exposing the intermediate streams.
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrng;
-use lustro::types::{Seed256, StreamId};
+use lustro::{LustroPrng, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let rng = LustroPrng::derive_path(&seed, &[StreamId(12), StreamId(7), StreamId(99)]);
@@ -248,7 +326,7 @@ rng = LustroPrng.derive_path(seed, [12, 7, 99])
 ```c
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 
 uint64_t ids_hi[3] = {0, 0, 0};
 uint64_t ids_lo[3] = {12, 7, 99};
@@ -276,9 +354,7 @@ Lustro can process multiple independent streams.
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrngBatch;
-use lustro::types::{Seed256, StreamId};
-use lustro::xof::LustroXofBatch;
+use lustro::{LustroPrngBatch, LustroXofBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 
@@ -326,7 +402,7 @@ xof.fill_blocks(xof_out, steps)
 ```c
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 
 uint64_t ids_hi[4] = {0};
 uint64_t ids_lo[4] = {0, 1, 2, 3};
@@ -336,7 +412,7 @@ LustroPrngBatch *prng =
 
 #define STEPS 2
 
-uint8_t prng_out[STEPS][4][32];
+uint8_t prng_out[STEPS][4][LUSTRO_BLOCK_LEN];
 lustro_prng_batch_fill_blocks(
     prng, (uint8_t *)prng_out, sizeof(prng_out), STEPS
 );
@@ -352,7 +428,7 @@ uintptr_t lengths[] = {4, 4, 4};
 LustroXofBatch *xof =
     lustro_xof_batch_new(messages, lengths, 3);
 
-uint8_t xof_out[STEPS][3][32];
+uint8_t xof_out[STEPS][3][LUSTRO_BLOCK_LEN];
 lustro_xof_batch_fill_blocks(
     xof, (uint8_t *)xof_out, sizeof(xof_out), STEPS
 );
@@ -370,8 +446,7 @@ lustro_prng_batch_free(prng);
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrngBatch;
-use lustro::types::{Seed256, StreamId};
+use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
@@ -401,12 +476,12 @@ prng.fill_blocks(out, steps)
 #include <stdlib.h>
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 LustroPrngBatch *prng =
     lustro_prng_batch_new_range(seed, 0, 0, 4);
 
 size_t steps = lustro_prng_batch_suggested_steps(prng);
-size_t out_len = steps * lustro_prng_batch_len(prng) * 32;
+size_t out_len = steps * lustro_prng_batch_len(prng) * LUSTRO_BLOCK_LEN;
 uint8_t *out = malloc(out_len);
 
 lustro_prng_batch_fill_blocks(prng, out, out_len, steps);
@@ -426,8 +501,7 @@ Create multiple child streams.
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrngBatch;
-use lustro::types::{Seed256, StreamId};
+use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
@@ -454,7 +528,7 @@ many_children = prng.fork_many([100, 200])
 ```c
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 LustroPrngBatch *prng =
     lustro_prng_batch_new_range(seed, 0, 0, 4);
 
@@ -489,8 +563,7 @@ per root.
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrngBatch;
-use lustro::types::{Seed256, StreamId};
+use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let roots = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
@@ -513,7 +586,7 @@ batch = LustroPrngBatch.derive_path(seed, [0, 1, 2, 3], [12, 7])
 ```c
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 
 uint64_t roots_hi[4] = {0, 0, 0, 0};
 uint64_t roots_lo[4] = {0, 1, 2, 3};
@@ -546,8 +619,8 @@ Save and restore the exact stream position.
 **Rust**
 
 ```rust
-use lustro::prng::LustroPrng;
-use lustro::types::{LustroPrngSnapshot, Seed256, StreamId};
+use lustro::types::LustroPrngSnapshot;
+use lustro::{LustroPrng, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let mut rng = LustroPrng::new(&seed, StreamId(0));
@@ -577,10 +650,10 @@ restored = LustroPrng.import_snapshot(snapshot)
 ```c
 #include "lustro.h"
 
-uint8_t seed[32] = {0};
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
 LustroPrng *rng = lustro_prng_new(seed, 0, 0);
 
-uint8_t snapshot[56];
+uint8_t snapshot[LUSTRO_SNAPSHOT_LEN];
 lustro_prng_export_snapshot(rng, snapshot);
 
 LustroPrng *restored =
@@ -590,6 +663,20 @@ lustro_prng_free(restored);
 lustro_prng_free(rng);
 ```
 
-The same snapshot API is available for XOF and batch contexts. Please note that for batch contexts in C/C++ the snapshot size is dynamic; call the corresponding `*_batch_snapshot_size(ctx)` before export.
+The same snapshot API is available for XOF and batch contexts. Please note that for batch contexts in C/C++ the snapshot size is dynamic; call the corresponding `*_batch_snapshot_size(ctx)` before export. It equals `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN` for `n` streams.
+
+---
+
+### Size Constants
+
+| Meaning | Bytes | C / C++ (`lustro.h`) | Rust (`lustro::types`) | Python (`lustro`) |
+|---|---|---|---|---|
+| Seed | 32 | `LUSTRO_SEED_LEN` | `LUSTRO_SEED_LEN` | `SEED_LEN` |
+| Output block | 32 | `LUSTRO_BLOCK_LEN` | `LUSTRO_BLOCK_LEN` | `BLOCK_LEN` |
+| `hash128` digest | 16 | `LUSTRO_HASH128_LEN` | `LUSTRO_HASH128_LEN` | `HASH128_LEN` |
+| `hash256` digest | 32 | `LUSTRO_HASH256_LEN` | `LUSTRO_HASH256_LEN` | `HASH256_LEN` |
+| Single snapshot | 56 | `LUSTRO_SNAPSHOT_LEN` | `LUSTRO_SNAPSHOT_LEN` | `SNAPSHOT_LEN` |
+| Batch snapshot header | 16 | `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN` | `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN` | `BATCH_SNAPSHOT_HEADER_LEN` |
+| Batch snapshot, per stream | 48 | `LUSTRO_BATCH_SNAPSHOT_LANE_LEN` | `LUSTRO_BATCH_SNAPSHOT_LANE_LEN` | `BATCH_SNAPSHOT_LANE_LEN` |
 
 For full API details please see **[ARCHITECTURE.md](ARCHITECTURE.md)**.

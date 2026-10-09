@@ -8,9 +8,7 @@ use rand_core::{Error, RngCore, SeedableRng};
 impl RngCore for LustroPrng {
     #[inline]
     fn next_u32(&mut self) -> u32 {
-        let mut buf = [0u8; 4];
-        LustroPrng::fill_bytes(self, &mut buf);
-        u32::from_le_bytes(buf)
+        LustroPrng::next_u32(self)
     }
 
     #[inline]
@@ -40,21 +38,5 @@ impl SeedableRng for LustroPrng {
     fn from_seed(seed: Self::Seed) -> Self {
         let seed256 = Seed256::from_bytes(seed);
         Self::new(&seed256, StreamId(0))
-    }
-}
-
-impl From<Seed256> for LustroPrng {
-    /// Creates stream 0 from a Seed256.
-    /// Use LustroPrng::new() directly when a non-zero StreamId is required.
-    fn from(seed: Seed256) -> Self {
-        Self::new(&seed, StreamId(0))
-    }
-}
-
-impl From<[u8; 32]> for LustroPrng {
-    /// Creates stream 0 from a raw 32-byte array.
-    /// Use LustroPrng::new() directly when a non-zero StreamId is required.
-    fn from(seed: [u8; 32]) -> Self {
-        Self::from_seed(seed)
     }
 }

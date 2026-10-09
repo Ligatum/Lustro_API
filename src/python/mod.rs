@@ -17,23 +17,9 @@ pub fn lustro_api_version() -> u32 {
     crate::api::LUSTRO_API_VERSION
 }
 
-// Maps SnapshotError to a PyValueError with a specific message per variant.
+// Maps SnapshotError to a PyValueError (message from Display).
 pub(crate) fn snapshot_error(err: crate::types::SnapshotError) -> pyo3::PyErr {
-    use crate::types::SnapshotError;
-    match err {
-        SnapshotError::UnsupportedVersion => {
-            pyo3::exceptions::PyValueError::new_err("unsupported snapshot version")
-        }
-        SnapshotError::InvalidKind => {
-            pyo3::exceptions::PyValueError::new_err("snapshot kind does not match this type")
-        }
-        SnapshotError::InvalidCursor => {
-            pyo3::exceptions::PyValueError::new_err("invalid snapshot cursor value")
-        }
-        SnapshotError::InvalidLength => {
-            pyo3::exceptions::PyValueError::new_err("invalid snapshot length")
-        }
-    }
+    pyo3::exceptions::PyValueError::new_err(err.to_string())
 }
 
 // Maps an allocation failure to MemoryError.
@@ -73,9 +59,7 @@ pub(crate) fn fill_buffer(
 }
 
 // Keep the bytes alive while the GIL is released (the list may change meanwhile).
-pub(crate) fn list_items<'py>(
-    messages: &Bound<'py, PyList>,
-) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+pub(crate) fn list_items<'py>(messages: &Bound<'py, PyList>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
     messages
         .iter()
         .map(|item| {
