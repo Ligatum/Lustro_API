@@ -150,11 +150,11 @@ impl LustroPrngPy {
     }
 
     /// Restores a generator from `export_snapshot()` bytes.
-    /// Raises ValueError for a wrong length, version, kind or cursor.
+    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or cursor.
     #[staticmethod]
     pub fn import_snapshot(bytes: &[u8]) -> PyResult<Self> {
         let array_ref: &[u8; 56] = bytes.try_into().map_err(|_| {
-            pyo3::exceptions::PyValueError::new_err("snapshot must be exactly 56 bytes")
+            crate::python::SnapshotError::new_err("snapshot must be exactly 56 bytes")
         })?;
 
         let snapshot = crate::types::LustroPrngSnapshot::from_le_bytes(array_ref)
@@ -241,18 +241,23 @@ impl LustroPrngBatchPy {
     }
 
     /// Returns an independent batch with identical lane states.
-    pub fn copy(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
+    /// Raises MemoryError if the lanes cannot be allocated.
+    pub fn copy(&self) -> PyResult<Self> {
+        let inner = self
+            .inner
+            .try_clone()
+            .map_err(|_| crate::python::alloc_error())?;
+        Ok(Self {
+            inner,
             blocks_buf: Vec::new(),
-        }
+        })
     }
 
-    pub fn __copy__(&self) -> Self {
+    pub fn __copy__(&self) -> PyResult<Self> {
         self.copy()
     }
 
-    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.copy()
     }
 
@@ -424,7 +429,7 @@ impl LustroPrngBatchPy {
     }
 
     /// Restores a batch from `export_snapshot()` bytes.
-    /// Raises ValueError for a wrong length, version, kind or lane count.
+    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or lane count.
     #[staticmethod]
     pub fn import_snapshot(bytes: &[u8]) -> PyResult<Self> {
         let snapshot = crate::types::LustroPrngBatchSnapshot::from_le_bytes(bytes)

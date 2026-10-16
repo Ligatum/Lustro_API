@@ -147,6 +147,16 @@ def print_row(label, n, steps, size_bytes, data):
 # =========================================================
 U8P = ctypes.POINTER(ctypes.c_uint8)
 SizeT = ctypes.c_size_t
+OUTP = ctypes.POINTER(ctypes.c_void_p)
+
+
+def new_ctx(fn, *args):
+    """Constructor LustroError f(..., T **out_ctx): returns the context or raises."""
+    slot = ctypes.c_void_p()
+    err = fn(*args, ctypes.byref(slot))
+    if err != 0 or not slot.value:
+        raise RuntimeError(f"{fn.__name__} returned error {err}")
+    return slot.value
 
 
 def load_lib():
@@ -163,16 +173,16 @@ def load_lib():
     lib.lustro_hash256_many.restype = ctypes.c_int32
     lib.lustro_hash256_many.argtypes = [U8P, SizeT, SizeT, U8P]
 
-    # Single stream: new / fill(ctx, out, out_len) / free.
-    lib.lustro_prng_new.restype = ctypes.c_void_p
-    lib.lustro_prng_new.argtypes = [U8P, ctypes.c_uint64, ctypes.c_uint64]
+    # Single stream: new(..., &ctx) / fill(ctx, out, out_len) / free.
+    lib.lustro_prng_new.restype = ctypes.c_int32
+    lib.lustro_prng_new.argtypes = [U8P, ctypes.c_uint64, ctypes.c_uint64, OUTP]
     lib.lustro_prng_free.restype = None
     lib.lustro_prng_free.argtypes = [ctypes.c_void_p]
     lib.lustro_prng_fill.restype = ctypes.c_int32
     lib.lustro_prng_fill.argtypes = [ctypes.c_void_p, U8P, SizeT]
 
-    lib.lustro_xof_new.restype = ctypes.c_void_p
-    lib.lustro_xof_new.argtypes = [U8P, SizeT]
+    lib.lustro_xof_new.restype = ctypes.c_int32
+    lib.lustro_xof_new.argtypes = [U8P, SizeT, OUTP]
     lib.lustro_xof_free.restype = None
     lib.lustro_xof_free.argtypes = [ctypes.c_void_p]
     lib.lustro_xof_fill.restype = ctypes.c_int32
@@ -180,8 +190,8 @@ def load_lib():
 
     # fill_blocks(ctx, out, out_len, steps), output is step-major.
     # suggested_steps(ctx) is the `steps` the library recommends for len(ctx).
-    lib.lustro_prng_batch_new_range.restype = ctypes.c_void_p
-    lib.lustro_prng_batch_new_range.argtypes = [U8P, ctypes.c_uint64, ctypes.c_uint64, SizeT]
+    lib.lustro_prng_batch_new_range.restype = ctypes.c_int32
+    lib.lustro_prng_batch_new_range.argtypes = [U8P, ctypes.c_uint64, ctypes.c_uint64, SizeT, OUTP]
     lib.lustro_prng_batch_free.restype = None
     lib.lustro_prng_batch_free.argtypes = [ctypes.c_void_p]
     lib.lustro_prng_batch_fill_blocks.restype = ctypes.c_int32
@@ -189,8 +199,8 @@ def load_lib():
     lib.lustro_prng_batch_suggested_steps.restype = SizeT
     lib.lustro_prng_batch_suggested_steps.argtypes = [ctypes.c_void_p]
 
-    lib.lustro_xof_batch_new.restype = ctypes.c_void_p
-    lib.lustro_xof_batch_new.argtypes = [ctypes.POINTER(U8P), ctypes.POINTER(SizeT), SizeT]
+    lib.lustro_xof_batch_new.restype = ctypes.c_int32
+    lib.lustro_xof_batch_new.argtypes = [ctypes.POINTER(U8P), ctypes.POINTER(SizeT), SizeT, OUTP]
     lib.lustro_xof_batch_free.restype = None
     lib.lustro_xof_batch_free.argtypes = [ctypes.c_void_p]
     lib.lustro_xof_batch_fill_blocks.restype = ctypes.c_int32
@@ -263,17 +273,13 @@ def fill_single_worker(kind, size, q):
 
         if kind == "PRNG":
             seed = u8_buf(bytes(range(32)))
-            ctx = lib.lustro_prng_new(seed, 0, 0)
-            if not ctx:
-                raise RuntimeError("lustro_prng_new returned NULL")
+            ctx = new_ctx(lib.lustro_prng_new, seed, 0, 0)
             fill = lib.lustro_prng_fill
             free = lib.lustro_prng_free
             fill_name = "lustro_prng_fill"
         else:
             msg = u8_buf(b"m0")
-            ctx = lib.lustro_xof_new(msg, 2)
-            if not ctx:
-                raise RuntimeError("lustro_xof_new returned NULL")
+            ctx = new_ctx(lib.lustro_xof_new, msg, 2)
             fill = lib.lustro_xof_fill
             free = lib.lustro_xof_free
             fill_name = "lustro_xof_fill"
@@ -301,10 +307,7 @@ def _make_xof_batch(lib, n):
     bufs = [u8_buf(m) for m in messages]  # keep alive until lustro_xof_batch_new returns
     ptr_array = (U8P * n)(*[ctypes.cast(b, U8P) for b in bufs])
     len_array = (SizeT * n)(*[len(m) for m in messages])
-    ctx = lib.lustro_xof_batch_new(ptr_array, len_array, n)
-    if not ctx:
-        raise RuntimeError("lustro_xof_batch_new returned NULL")
-    return ctx
+    return new_ctx(lib.lustro_xof_batch_new, ptr_array, len_array, n)
 
 
 def stream_batch_worker(kind, n, q):
@@ -318,9 +321,7 @@ def stream_batch_worker(kind, n, q):
 
         if kind == "PRNG":
             seed = u8_buf(bytes(range(32)))
-            batch_ctx = lib.lustro_prng_batch_new_range(seed, 0, 0, n)
-            if not batch_ctx:
-                raise RuntimeError("lustro_prng_batch_new_range returned NULL")
+            batch_ctx = new_ctx(lib.lustro_prng_batch_new_range, seed, 0, 0, n)
             fill = lib.lustro_prng_batch_fill_blocks
             free = lib.lustro_prng_batch_free
             suggested = lib.lustro_prng_batch_suggested_steps

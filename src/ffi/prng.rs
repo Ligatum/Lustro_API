@@ -6,8 +6,8 @@ use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
 use crate::types::{Seed256, StreamId};
 
-use super::guarded;
-use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
+use super::types::{buf_in, buf_out, bytes_in, fits_slice, ids_from_parts, slice_out};
+use super::{batch_status, construct, derive_path_status, guarded};
 
 // ==========================================
 // FFI STREAM SINGLE API
@@ -15,25 +15,25 @@ use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
 
 /// Creates a PRNG context from a 32-byte seed and 128-bit stream ID.
 /// `stream_id` is passed as `(hi, lo)` u64 values.
-/// Returns null on invalid input.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `seed`.
 ///
 /// # Safety
 /// If `seed` is non-null, it must be valid for 32 readable bytes.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_new(
     seed: *const u8,
     stream_id_hi: u64,
     stream_id_lo: u64,
-) -> *mut LustroPrng {
-    guarded(std::ptr::null_mut(), || {
-        let seed_bytes = match buf_in(seed, 32) {
-            Some(s) if s.len() == 32 => s,
-            _ => return std::ptr::null_mut(),
-        };
+    out_ctx: *mut *mut LustroPrng,
+) -> LustroError {
+    construct(out_ctx, || {
+        let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
         let stream_id = ((stream_id_hi as u128) << 64) | (stream_id_lo as u128);
-
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        Box::into_raw(Box::new(LustroPrng::new(&seed256, StreamId(stream_id))))
+        Ok(LustroPrng::new(&seed256, StreamId(stream_id)))
     })
 }
 
@@ -119,6 +119,7 @@ pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u
 }
 
 /// Writes the next full 32-byte block. Unread bytes of the current block are discarded.
+///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context and
 /// be exclusively accessible for the duration of the call.
@@ -171,82 +172,80 @@ pub unsafe extern "C" fn lustro_prng_fill(
 }
 
 /// Clones the PRNG context and returns a new independent instance.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
 /// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_prng_clone(ctx: *const LustroPrng) -> *mut LustroPrng {
-    guarded(std::ptr::null_mut(), || {
+pub unsafe extern "C" fn lustro_prng_clone(
+    ctx: *const LustroPrng,
+    out_ctx: *mut *mut LustroPrng,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
-        Box::into_raw(Box::new((*ctx).clone()))
+        Ok((*ctx).clone())
     })
 }
 
 /// Derives a child PRNG from the current state and 128-bit identifier.
 /// `id` is passed as `(hi, lo)` u64 values.
-/// Returns null on null `ctx`.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
 /// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fork(
     ctx: *const LustroPrng,
     id_hi: u64,
     id_lo: u64,
-) -> *mut LustroPrng {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroPrng,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
-        let prng = &*ctx;
         let id = ((id_hi as u128) << 64) | (id_lo as u128);
-
-        Box::into_raw(Box::new(prng.fork(StreamId(id))))
+        Ok((*ctx).fork(StreamId(id)))
     })
 }
 
 /// Derives a PRNG from a 32-byte seed along a path of `n` identifiers.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
-/// Returns null on invalid input, including `n == 0`.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
+/// its length is nonzero), `InvalidLength` for `n == 0` or an `n` too large to address.
 ///
 /// # Safety
 /// `seed` must be valid for 32 bytes.
 /// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_derive_path(
     seed: *const u8,
     ids_hi: *const u64,
     ids_lo: *const u64,
     n: usize,
-) -> *mut LustroPrng {
-    guarded(std::ptr::null_mut(), || {
-        let seed_bytes = match buf_in(seed, 32) {
-            Some(s) if s.len() == 32 => s,
-            _ => return std::ptr::null_mut(),
-        };
-        if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
-            return std::ptr::null_mut();
+    out_ctx: *mut *mut LustroPrng,
+) -> LustroError {
+    construct(out_ctx, || {
+        let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
+        if n == 0 {
+            return Err(LustroError::InvalidLength);
         }
-        let his = match slice_in(ids_hi, n) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let los = match slice_in(ids_lo, n) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let path: Vec<StreamId> = his
-            .iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect();
-
+        let path = ids_from_parts(ids_hi, ids_lo, n)?;
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        Box::into_raw(Box::new(LustroPrng::derive_path(&seed256, &path)))
+        Ok(LustroPrng::derive_path(&seed256, &path))
     })
 }
 
@@ -279,24 +278,25 @@ pub unsafe extern "C" fn lustro_prng_export_snapshot(
 }
 
 /// Restores a PRNG context from a 56-byte snapshot.
-/// Returns null on invalid input or decoding failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `bytes`; `UnsupportedVersion`, `InvalidKind`
+/// or `InvalidCursor` for a rejected snapshot. The length is fixed at 56 bytes, so `InvalidLength`
+/// is not reported.
 ///
 /// # Safety
 /// If `bytes` is non-null, it must be valid for 56 readable bytes.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_prng_import_snapshot(bytes: *const u8) -> *mut LustroPrng {
-    guarded(std::ptr::null_mut(), || {
-        let snapshot_bytes = match buf_in(bytes, 56) {
-            Some(s) if s.len() == 56 => s,
-            _ => return std::ptr::null_mut(),
-        };
+pub unsafe extern "C" fn lustro_prng_import_snapshot(
+    bytes: *const u8,
+    out_ctx: *mut *mut LustroPrng,
+) -> LustroError {
+    construct(out_ctx, || {
+        let snapshot_bytes = buf_in(bytes, 56).ok_or(LustroError::InvalidPointer)?;
         let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
-
-        if let Ok(snapshot) = crate::types::LustroPrngSnapshot::from_le_bytes(array_ref) {
-            Box::into_raw(Box::new(LustroPrng::import_snapshot(snapshot)))
-        } else {
-            std::ptr::null_mut()
-        }
+        let snapshot = crate::types::LustroPrngSnapshot::from_le_bytes(array_ref)?;
+        Ok(LustroPrng::import_snapshot(snapshot))
     })
 }
 
@@ -306,75 +306,55 @@ pub unsafe extern "C" fn lustro_prng_import_snapshot(bytes: *const u8) -> *mut L
 
 /// Creates a PRNG batch from `n` stream identifiers.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
-/// Returns null on invalid input.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
+/// its length is nonzero), `InvalidLength` for an `n` too large to address.
 ///
 /// # Safety
 /// `seed` must be valid for 32 readable bytes.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
 /// when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_new(
     seed: *const u8,
     ids_hi: *const u64,
     ids_lo: *const u64,
     n: usize,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
-        let seed_bytes = match buf_in(seed, 32) {
-            Some(s) if s.len() == 32 => s,
-            _ => return std::ptr::null_mut(),
-        };
-
-        let stream_ids: Vec<StreamId> = if n == 0 {
-            Vec::new()
-        } else {
-            if ids_hi.is_null() || ids_lo.is_null() {
-                return std::ptr::null_mut();
-            }
-            let his = match slice_in(ids_hi, n) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            let los = match slice_in(ids_lo, n) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            his.iter()
-                .zip(los.iter())
-                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-                .collect()
-        };
-
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
+        let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        Box::into_raw(Box::new(LustroPrngBatch::new(&seed256, &stream_ids)))
+        Ok(LustroPrngBatch::new(&seed256, &stream_ids))
     })
 }
 
 /// Creates `count` streams with sequential IDs starting at `first_stream_id`.
 /// IDs wrap modulo 2^128. `first_stream_id` is passed as `(hi, lo)` u64 values.
-/// Returns null on invalid input or allocation failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `seed`, `OutOfMemory` if the lane buffer
+/// cannot be reserved (allocator refusal or capacity overflow).
 ///
 /// # Safety
 /// `seed` must be valid for 32 readable bytes.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_new_range(
     seed: *const u8,
     first_hi: u64,
     first_lo: u64,
     count: usize,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
-        let seed_bytes = match buf_in(seed, 32) {
-            Some(s) if s.len() == 32 => s,
-            _ => return std::ptr::null_mut(),
-        };
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
         let first_id = ((first_hi as u128) << 64) | (first_lo as u128);
-
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        match LustroPrngBatch::try_new_range(&seed256, StreamId(first_id), count) {
-            Ok(batch) => Box::into_raw(Box::new(batch)),
-            Err(_) => std::ptr::null_mut(),
-        }
+        LustroPrngBatch::try_new_range(&seed256, StreamId(first_id), count).map_err(batch_status)
     })
 }
 
@@ -390,6 +370,29 @@ pub unsafe extern "C" fn lustro_prng_batch_free(ctx: *mut LustroPrngBatch) {
         if !ctx.is_null() {
             drop(Box::from_raw(ctx));
         }
+    })
+}
+
+/// Clones the batch context and returns a new independent instance.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+/// be reserved.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+/// that is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_batch_clone(
+    ctx: *const LustroPrngBatch,
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        (*ctx).try_clone().map_err(batch_status)
     })
 }
 
@@ -479,103 +482,71 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
 /// Derives one child PRNG per lane from `n` child identifiers.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
 /// `n` must equal the batch length.
-/// Returns null on invalid input.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
 /// when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork(
     ctx: *const LustroPrngBatch,
     ids_hi: *const u64,
     ids_lo: *const u64,
     n: usize,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
         let batch = &*ctx;
         if n != batch.len() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidLength);
         }
-
-        let stream_ids: Vec<StreamId> = if n == 0 {
-            Vec::new()
-        } else {
-            if ids_hi.is_null() || ids_lo.is_null() {
-                return std::ptr::null_mut();
-            }
-            let his = match slice_in(ids_hi, n) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            let los = match slice_in(ids_lo, n) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            his.iter()
-                .zip(los.iter())
-                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-                .collect()
-        };
-
-        Box::into_raw(Box::new(batch.fork(&stream_ids)))
+        let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
+        Ok(batch.fork(&stream_ids))
     })
 }
 
 /// Derives `k` children per lane. Output is parent-major:
 /// child `j` of lane `i` is at index `i * k + j`.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
-/// Returns null on invalid input, `len() * k` overflow, or allocation failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+/// `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
+/// `OutOfMemory` if the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `k` readable elements
 /// when `k > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     ctx: *const LustroPrngBatch,
     ids_hi: *const u64,
     ids_lo: *const u64,
     k: usize,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
         let batch = &*ctx;
         if batch.len().checked_mul(k).is_none() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidLength);
         }
-
-        let ids: Vec<StreamId> = if k == 0 {
-            Vec::new()
-        } else {
-            if ids_hi.is_null() || ids_lo.is_null() {
-                return std::ptr::null_mut();
-            }
-            let his = match slice_in(ids_hi, k) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            let los = match slice_in(ids_lo, k) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            his.iter()
-                .zip(los.iter())
-                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-                .collect()
-        };
-
-        match batch.try_fork_many(&ids) {
-            Ok(child) => Box::into_raw(Box::new(child)),
-            Err(_) => std::ptr::null_mut(),
-        }
+        let ids = ids_from_parts(ids_hi, ids_lo, k)?;
+        batch.try_fork_many(&ids).map_err(batch_status)
     })
 }
 
@@ -583,13 +554,18 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
 /// of `n_path` identifiers.
 /// Root and path IDs are passed as parallel `(hi, lo)` u64 arrays.
 /// `n_path` must be nonzero; `n_roots` may be zero.
-/// Returns null on invalid input, including an empty path.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
+/// its length is nonzero), `InvalidLength` for `n_path == 0` or a count too large to address,
+/// `OutOfMemory` if the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// `seed` must be valid for 32 bytes.
 /// `roots_hi` and `roots_lo` must each be valid for `n_roots` elements when
 /// `n_roots > 0`. `path_hi` and `path_lo` must each be valid for `n_path`
 /// elements when `n_path > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_derive_path(
     seed: *const u8,
@@ -599,69 +575,43 @@ pub unsafe extern "C" fn lustro_prng_batch_derive_path(
     path_hi: *const u64,
     path_lo: *const u64,
     n_path: usize,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
-        let seed_bytes = match buf_in(seed, 32) {
-            Some(s) if s.len() == 32 => s,
-            _ => return std::ptr::null_mut(),
-        };
-        if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
-            return std::ptr::null_mut();
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
+        if n_path == 0 {
+            return Err(LustroError::InvalidLength);
         }
-        if n_roots > 0 && (roots_hi.is_null() || roots_lo.is_null()) {
-            return std::ptr::null_mut();
-        }
-
-        let ids_from_parts = |hi: *const u64, lo: *const u64, n: usize| -> Option<Vec<StreamId>> {
-            if n == 0 {
-                return Some(Vec::new());
-            }
-            let his = slice_in(hi, n)?;
-            let los = slice_in(lo, n)?;
-            Some(
-                his.iter()
-                    .zip(los.iter())
-                    .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-                    .collect(),
-            )
-        };
-        let roots = match ids_from_parts(roots_hi, roots_lo, n_roots) {
-            Some(v) => v,
-            None => return std::ptr::null_mut(),
-        };
-        let path = match ids_from_parts(path_hi, path_lo, n_path) {
-            Some(v) => v,
-            None => return std::ptr::null_mut(),
-        };
-
+        let roots = ids_from_parts(roots_hi, roots_lo, n_roots)?;
+        let path = ids_from_parts(path_hi, path_lo, n_path)?;
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        Box::into_raw(Box::new(LustroPrngBatch::derive_path(
-            &seed256, &roots, &path,
-        )))
+        LustroPrngBatch::try_derive_path(&seed256, &roots, &path).map_err(derive_path_status)
     })
 }
 
 /// Derives one child PRNG per lane with sequential IDs starting at `first`.
 /// IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
-/// Returns null on null `ctx`.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork_range(
     ctx: *const LustroPrngBatch,
     first_hi: u64,
     first_lo: u64,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
-        let batch = &*ctx;
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-
-        Box::into_raw(Box::new(batch.fork_range(StreamId(first))))
+        Ok((*ctx).fork_range(StreamId(first)))
     })
 }
 
@@ -719,25 +669,23 @@ pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
 }
 
 /// Restores a PRNG batch from `len` snapshot bytes.
-/// Returns null on invalid input or decoding failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`,
+/// `UnsupportedVersion` or `InvalidKind` for a rejected snapshot.
 ///
 /// # Safety
 /// `bytes` must be valid for `len` bytes when `len > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_import_snapshot(
     bytes: *const u8,
     len: usize,
-) -> *mut LustroPrngBatch {
-    guarded(std::ptr::null_mut(), || {
-        let snapshot_bytes = match buf_in(bytes, len) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-
-        if let Ok(snapshot) = crate::types::LustroPrngBatchSnapshot::from_le_bytes(snapshot_bytes) {
-            Box::into_raw(Box::new(LustroPrngBatch::import_snapshot(snapshot)))
-        } else {
-            std::ptr::null_mut()
-        }
+    out_ctx: *mut *mut LustroPrngBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let snapshot_bytes = bytes_in(bytes, len)?;
+        let snapshot = crate::types::LustroPrngBatchSnapshot::from_le_bytes(snapshot_bytes)?;
+        Ok(LustroPrngBatch::import_snapshot(snapshot))
     })
 }

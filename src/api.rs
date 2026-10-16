@@ -11,6 +11,13 @@ pub fn lustro_api_version() -> u32 {
     LUSTRO_API_VERSION
 }
 
+/// Execution settings of this process, read from `LUSTRO_*` env on first use
+/// (this call counts). `threads` is the configured pool size, not running
+/// workers: the pool is not started here.
+pub fn runtime_info() -> crate::types::RuntimeInfo {
+    crate::dispatch::runtime_info()
+}
+
 // ==========================================
 // INTERNAL CORE API
 // ==========================================

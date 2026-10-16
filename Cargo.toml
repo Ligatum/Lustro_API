@@ -2,7 +2,7 @@
 name         = "lustro"
 version      = "1.0.0"
 edition      = "2021"
-rust-version = "1.87"
+rust-version = "1.90"
 description  = "Lustro V1 is a 256-bit deterministic, single-pass diffusion engine with HASH/PRNG/XOF capabilities, providing live state-forking (stream tree branching)"
 license-file = "LICENSE.md"
 repository   = "https://github.com/Ligatum/Lustro_API"
@@ -16,7 +16,8 @@ name       = "lustro"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = []
+default = ["parallel"]
+parallel = ["dep:rayon"]
 python  = ["dep:pyo3", "dep:numpy"]
 ffi     = []
 rand    = ["dep:rand_core"]
@@ -24,7 +25,7 @@ rand    = ["dep:rand_core"]
 [dependencies]
 pyo3   = { version = "0.22", features = ["extension-module"], optional = true }
 numpy  = { version = "0.22", optional = true }
-rayon  = "1.10"
+rayon  = { version = "1.10", optional = true }
 rand_core = { version = "0.6", features = ["alloc"], optional = true }
 
 [build-dependencies]

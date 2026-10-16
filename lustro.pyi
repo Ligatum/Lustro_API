@@ -7,6 +7,7 @@ from typing_extensions import Buffer
 __all__ = [
     "__version__",
     "lustro_api_version",
+    "runtime_info",
     "SEED_LEN",
     "BLOCK_LEN",
     "HASH128_LEN",
@@ -14,6 +15,7 @@ __all__ = [
     "SNAPSHOT_LEN",
     "BATCH_SNAPSHOT_HEADER_LEN",
     "BATCH_SNAPSHOT_LANE_LEN",
+    "SnapshotError",
     "hash256",
     "hash128",
     "hash256_many",
@@ -36,7 +38,10 @@ SNAPSHOT_LEN: int
 BATCH_SNAPSHOT_HEADER_LEN: int
 BATCH_SNAPSHOT_LANE_LEN: int
 
+class SnapshotError(ValueError): ...
+
 def lustro_api_version() -> int: ...
+def runtime_info() -> dict[str, str | int]: ...
 def hash256(data: bytes) -> bytes: ...
 def hash128(data: bytes) -> bytes: ...
 def hash256_many(data: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]: ...

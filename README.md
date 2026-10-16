@@ -33,7 +33,7 @@ All release builds catch internal panics and convert them to `LustroError::Inter
 
 ## Speed Test and Validation
 
-This repo is the full API implementation and also contains **Lustro_Golden_Vectors_Validator.py** along with **Lustro_Speed_Tester.py**. These scripts require the C FFI library (`lustro.dll`) in the same folder.
+This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. This script requires the C FFI library (`lustro.dll`) in the same folder.
 
 Please note that the core mechanism and the API implementation are considered non-cryptographic at this moment.
 
@@ -165,16 +165,26 @@ value = rng.next_u64()
 **C / C++**
 
 ```c
+#include <stdio.h>
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrng *rng = lustro_prng_new(seed, 0, 0);
+
+LustroPrng *rng = NULL;
+LustroError err = lustro_prng_new(seed, 0, 0, &rng);
+if (err != LUSTRO_ERROR_OK) {
+    fprintf(stderr, "%s\n", lustro_strerror(err));
+    return 1;
+}
 
 uint64_t value;
 lustro_prng_next_u64(rng, &value);
 
 lustro_prng_free(rng);
 ```
+Every constructor returns a `LustroError` and stores the new context in its last argument (`out_ctx`). 
+On failure `*out_ctx` is set to `NULL` and the status tells why (`lustro_strerror` returns a message). The `lustro_*_free` functions accept `NULL`. 
+The C examples below omit the status checks for brevity.
 
 ---
 
@@ -203,8 +213,8 @@ block = xof.next_block()
 ```c
 #include "lustro.h"
 
-LustroXof *xof =
-    lustro_xof_new((const uint8_t *)"hello world", 11);
+LustroXof *xof = NULL;
+lustro_xof_new((const uint8_t *)"hello world", 11, &xof);
 
 uint8_t block[LUSTRO_BLOCK_LEN];
 lustro_xof_next_block(xof, block);
@@ -255,7 +265,8 @@ data = rng.fill(100)            # bytes, 100
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrng *rng = lustro_prng_new(seed, 0, 0);
+LustroPrng *rng = NULL;
+lustro_prng_new(seed, 0, 0, &rng);
 
 uint32_t a;
 uint64_t b;
@@ -331,8 +342,8 @@ uint8_t seed[LUSTRO_SEED_LEN] = {0};
 uint64_t ids_hi[3] = {0, 0, 0};
 uint64_t ids_lo[3] = {12, 7, 99};
 
-LustroPrng *rng =
-    lustro_prng_derive_path(seed, ids_hi, ids_lo, 3);
+LustroPrng *rng = NULL;
+lustro_prng_derive_path(seed, ids_hi, ids_lo, 3, &rng);
 
 lustro_prng_free(rng);
 ```
@@ -341,7 +352,7 @@ lustro_prng_free(rng);
 first identifier, then `fork` for each remaining one — in one call, without
 creating the intermediate streams. The same API is available for XOF, via
 `LustroXof::derive_path(message, path)` (Rust), `LustroXof.derive_path(message, path)`
-(Python), and `lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, n)`
+(Python), and `lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, n, &out_ctx)`
 (C/C++); there every identifier in `path` is a `fork`, since `XOF::new` already
 takes the message as its root.
 
@@ -407,8 +418,8 @@ uint8_t seed[LUSTRO_SEED_LEN] = {0};
 uint64_t ids_hi[4] = {0};
 uint64_t ids_lo[4] = {0, 1, 2, 3};
 
-LustroPrngBatch *prng =
-    lustro_prng_batch_new(seed, ids_hi, ids_lo, 4);
+LustroPrngBatch *prng = NULL;
+lustro_prng_batch_new(seed, ids_hi, ids_lo, 4, &prng);
 
 #define STEPS 2
 
@@ -425,8 +436,8 @@ const uint8_t *messages[] = {
 
 uintptr_t lengths[] = {4, 4, 4};
 
-LustroXofBatch *xof =
-    lustro_xof_batch_new(messages, lengths, 3);
+LustroXofBatch *xof = NULL;
+lustro_xof_batch_new(messages, lengths, 3, &xof);
 
 uint8_t xof_out[STEPS][3][LUSTRO_BLOCK_LEN];
 lustro_xof_batch_fill_blocks(
@@ -477,8 +488,8 @@ prng.fill_blocks(out, steps)
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrngBatch *prng =
-    lustro_prng_batch_new_range(seed, 0, 0, 4);
+LustroPrngBatch *prng = NULL;
+lustro_prng_batch_new_range(seed, 0, 0, 4, &prng);
 
 size_t steps = lustro_prng_batch_suggested_steps(prng);
 size_t out_len = steps * lustro_prng_batch_len(prng) * LUSTRO_BLOCK_LEN;
@@ -529,17 +540,17 @@ many_children = prng.fork_many([100, 200])
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrngBatch *prng =
-    lustro_prng_batch_new_range(seed, 0, 0, 4);
+LustroPrngBatch *prng = NULL;
+lustro_prng_batch_new_range(seed, 0, 0, 4, &prng);
 
-LustroPrngBatch *children =
-    lustro_prng_batch_fork_range(prng, 0, 100);
+LustroPrngBatch *children = NULL;
+lustro_prng_batch_fork_range(prng, 0, 100, &children);
 
 uint64_t k_hi[2] = {0, 0};
 uint64_t k_lo[2] = {100, 200};
 
-LustroPrngBatch *many_children =
-    lustro_prng_batch_fork_many(prng, k_hi, k_lo, 2);
+LustroPrngBatch *many_children = NULL;
+lustro_prng_batch_fork_many(prng, k_hi, k_lo, 2, &many_children);
 
 lustro_prng_batch_free(many_children);
 lustro_prng_batch_free(children);
@@ -594,10 +605,10 @@ uint64_t roots_lo[4] = {0, 1, 2, 3};
 uint64_t path_hi[2] = {0, 0};
 uint64_t path_lo[2] = {12, 7};
 
-LustroPrngBatch *batch =
-    lustro_prng_batch_derive_path(
-        seed, roots_hi, roots_lo, 4, path_hi, path_lo, 2
-    );
+LustroPrngBatch *batch = NULL;
+lustro_prng_batch_derive_path(
+    seed, roots_hi, roots_lo, 4, path_hi, path_lo, 2, &batch
+);
 
 lustro_prng_batch_free(batch);
 ```
@@ -607,7 +618,7 @@ lustro_prng_batch_free(batch);
 stream's state. The same API is available for XOF, via
 `LustroXofBatch::derive_path(messages, path)` (Rust),
 `LustroXofBatch.derive_path(messages, path)` (Python), and
-`lustro_xof_batch_derive_path(message_ptrs, message_lens, n_messages, path_hi, path_lo, n_path)`
+`lustro_xof_batch_derive_path(message_ptrs, message_lens, n_messages, path_hi, path_lo, n_path, &out_ctx)`
 (C/C++), using a list of messages instead of a seed and root identifiers.
 
 ---
@@ -648,22 +659,29 @@ restored = LustroPrng.import_snapshot(snapshot)
 **C / C++**
 
 ```c
+#include <stdio.h>
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrng *rng = lustro_prng_new(seed, 0, 0);
+LustroPrng *rng = NULL;
+lustro_prng_new(seed, 0, 0, &rng);
 
 uint8_t snapshot[LUSTRO_SNAPSHOT_LEN];
 lustro_prng_export_snapshot(rng, snapshot);
 
-LustroPrng *restored =
-    lustro_prng_import_snapshot(snapshot);
+LustroPrng *restored = NULL;
+LustroError err = lustro_prng_import_snapshot(snapshot, &restored);
+if (err != LUSTRO_ERROR_OK) {
+    fprintf(stderr, "%s\n", lustro_strerror(err));
+}
 
 lustro_prng_free(restored);
 lustro_prng_free(rng);
 ```
 
-The same snapshot API is available for XOF and batch contexts. Please note that for batch contexts in C/C++ the snapshot size is dynamic; call the corresponding `*_batch_snapshot_size(ctx)` before export. It equals `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN` for `n` streams.
+The same snapshot API is available for XOF and batch contexts. Please note that for batch contexts in C/C++ the snapshot size is dynamic; 
+call the corresponding `*_batch_snapshot_size(ctx)` before export. It equals `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN` 
+for `n` streams.
 
 ---
 

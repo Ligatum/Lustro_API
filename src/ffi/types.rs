@@ -1,5 +1,8 @@
 //! Lustro V1 FFI — buffer helpers for C consumers.
 
+use crate::errors::LustroError;
+use crate::types::StreamId;
+
 /// Whether `len` elements of `T` span at most isize::MAX bytes
 /// (the `slice::from_raw_parts` limit). False also on usize overflow.
 #[inline]
@@ -56,6 +59,57 @@ pub(super) unsafe fn buf_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> 
 #[inline]
 pub(super) unsafe fn buf_out<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [u8]> {
     slice_out(ptr, len)
+}
+
+/// As `buf_in`, but a length above isize::MAX is `InvalidLength`, as in the hash functions.
+/// SAFETY: ptr must be valid for len bytes if len > 0.
+#[inline]
+pub(super) unsafe fn bytes_in<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], LustroError> {
+    if !fits_slice::<u8>(len) {
+        return Err(LustroError::InvalidLength);
+    }
+    buf_in(ptr, len).ok_or(LustroError::InvalidPointer)
+}
+
+/// Joins parallel `(hi, lo)` arrays into stream IDs.
+/// `InvalidLength` if `n` is not addressable; `InvalidPointer` if a pointer is null (n > 0) or misaligned.
+/// SAFETY: both pointers must be valid for `n` elements if n > 0.
+pub(super) unsafe fn ids_from_parts(
+    hi: *const u64,
+    lo: *const u64,
+    n: usize,
+) -> Result<Vec<StreamId>, LustroError> {
+    if !fits_slice::<StreamId>(n) {
+        return Err(LustroError::InvalidLength);
+    }
+    let his = slice_in(hi, n).ok_or(LustroError::InvalidPointer)?;
+    let los = slice_in(lo, n).ok_or(LustroError::InvalidPointer)?;
+    Ok(his
+        .iter()
+        .zip(los)
+        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
+        .collect())
+}
+
+/// Reconstructs `n` messages from parallel pointer/length arrays.
+/// `InvalidLength` if a length is not addressable; `InvalidPointer` on a null or misaligned
+/// array, or on a null message pointer with a nonzero length.
+/// SAFETY: arrays must be valid for `n` elements if n > 0; each pointer for its length.
+pub(super) unsafe fn messages_from_parts<'a>(
+    ptrs: *const *const u8,
+    lens: *const usize,
+    n: usize,
+) -> Result<Vec<&'a [u8]>, LustroError> {
+    if !fits_slice::<&[u8]>(n) {
+        return Err(LustroError::InvalidLength);
+    }
+    let ptrs = slice_in(ptrs, n).ok_or(LustroError::InvalidPointer)?;
+    let lens = slice_in(lens, n).ok_or(LustroError::InvalidPointer)?;
+    let mut messages = Vec::with_capacity(n);
+    for (&p, &len) in ptrs.iter().zip(lens) {
+        messages.push(bytes_in(p, len)?);
+    }
+    Ok(messages)
 }
 
 /// Whether byte ranges [a, a+a_len) and [b, b+b_len) overlap.

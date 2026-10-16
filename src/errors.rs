@@ -5,6 +5,7 @@
 /// Status code returned by the C ABI. Values are fixed.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LustroError {
     /// Success.
     Ok = 0,
@@ -20,6 +21,14 @@ pub enum LustroError {
     VerificationFailed = 5,
     /// Panic caught at the FFI boundary.
     InternalPanic = 6,
+    /// Snapshot version byte is not supported.
+    UnsupportedVersion = 7,
+    /// Snapshot kind byte does not match the expected type.
+    InvalidKind = 8,
+    /// Snapshot cursor is outside `1..=32`.
+    InvalidCursor = 9,
+    /// Reserving a batch lane buffer failed (allocator refusal or capacity overflow).
+    OutOfMemory = 10,
 }
 
 impl LustroError {
@@ -33,6 +42,10 @@ impl LustroError {
             4 => Some(LustroError::AlreadyFinalised),
             5 => Some(LustroError::VerificationFailed),
             6 => Some(LustroError::InternalPanic),
+            7 => Some(LustroError::UnsupportedVersion),
+            8 => Some(LustroError::InvalidKind),
+            9 => Some(LustroError::InvalidCursor),
+            10 => Some(LustroError::OutOfMemory),
             _ => None,
         }
     }
@@ -53,6 +66,10 @@ impl LustroError {
             LustroError::AlreadyFinalised => "context already finalised\0",
             LustroError::VerificationFailed => "verification failed\0",
             LustroError::InternalPanic => "internal panic caught at FFI boundary\0",
+            LustroError::UnsupportedVersion => "unsupported snapshot version\0",
+            LustroError::InvalidKind => "snapshot kind does not match this type\0",
+            LustroError::InvalidCursor => "invalid snapshot cursor value\0",
+            LustroError::OutOfMemory => "allocation failed\0",
         }
     }
 }
@@ -64,3 +81,15 @@ impl core::fmt::Display for LustroError {
 }
 
 impl std::error::Error for LustroError {}
+
+impl From<crate::types::SnapshotError> for LustroError {
+    fn from(e: crate::types::SnapshotError) -> Self {
+        use crate::types::SnapshotError as S;
+        match e {
+            S::UnsupportedVersion => LustroError::UnsupportedVersion,
+            S::InvalidKind => LustroError::InvalidKind,
+            S::InvalidCursor => LustroError::InvalidCursor,
+            S::InvalidLength => LustroError::InvalidLength,
+        }
+    }
+}

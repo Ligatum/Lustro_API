@@ -17,9 +17,34 @@ pub fn lustro_api_version() -> u32 {
     crate::api::LUSTRO_API_VERSION
 }
 
-// Maps SnapshotError to a PyValueError (message from Display).
+/// Execution settings of this process as a dict: `backend` ("scalar" or "avx2")
+/// and `threads` (configured pool size, 0 = calling thread only). The pool is not
+/// started by this call; see `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT`,
+/// `LUSTRO_DISABLE_SIMD`.
+#[pyfunction]
+pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+    let info = crate::api::runtime_info();
+    let d = pyo3::types::PyDict::new_bound(py);
+    d.set_item("backend", info.backend)?;
+    d.set_item("threads", info.threads)?;
+    Ok(d)
+}
+
+// Separate module: the macro expands to a `gil-refs` cfg that rustc does not know.
+#[allow(unexpected_cfgs)]
+mod exceptions {
+    pyo3::create_exception!(
+        lustro,
+        SnapshotError,
+        pyo3::exceptions::PyValueError,
+        "A snapshot could not be imported."
+    );
+}
+pub use exceptions::SnapshotError;
+
+// Maps SnapshotError to the Python SnapshotError (message from Display).
 pub(crate) fn snapshot_error(err: crate::types::SnapshotError) -> pyo3::PyErr {
-    pyo3::exceptions::PyValueError::new_err(err.to_string())
+    SnapshotError::new_err(err.to_string())
 }
 
 // Maps an allocation failure to MemoryError.

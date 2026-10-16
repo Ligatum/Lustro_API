@@ -2,10 +2,13 @@
 
 #![allow(non_snake_case)]
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
+#[cfg(feature = "parallel")]
 use rayon::ThreadPoolBuilder;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
+#[cfg(feature = "parallel")]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
@@ -177,13 +180,16 @@ fn runtime_config() -> RuntimeConfig {
 // RAYON POOL
 // ==========================================
 
+#[cfg(feature = "parallel")]
 static RAYON_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
 // PID of the process that owns pool initialization. 0 = unclaimed.
+#[cfg(feature = "parallel")]
 static POOL_OWNER: AtomicU32 = AtomicU32::new(0);
 
 // Initializes the dispatcher's Rayon pool once.
 // A process that inherited the pool through `fork` uses the single-threaded fallback.
+#[cfg(feature = "parallel")]
 pub(crate) fn init_pool() {
     let pid = std::process::id();
     let _ = POOL_OWNER.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire);
@@ -201,6 +207,7 @@ pub(crate) fn init_pool() {
 
 // None if the pool could not be built or this process inherited it through `fork`.
 // Callers then use the calling thread.
+#[cfg(feature = "parallel")]
 fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
     init_pool();
     if POOL_OWNER.load(Ordering::Acquire) != std::process::id() {
@@ -310,13 +317,10 @@ fn execute_hash<const N: usize>(
     absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
 ) {
     match plan.parallel {
-        HashParallel::Single => {
-            for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
-                absorb_into(m, domain, o);
-            }
-        }
-        HashParallel::Rayon => match get_or_init_pool() {
-            Some(pool) => {
+        HashParallel::Single => hash_single(messages, domain, out, absorb_into),
+        HashParallel::Rayon => {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = get_or_init_pool() {
                 pool.install(|| {
                     messages
                         .par_iter()
@@ -324,13 +328,21 @@ fn execute_hash<const N: usize>(
                         .zip(out.par_iter_mut())
                         .for_each(|(m, o)| absorb_into(m, domain, o));
                 });
+                return;
             }
-            None => {
-                for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
-                    absorb_into(m, domain, o);
-                }
-            }
-        },
+            hash_single(messages, domain, out, absorb_into);
+        }
+    }
+}
+
+fn hash_single<const N: usize>(
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]),
+) {
+    for (m, o) in messages.iter().copied().zip(out.iter_mut()) {
+        absorb_into(m, domain, o);
     }
 }
 
@@ -416,6 +428,14 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Backend::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2(_) => "avx2",
+        }
+    }
+
     // Stream policy parameters of this backend.
     pub(crate) fn stream_params(self) -> StreamParams {
         match self {
@@ -585,6 +605,37 @@ pub(crate) fn suggested_steps_with(caps: Caps, overrides: Overrides, n: usize) -
     backend_for(caps, overrides, n).steps_policy().steps_for(n)
 }
 
+// Backend and thread count for the given capabilities and config; no pool access.
+// `logical` is the logical CPU count.
+fn runtime_info_with(
+    caps: Caps,
+    config: RuntimeConfig,
+    logical: usize,
+) -> crate::types::RuntimeInfo {
+    // Largest batch: AVX2 whenever it is available.
+    let backend = backend_for(caps, config.overrides(), usize::MAX);
+    #[cfg(feature = "parallel")]
+    let threads = if config.disable_mt {
+        0
+    } else {
+        config.threads.map_or(logical, NonZeroUsize::get)
+    };
+    #[cfg(not(feature = "parallel"))]
+    let threads = {
+        let _ = logical;
+        0
+    };
+    crate::types::RuntimeInfo {
+        backend: backend.name(),
+        threads,
+    }
+}
+
+// Settings of the current CPU and runtime config. Reads the config like any dispatch.
+pub(crate) fn runtime_info() -> crate::types::RuntimeInfo {
+    runtime_info_with(Caps::detect(), runtime_config(), logical_cpus())
+}
+
 // Suggested `steps` for the current CPU and runtime config.
 pub(crate) fn suggested_steps(n: usize) -> usize {
     suggested_steps_with(Caps::detect(), runtime_config().overrides(), n)
@@ -643,8 +694,9 @@ fn execute_streams(
             // SAFETY: one call covers all lanes; out holds n * steps blocks.
             unsafe { process_lanes(backend, lanes, out_ptr.get(), n, 0, steps) };
         }
-        Parallel::Rayon { chunk } => match get_or_init_pool() {
-            Some(pool) => {
+        Parallel::Rayon { chunk } => {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = get_or_init_pool() {
                 pool.install(|| {
                     lanes
                         .par_chunks_mut(chunk)
@@ -658,11 +710,12 @@ fn execute_streams(
                             };
                         });
                 });
+                return;
             }
-            None => {
-                // SAFETY: fallback to single thread when pool creation fails.
-                unsafe { process_lanes(backend, lanes, out_ptr.get(), n, 0, steps) };
-            }
-        },
+            #[cfg(not(feature = "parallel"))]
+            let _ = chunk;
+            // SAFETY: fallback to single thread when there is no pool.
+            unsafe { process_lanes(backend, lanes, out_ptr.get(), n, 0, steps) };
+        }
     }
 }

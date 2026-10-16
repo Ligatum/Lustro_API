@@ -292,6 +292,17 @@ impl LustroXofBatch {
         Self { streams }
     }
 
+    /// As `clone`, returning `Err(BatchError::Reserve)` if reserving the lane buffer
+    /// fails. Never returns `BatchError::SizeOverflow`.
+    pub fn try_clone(&self) -> Result<Self, BatchError> {
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(self.streams.len())
+            .map_err(BatchError::Reserve)?;
+        streams.extend_from_slice(&self.streams);
+        Ok(Self { streams })
+    }
+
     /// Exports the current state of every lane.
     /// Batch snapshots are block-aligned and have no cursor.
     #[must_use]

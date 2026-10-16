@@ -77,6 +77,19 @@ impl core::fmt::Debug for Seed256 {
     }
 }
 
+/// Execution settings of this process, as configured.
+/// Reading them does not start the thread pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeInfo {
+    /// Backend for batch streams: `"scalar"` or `"avx2"`. AVX2 is used from 4 lanes
+    /// up; hashing and single streams are always scalar.
+    pub backend: &'static str,
+    /// Threads for parallel batches. 0 = batches run on the calling thread
+    /// (disabled by the environment or built without `parallel`).
+    pub threads: usize,
+}
+
 /// Seed length in bytes.
 pub const LUSTRO_SEED_LEN: usize = 32;
 /// Output block length in bytes.
@@ -127,6 +140,7 @@ pub enum SnapshotKind {
 
 /// Why a snapshot could not be decoded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum SnapshotError {
     /// Version byte is not supported.
     UnsupportedVersion,
@@ -180,7 +194,7 @@ impl std::error::Error for DerivePathError {
     }
 }
 
-/// Why a batch could not be built by a `try_new_range` or `try_fork_many` function.
+/// Why a batch could not be built by `try_new_range`, `try_fork_many` or `try_clone`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BatchError {

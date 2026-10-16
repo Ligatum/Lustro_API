@@ -5,28 +5,34 @@ use crate::types::StreamId;
 use crate::xof::LustroXof;
 use crate::xof::LustroXofBatch;
 
-use super::guarded;
-use super::types::{buf_in, buf_out, fits_slice, slice_in, slice_out};
+use super::types::{
+    buf_in, buf_out, bytes_in, fits_slice, ids_from_parts, messages_from_parts, slice_out,
+};
+use super::{batch_status, construct, derive_path_status, guarded};
 
 // ==========================================
 // FFI XOF SINGLE API
 // ==========================================
 
 /// Creates an XOF context by absorbing a message.
-/// Returns null on invalid input.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `message` when `message_len > 0`,
+/// `InvalidLength` for a `message_len` too large to address.
 ///
 /// # Safety
 /// If `message_len > 0`, `message` must be valid for `message_len` readable
 /// bytes.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_xof_new(message: *const u8, message_len: usize) -> *mut LustroXof {
-    guarded(std::ptr::null_mut(), || {
-        let message = match buf_in(message, message_len) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-
-        Box::into_raw(Box::new(LustroXof::new(message)))
+pub unsafe extern "C" fn lustro_xof_new(
+    message: *const u8,
+    message_len: usize,
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
+        let message = bytes_in(message, message_len)?;
+        Ok(LustroXof::new(message))
     })
 }
 
@@ -136,6 +142,7 @@ pub unsafe extern "C" fn lustro_xof_next_block(ctx: *mut LustroXof, out: *mut u8
 }
 
 /// Fills `out` with `out_len` output bytes.
+///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context and
 /// be exclusively accessible for the duration of the call.
@@ -166,53 +173,65 @@ pub unsafe extern "C" fn lustro_xof_fill(
 }
 
 /// Clones the XOF context and returns a new independent instance.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_xof_clone(ctx: *const LustroXof) -> *mut LustroXof {
-    guarded(std::ptr::null_mut(), || {
+pub unsafe extern "C" fn lustro_xof_clone(
+    ctx: *const LustroXof,
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
-        let xof = &*ctx;
-
-        Box::into_raw(Box::new(xof.clone()))
+        Ok((*ctx).clone())
     })
 }
 
 /// Derives a child XOF from the current state and 128-bit identifier.
 /// `id` is passed as `(hi, lo)` u64 values.
-/// Returns null on null `ctx`.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork(
     ctx: *const LustroXof,
     id_hi: u64,
     id_lo: u64,
-) -> *mut LustroXof {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
-        let xof = &*ctx;
         let id = ((id_hi as u128) << 64) | (id_lo as u128);
-
-        Box::into_raw(Box::new(xof.fork(StreamId(id))))
+        Ok((*ctx).fork(StreamId(id)))
     })
 }
 
 /// Derives an XOF from a message along a path of `n` identifiers.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
-/// Returns null on invalid input, including `n == 0`.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `message` when `message_len > 0` or a null or
+/// misaligned ID array (when `n > 0`), `InvalidLength` for `n == 0` or a length too large to
+/// address.
 ///
 /// # Safety
 /// `message` must be valid for `message_len` bytes when `message_len > 0`.
 /// `ids_hi` and `ids_lo` must each be valid for `n` elements when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_derive_path(
     message: *const u8,
@@ -220,30 +239,15 @@ pub unsafe extern "C" fn lustro_xof_derive_path(
     ids_hi: *const u64,
     ids_lo: *const u64,
     n: usize,
-) -> *mut LustroXof {
-    guarded(std::ptr::null_mut(), || {
-        let message = match buf_in(message, message_len) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        if n == 0 || ids_hi.is_null() || ids_lo.is_null() {
-            return std::ptr::null_mut();
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
+        let message = bytes_in(message, message_len)?;
+        if n == 0 {
+            return Err(LustroError::InvalidLength);
         }
-        let his = match slice_in(ids_hi, n) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let los = match slice_in(ids_lo, n) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let path: Vec<StreamId> = his
-            .iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect();
-
-        Box::into_raw(Box::new(LustroXof::derive_path(message, &path)))
+        let path = ids_from_parts(ids_hi, ids_lo, n)?;
+        Ok(LustroXof::derive_path(message, &path))
     })
 }
 
@@ -276,24 +280,25 @@ pub unsafe extern "C" fn lustro_xof_export_snapshot(
 }
 
 /// Restores an XOF context from a 56-byte snapshot.
-/// Returns null on invalid input or decoding failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `bytes`; `UnsupportedVersion`, `InvalidKind`
+/// or `InvalidCursor` for a rejected snapshot. The length is fixed at 56 bytes, so `InvalidLength`
+/// is not reported.
 ///
 /// # Safety
 /// If `bytes` is non-null, it must be valid for 56 readable bytes.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_xof_import_snapshot(bytes: *const u8) -> *mut LustroXof {
-    guarded(std::ptr::null_mut(), || {
-        let snapshot_bytes = match buf_in(bytes, 56) {
-            Some(s) if s.len() == 56 => s,
-            _ => return std::ptr::null_mut(),
-        };
+pub unsafe extern "C" fn lustro_xof_import_snapshot(
+    bytes: *const u8,
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
+        let snapshot_bytes = buf_in(bytes, 56).ok_or(LustroError::InvalidPointer)?;
         let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
-
-        if let Ok(snapshot) = crate::types::LustroXofSnapshot::from_le_bytes(array_ref) {
-            Box::into_raw(Box::new(LustroXof::import_snapshot(snapshot)))
-        } else {
-            std::ptr::null_mut()
-        }
+        let snapshot = crate::types::LustroXofSnapshot::from_le_bytes(array_ref)?;
+        Ok(LustroXof::import_snapshot(snapshot))
     })
 }
 
@@ -303,45 +308,28 @@ pub unsafe extern "C" fn lustro_xof_import_snapshot(bytes: *const u8) -> *mut Lu
 
 /// Creates an XOF batch from `n` messages.
 /// Messages are passed as parallel pointer/length arrays.
-/// Returns null on invalid input.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null or misaligned pointer/length array (when
+/// `n > 0`) or a null message pointer with a nonzero length, `InvalidLength` for a length too large
+/// to address.
 ///
 /// # Safety
 /// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
 /// `n` readable elements.
 /// Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
 /// when `message_lens[i] > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_new(
     message_ptrs: *const *const u8,
     message_lens: *const usize,
     n: usize,
-) -> *mut LustroXofBatch {
-    guarded(std::ptr::null_mut(), || {
-        if n == 0 {
-            return Box::into_raw(Box::new(LustroXofBatch::new(&[])));
-        }
-        if message_ptrs.is_null() || message_lens.is_null() {
-            return std::ptr::null_mut();
-        }
-
-        let ptrs = match slice_in(message_ptrs, n) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let lens = match slice_in(message_lens, n) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-
-        let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
-        for i in 0..n {
-            match buf_in(ptrs[i], lens[i]) {
-                Some(s) => messages.push(s),
-                None => return std::ptr::null_mut(),
-            }
-        }
-
-        Box::into_raw(Box::new(LustroXofBatch::new(&messages)))
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let messages = messages_from_parts(message_ptrs, message_lens, n)?;
+        Ok(LustroXofBatch::new(&messages))
     })
 }
 
@@ -357,6 +345,29 @@ pub unsafe extern "C" fn lustro_xof_batch_free(ctx: *mut LustroXofBatch) {
         if !ctx.is_null() {
             drop(Box::from_raw(ctx));
         }
+    })
+}
+
+/// Clones the batch context and returns a new independent instance.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+/// be reserved.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_clone(
+    ctx: *const LustroXofBatch,
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        (*ctx).try_clone().map_err(batch_status)
     })
 }
 
@@ -446,103 +457,71 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
 /// Derives one child XOF per lane from `n` child identifiers.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
 /// `n` must equal the batch length.
-/// Returns null on invalid input.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
 /// when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork(
     ctx: *const LustroXofBatch,
     ids_hi: *const u64,
     ids_lo: *const u64,
     n: usize,
-) -> *mut LustroXofBatch {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
         let batch = &*ctx;
         if n != batch.len() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidLength);
         }
-
-        let stream_ids: Vec<StreamId> = if n == 0 {
-            Vec::new()
-        } else {
-            if ids_hi.is_null() || ids_lo.is_null() {
-                return std::ptr::null_mut();
-            }
-            let his = match slice_in(ids_hi, n) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            let los = match slice_in(ids_lo, n) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            his.iter()
-                .zip(los.iter())
-                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-                .collect()
-        };
-
-        Box::into_raw(Box::new(batch.fork(&stream_ids)))
+        let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
+        Ok(batch.fork(&stream_ids))
     })
 }
 
 /// Derives `k` children per lane. Output is parent-major:
 /// child `j` of lane `i` is at index `i * k + j`.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
-/// Returns null on invalid input, `len() * k` overflow, or allocation failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+/// `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
+/// `OutOfMemory` if the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `k` readable elements
 /// when `k > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     ctx: *const LustroXofBatch,
     ids_hi: *const u64,
     ids_lo: *const u64,
     k: usize,
-) -> *mut LustroXofBatch {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
         let batch = &*ctx;
         if batch.len().checked_mul(k).is_none() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidLength);
         }
-
-        let ids: Vec<StreamId> = if k == 0 {
-            Vec::new()
-        } else {
-            if ids_hi.is_null() || ids_lo.is_null() {
-                return std::ptr::null_mut();
-            }
-            let his = match slice_in(ids_hi, k) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            let los = match slice_in(ids_lo, k) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            his.iter()
-                .zip(los.iter())
-                .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-                .collect()
-        };
-
-        match batch.try_fork_many(&ids) {
-            Ok(child) => Box::into_raw(Box::new(child)),
-            Err(_) => std::ptr::null_mut(),
-        }
+        let ids = ids_from_parts(ids_hi, ids_lo, k)?;
+        batch.try_fork_many(&ids).map_err(batch_status)
     })
 }
 
@@ -550,7 +529,10 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
 /// of `n_path` identifiers. Messages are passed as parallel pointer/length
 /// arrays; path IDs as parallel `(hi, lo)` u64 arrays.
 /// `n_path` must be nonzero; `n_messages` may be zero.
-/// Returns null on invalid input, including an empty path.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null or misaligned argument array (when its length
+/// is nonzero) or a null message pointer with a nonzero length, `InvalidLength` for `n_path == 0`
+/// or a length too large to address, `OutOfMemory` if the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// `message_ptrs` and `message_lens` must each be valid for `n_messages`
@@ -558,6 +540,8 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
 /// `message_lens[i]` bytes if `message_lens[i] > 0`.
 /// `path_hi` and `path_lo` must each be valid for `n_path` elements when
 /// `n_path > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_derive_path(
     message_ptrs: *const *const u8,
@@ -566,72 +550,41 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
     path_hi: *const u64,
     path_lo: *const u64,
     n_path: usize,
-) -> *mut LustroXofBatch {
-    guarded(std::ptr::null_mut(), || {
-        if n_path == 0 || path_hi.is_null() || path_lo.is_null() {
-            return std::ptr::null_mut();
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        if n_path == 0 {
+            return Err(LustroError::InvalidLength);
         }
-        if n_messages > 0 && (message_ptrs.is_null() || message_lens.is_null()) {
-            return std::ptr::null_mut();
-        }
-
-        let mut messages: Vec<&[u8]> = Vec::with_capacity(n_messages);
-        if n_messages > 0 {
-            let ptrs = match slice_in(message_ptrs, n_messages) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            let lens = match slice_in(message_lens, n_messages) {
-                Some(s) => s,
-                None => return std::ptr::null_mut(),
-            };
-            for i in 0..n_messages {
-                match buf_in(ptrs[i], lens[i]) {
-                    Some(s) => messages.push(s),
-                    None => return std::ptr::null_mut(),
-                }
-            }
-        }
-
-        let his = match slice_in(path_hi, n_path) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let los = match slice_in(path_lo, n_path) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let path: Vec<StreamId> = his
-            .iter()
-            .zip(los.iter())
-            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-            .collect();
-
-        Box::into_raw(Box::new(LustroXofBatch::derive_path(&messages, &path)))
+        let messages = messages_from_parts(message_ptrs, message_lens, n_messages)?;
+        let path = ids_from_parts(path_hi, path_lo, n_path)?;
+        LustroXofBatch::try_derive_path(&messages, &path).map_err(derive_path_status)
     })
 }
 
 /// Derives one child XOF per lane with sequential IDs starting at `first`.
 /// IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
-/// Returns null on null `ctx`.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_range(
     ctx: *const LustroXofBatch,
     first_hi: u64,
     first_lo: u64,
-) -> *mut LustroXofBatch {
-    guarded(std::ptr::null_mut(), || {
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
         if ctx.is_null() {
-            return std::ptr::null_mut();
+            return Err(LustroError::InvalidPointer);
         }
-        let batch = &*ctx;
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-
-        Box::into_raw(Box::new(batch.fork_range(StreamId(first))))
+        Ok((*ctx).fork_range(StreamId(first)))
     })
 }
 
@@ -689,25 +642,23 @@ pub unsafe extern "C" fn lustro_xof_batch_export_snapshot(
 }
 
 /// Restores an XOF batch from `len` snapshot bytes.
-/// Returns null on invalid input or decoding failure.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`,
+/// `UnsupportedVersion` or `InvalidKind` for a rejected snapshot.
 ///
 /// # Safety
 /// `bytes` must be valid for `len` bytes if len > 0.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_import_snapshot(
     bytes: *const u8,
     len: usize,
-) -> *mut LustroXofBatch {
-    guarded(std::ptr::null_mut(), || {
-        let snapshot_bytes = match buf_in(bytes, len) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-
-        if let Ok(snapshot) = crate::types::LustroXofBatchSnapshot::from_le_bytes(snapshot_bytes) {
-            Box::into_raw(Box::new(LustroXofBatch::import_snapshot(snapshot)))
-        } else {
-            std::ptr::null_mut()
-        }
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let snapshot_bytes = bytes_in(bytes, len)?;
+        let snapshot = crate::types::LustroXofBatchSnapshot::from_le_bytes(snapshot_bytes)?;
+        Ok(LustroXofBatch::import_snapshot(snapshot))
     })
 }

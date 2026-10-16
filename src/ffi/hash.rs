@@ -93,7 +93,7 @@ pub unsafe extern "C" fn lustro_hash128(
 /// If `n * message_len` is nonzero and representable, `data_ptr` must be
 /// valid for `n * message_len` readable bytes.
 /// If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
-/// for `n * 16` writable bytes.
+/// for `n * 32` writable bytes.
 /// The input and output regions must not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256_many(

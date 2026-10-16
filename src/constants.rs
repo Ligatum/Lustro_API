@@ -6,7 +6,7 @@ pub(crate) const IV_S1: u128 = 0x6C62272E07BB01426C62272E07BB0142_u128;
 
 /// Domain separation tags
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Domain {
+pub(crate) enum Domain {
     /// Stateless hashing.
     Hash = 0x01,
     /// PRNG streams.
