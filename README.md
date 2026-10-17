@@ -18,6 +18,10 @@ cd Lustro_API
 
 cargo build --release
 
+# System entropy for Seed256::from_entropy() (Rust)
+
+cargo build --release --features entropy
+
 # Python (requires NumPy)
 
 pip install maturin numpy
@@ -31,7 +35,7 @@ cargo build --release --features ffi
 
 All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead of just aborting the process. See ARCHITECTURE.md §13.
 
-## Speed Test and Validation
+## Speed Test
 
 This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. This script requires the C FFI library (`lustro.dll`) in the same folder.
 
@@ -182,9 +186,38 @@ lustro_prng_next_u64(rng, &value);
 
 lustro_prng_free(rng);
 ```
-Every constructor returns a `LustroError` and stores the new context in its last argument (`out_ctx`). 
-On failure `*out_ctx` is set to `NULL` and the status tells why (`lustro_strerror` returns a message). The `lustro_*_free` functions accept `NULL`. 
+
+Every constructor returns a `LustroError` and stores the new context in its last argument (`out_ctx`).
+On failure `*out_ctx` is set to `NULL` and the status tells why (`lustro_strerror` returns a message). The `lustro_*_free` functions accept `NULL`.
 The C examples below omit the status checks for brevity.
+
+### Random Seed
+
+**Rust** (`--features entropy`, also enabled by `rand`)
+
+```rust
+use lustro::prng::LustroPrng;
+use lustro::types::{Seed256, StreamId};
+
+// Err(EntropyError) if the operating system cannot provide entropy.
+let seed = Seed256::from_entropy()?;
+let mut rng = LustroPrng::new(&seed, StreamId(0));
+```
+
+**Python**
+
+```python
+import os
+from lustro import LustroPrng
+
+rng = LustroPrng(os.urandom(32), 0)
+```
+
+**C / C++** — fill the 32-byte seed from the system's entropy source
+(for example `getrandom(2)`, `arc4random_buf` or `BCryptGenRandom`).
+
+A seed from the operating system does not make the generator cryptographically
+secure: `LustroPrng` does not implement `CryptoRng`.
 
 ---
 
@@ -348,11 +381,10 @@ lustro_prng_derive_path(seed, ids_hi, ids_lo, 3, &rng);
 lustro_prng_free(rng);
 ```
 
-`derive_path(seed, path)` derives the same stream as calling `new` with the
-first identifier, then `fork` for each remaining one — in one call, without
-creating the intermediate streams. The same API is available for XOF, via
-`LustroXof::derive_path(message, path)` (Rust), `LustroXof.derive_path(message, path)`
-(Python), and `lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, n, &out_ctx)`
+`derive_path(seed, path)` gives the same stream as `new` with the first
+identifier followed by `fork` for each remaining one, in a single call. The same
+API is available for XOF, via `LustroXof::derive_path(message, path)` (Rust),
+`LustroXof.derive_path(message, path)` (Python), and `lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, n, &out_ctx)`
 (C/C++); there every identifier in `path` is a `fork`, since `XOF::new` already
 takes the message as its root.
 
@@ -679,9 +711,52 @@ lustro_prng_free(restored);
 lustro_prng_free(rng);
 ```
 
-The same snapshot API is available for XOF and batch contexts. Please note that for batch contexts in C/C++ the snapshot size is dynamic; 
-call the corresponding `*_batch_snapshot_size(ctx)` before export. It equals `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN` 
+The same snapshot API is available for XOF and batch contexts. Please note that for batch contexts in C/C++ the snapshot size is dynamic;
+call the corresponding `*_batch_snapshot_size(ctx)` before export. It equals `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN`
 for `n` streams.
+
+---
+
+### Runtime Settings
+
+Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before the first batch call.
+
+**Rust**
+
+```rust
+use lustro::{configure, RuntimeOptions};
+use std::num::NonZeroUsize;
+
+let options = RuntimeOptions::new()
+    .threads(NonZeroUsize::new(4).unwrap())
+    .allow_simd(true);
+
+configure(options)?;
+```
+
+**Python**
+
+```python
+import lustro
+
+lustro.configure(threads=4, allow_simd=True)
+```
+
+**C / C++**
+
+```c
+#include <stdio.h>
+#include "lustro.h"
+
+LustroError err = lustro_configure(4, LUSTRO_SIMD_AUTO);
+if (err != LUSTRO_ERROR_OK) {
+    fprintf(stderr, "%s\n", lustro_strerror(err));
+}
+```
+
+Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you pass override it. `threads` is capped at the number of logical CPUs, and `1` disables the thread pool. `allow_simd=False` (`LUSTRO_SIMD_SCALAR` in C/C++) selects the scalar backend.
+
+The settings can be set only once. The first batch call, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` shows what ended up in effect.
 
 ---
 

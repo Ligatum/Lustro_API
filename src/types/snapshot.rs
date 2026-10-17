@@ -1,0 +1,423 @@
+//! Lustro V1 — PRNG/XOF snapshot types and their binary format.
+
+use super::{
+    LUSTRO_BATCH_SNAPSHOT_HEADER_LEN, LUSTRO_BATCH_SNAPSHOT_LANE_LEN, LUSTRO_SNAPSHOT_LEN,
+};
+
+//==========================
+// PRNG/XOF SNAPSHOT TYPES
+//==========================
+
+// Byte 0 of every snapshot. Independent of the API and crate versions.
+const SNAPSHOT_VERSION: u8 = 1;
+
+/// Identifies the generator family encoded in a snapshot.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SnapshotKind {
+    /// Single PRNG stream.
+    Prng = 0x01,
+    /// Single XOF stream.
+    Xof = 0x02,
+    /// PRNG batch.
+    PrngBatch = 0x03,
+    /// XOF batch.
+    XofBatch = 0x04,
+}
+
+/// Why a snapshot could not be decoded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum SnapshotError {
+    /// Version byte is not supported.
+    UnsupportedVersion,
+    /// Kind byte does not match the expected type.
+    InvalidKind,
+    /// Cursor is outside `1..=32`.
+    InvalidCursor,
+    /// Length does not match the format.
+    InvalidLength,
+}
+
+impl core::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SnapshotError::UnsupportedVersion => write!(f, "unsupported snapshot version"),
+            SnapshotError::InvalidKind => write!(f, "snapshot kind does not match this type"),
+            SnapshotError::InvalidCursor => write!(f, "invalid snapshot cursor value"),
+            SnapshotError::InvalidLength => write!(f, "invalid snapshot length"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+// Single-stream snapshot: fixed 56-byte format.
+const SINGLE_SNAPSHOT_LEN: usize = LUSTRO_SNAPSHOT_LEN;
+
+#[inline]
+fn encode_single_snapshot(
+    kind: SnapshotKind,
+    s0: u128,
+    s1: u128,
+    step: u64,
+    cursor: u8,
+) -> [u8; SINGLE_SNAPSHOT_LEN] {
+    let mut bytes = [0u8; SINGLE_SNAPSHOT_LEN];
+    bytes[0] = SNAPSHOT_VERSION;
+    bytes[1] = kind as u8;
+    // bytes[2..8] reserved, zero.
+    bytes[8..24].copy_from_slice(&s0.to_le_bytes());
+    bytes[24..40].copy_from_slice(&s1.to_le_bytes());
+    bytes[40..48].copy_from_slice(&step.to_le_bytes());
+    bytes[48] = cursor;
+    // bytes[49..56] reserved for future extensions.
+    bytes
+}
+
+#[inline]
+fn decode_single_snapshot(
+    bytes: &[u8; SINGLE_SNAPSHOT_LEN],
+    expected_kind: SnapshotKind,
+) -> Result<(u128, u128, u64, u8), SnapshotError> {
+    if bytes[0] != SNAPSHOT_VERSION {
+        return Err(SnapshotError::UnsupportedVersion);
+    }
+    if bytes[1] != expected_kind as u8 {
+        return Err(SnapshotError::InvalidKind);
+    }
+    let cursor = bytes[48];
+    if cursor == 0 || cursor > 32 {
+        return Err(SnapshotError::InvalidCursor);
+    }
+    let s0 = u128::from_le_bytes(bytes[8..24].try_into().unwrap());
+    let s1 = u128::from_le_bytes(bytes[24..40].try_into().unwrap());
+    let step = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    Ok((s0, s1, step, cursor))
+}
+
+/// Serialized PRNG stream state.
+/// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LustroPrngSnapshot {
+    s0: u128,
+    s1: u128,
+    step: u64,
+    cursor: u8,
+}
+
+impl core::fmt::Debug for LustroPrngSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroPrngSnapshot")
+            .field("state", &"[redacted]")
+            .field("step", &self.step)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+impl TryFrom<&[u8]> for LustroPrngSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let bytes: &[u8; SINGLE_SNAPSHOT_LEN] =
+            bytes.try_into().map_err(|_| SnapshotError::InvalidLength)?;
+        Self::from_le_bytes(bytes)
+    }
+}
+
+impl LustroPrngSnapshot {
+    #[inline]
+    pub(crate) fn new(s0: u128, s1: u128, step: u64, cursor: u8) -> Self {
+        Self {
+            s0,
+            s1,
+            step,
+            cursor,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_parts(self) -> (u128, u128, u64, u8) {
+        (self.s0, self.s1, self.step, self.cursor)
+    }
+
+    /// Serializes the snapshot to the stable 56-byte format.
+    #[must_use]
+    #[inline]
+    pub fn to_le_bytes(&self) -> [u8; SINGLE_SNAPSHOT_LEN] {
+        encode_single_snapshot(SnapshotKind::Prng, self.s0, self.s1, self.step, self.cursor)
+    }
+
+    /// Deserializes a PRNG snapshot from the 56-byte format.
+    #[inline]
+    pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
+        let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Prng)?;
+        Ok(Self {
+            s0,
+            s1,
+            step,
+            cursor,
+        })
+    }
+}
+
+/// Serialized XOF stream state.
+/// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LustroXofSnapshot {
+    s0: u128,
+    s1: u128,
+    step: u64,
+    cursor: u8,
+}
+
+impl core::fmt::Debug for LustroXofSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroXofSnapshot")
+            .field("state", &"[redacted]")
+            .field("step", &self.step)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+impl TryFrom<&[u8]> for LustroXofSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let bytes: &[u8; SINGLE_SNAPSHOT_LEN] =
+            bytes.try_into().map_err(|_| SnapshotError::InvalidLength)?;
+        Self::from_le_bytes(bytes)
+    }
+}
+
+impl LustroXofSnapshot {
+    #[inline]
+    pub(crate) fn new(s0: u128, s1: u128, step: u64, cursor: u8) -> Self {
+        Self {
+            s0,
+            s1,
+            step,
+            cursor,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_parts(self) -> (u128, u128, u64, u8) {
+        (self.s0, self.s1, self.step, self.cursor)
+    }
+
+    /// Serializes the snapshot to the stable 56-byte format.
+    #[must_use]
+    #[inline]
+    pub fn to_le_bytes(&self) -> [u8; SINGLE_SNAPSHOT_LEN] {
+        encode_single_snapshot(SnapshotKind::Xof, self.s0, self.s1, self.step, self.cursor)
+    }
+
+    /// Deserializes a XOF snapshot from the 56-byte format.
+    #[inline]
+    pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
+        let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Xof)?;
+        Ok(Self {
+            s0,
+            s1,
+            step,
+            cursor,
+        })
+    }
+}
+
+// Batch snapshot: 16-byte header + 48 bytes per lane.
+// No cursor; batch lanes are always block-aligned.
+const BATCH_HEADER_LEN: usize = LUSTRO_BATCH_SNAPSHOT_HEADER_LEN;
+const BATCH_LANE_LEN: usize = LUSTRO_BATCH_SNAPSHOT_LANE_LEN;
+
+// Returns the encoded batch snapshot length, or `None` on overflow.
+#[cfg(feature = "ffi")]
+#[inline]
+pub(crate) fn batch_snapshot_encoded_len(lane_count: usize) -> Option<usize> {
+    lane_count
+        .checked_mul(BATCH_LANE_LEN)?
+        .checked_add(BATCH_HEADER_LEN)
+}
+
+#[inline]
+fn encode_batch_header(kind: SnapshotKind, lane_count: u64) -> [u8; BATCH_HEADER_LEN] {
+    let mut bytes = [0u8; BATCH_HEADER_LEN];
+    bytes[0] = SNAPSHOT_VERSION;
+    bytes[1] = kind as u8;
+    // bytes[2..8] reserved, zero.
+    bytes[8..16].copy_from_slice(&lane_count.to_le_bytes());
+    bytes
+}
+
+#[inline]
+fn encode_batch_lane(bytes: &mut [u8], s0: u128, s1: u128, step: u64) {
+    debug_assert_eq!(bytes.len(), BATCH_LANE_LEN);
+    bytes[0..16].copy_from_slice(&s0.to_le_bytes());
+    bytes[16..32].copy_from_slice(&s1.to_le_bytes());
+    bytes[32..40].copy_from_slice(&step.to_le_bytes());
+    // bytes[40..48] reserved for future extensions.
+}
+
+#[inline]
+fn decode_batch_lane(bytes: &[u8]) -> (u128, u128, u64) {
+    debug_assert_eq!(bytes.len(), BATCH_LANE_LEN);
+    let s0 = u128::from_le_bytes(bytes[0..16].try_into().unwrap());
+    let s1 = u128::from_le_bytes(bytes[16..32].try_into().unwrap());
+    let step = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+    (s0, s1, step)
+}
+
+// Validates the header and exact encoded length.
+#[inline]
+fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64, SnapshotError> {
+    if bytes.len() < BATCH_HEADER_LEN {
+        return Err(SnapshotError::InvalidLength);
+    }
+    if bytes[0] != SNAPSHOT_VERSION {
+        return Err(SnapshotError::UnsupportedVersion);
+    }
+    if bytes[1] != expected_kind as u8 {
+        return Err(SnapshotError::InvalidKind);
+    }
+    let lane_count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+
+    let lane_count_usize: usize = lane_count
+        .try_into()
+        .map_err(|_| SnapshotError::InvalidLength)?;
+    let expected_len = lane_count_usize
+        .checked_mul(BATCH_LANE_LEN)
+        .and_then(|body_len| body_len.checked_add(BATCH_HEADER_LEN))
+        .ok_or(SnapshotError::InvalidLength)?;
+    if bytes.len() != expected_len {
+        return Err(SnapshotError::InvalidLength);
+    }
+
+    Ok(lane_count)
+}
+
+/// Serialized PRNG batch state.
+/// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LustroPrngBatchSnapshot {
+    lanes: Vec<(u128, u128, u64)>,
+}
+
+impl core::fmt::Debug for LustroPrngBatchSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroPrngBatchSnapshot")
+            .field("lane_count", &self.lanes.len())
+            .field("lanes", &"[redacted]")
+            .finish()
+    }
+}
+
+impl TryFrom<&[u8]> for LustroPrngBatchSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        Self::from_le_bytes(bytes)
+    }
+}
+
+impl LustroPrngBatchSnapshot {
+    #[inline]
+    pub(crate) fn new(lanes: Vec<(u128, u128, u64)>) -> Self {
+        Self { lanes }
+    }
+
+    #[inline]
+    pub(crate) fn into_lanes(self) -> Vec<(u128, u128, u64)> {
+        self.lanes
+    }
+
+    /// Serializes the batch snapshot to its variable-length format.
+    #[must_use]
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        let lane_count = self.lanes.len() as u64;
+        let mut out = Vec::with_capacity(BATCH_HEADER_LEN + self.lanes.len() * BATCH_LANE_LEN);
+        out.extend_from_slice(&encode_batch_header(SnapshotKind::PrngBatch, lane_count));
+        for &(s0, s1, step) in &self.lanes {
+            let mut lane_bytes = [0u8; BATCH_LANE_LEN];
+            encode_batch_lane(&mut lane_bytes, s0, s1, step);
+            out.extend_from_slice(&lane_bytes);
+        }
+        out
+    }
+
+    /// Deserializes a PRNG batch snapshot.
+    /// Rejects trailing or missing bytes.
+    pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let lane_count = decode_batch_header(bytes, SnapshotKind::PrngBatch)?;
+        let mut lanes = Vec::with_capacity(lane_count as usize);
+        for i in 0..lane_count as usize {
+            let start = BATCH_HEADER_LEN + i * BATCH_LANE_LEN;
+            lanes.push(decode_batch_lane(&bytes[start..start + BATCH_LANE_LEN]));
+        }
+        Ok(Self { lanes })
+    }
+}
+
+/// Serialized XOF batch state.
+/// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LustroXofBatchSnapshot {
+    lanes: Vec<(u128, u128, u64)>,
+}
+
+impl core::fmt::Debug for LustroXofBatchSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroXofBatchSnapshot")
+            .field("lane_count", &self.lanes.len())
+            .field("lanes", &"[redacted]")
+            .finish()
+    }
+}
+
+impl TryFrom<&[u8]> for LustroXofBatchSnapshot {
+    type Error = SnapshotError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        Self::from_le_bytes(bytes)
+    }
+}
+
+impl LustroXofBatchSnapshot {
+    #[inline]
+    pub(crate) fn new(lanes: Vec<(u128, u128, u64)>) -> Self {
+        Self { lanes }
+    }
+
+    #[inline]
+    pub(crate) fn into_lanes(self) -> Vec<(u128, u128, u64)> {
+        self.lanes
+    }
+
+    /// Serializes the batch snapshot to its variable-length format.
+    #[must_use]
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        let lane_count = self.lanes.len() as u64;
+        let mut out = Vec::with_capacity(BATCH_HEADER_LEN + self.lanes.len() * BATCH_LANE_LEN);
+        out.extend_from_slice(&encode_batch_header(SnapshotKind::XofBatch, lane_count));
+        for &(s0, s1, step) in &self.lanes {
+            let mut lane_bytes = [0u8; BATCH_LANE_LEN];
+            encode_batch_lane(&mut lane_bytes, s0, s1, step);
+            out.extend_from_slice(&lane_bytes);
+        }
+        out
+    }
+
+    /// Deserializes a XOF batch snapshot.
+    /// Rejects trailing or missing bytes.
+    pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let lane_count = decode_batch_header(bytes, SnapshotKind::XofBatch)?;
+        let mut lanes = Vec::with_capacity(lane_count as usize);
+        for i in 0..lane_count as usize {
+            let start = BATCH_HEADER_LEN + i * BATCH_LANE_LEN;
+            lanes.push(decode_batch_lane(&bytes[start..start + BATCH_LANE_LEN]));
+        }
+        Ok(Self { lanes })
+    }
+}

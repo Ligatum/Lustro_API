@@ -30,6 +30,32 @@ pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> 
     Ok(d)
 }
 
+/// Sets threads and SIMD for this process, before first use. `threads` >= 1, capped
+/// at the logical CPU count, 1 = no pool. `allow_simd=False` = scalar only. None
+/// follows the environment, a given value replaces it.
+///
+/// Fixed once, by an earlier call, a batch call, `suggested_steps()` or
+/// `runtime_info()`. Later calls raise `RuntimeError`, also with identical arguments.
+#[pyfunction]
+#[pyo3(signature = (threads=None, allow_simd=None))]
+pub fn configure(threads: Option<i64>, allow_simd: Option<bool>) -> PyResult<()> {
+    let mut options = crate::RuntimeOptions::new();
+    if let Some(n) = threads {
+        if n < 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "threads must be at least 1",
+            ));
+        }
+        let n = usize::try_from(n).unwrap_or(usize::MAX);
+        options =
+            options.threads(std::num::NonZeroUsize::new(n).unwrap_or(std::num::NonZeroUsize::MIN));
+    }
+    if let Some(allow) = allow_simd {
+        options = options.allow_simd(allow);
+    }
+    crate::configure(options).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
 // Separate module: the macro expands to a `gil-refs` cfg that rustc does not know.
 #[allow(unexpected_cfgs)]
 mod exceptions {

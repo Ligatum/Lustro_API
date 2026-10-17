@@ -9,12 +9,14 @@ mod core;
 #[cfg(target_arch = "x86_64")]
 mod core_avx2;
 mod dispatch;
-pub use api::{lustro_api_version, runtime_info};
+pub use api::{configure, lustro_api_version, runtime_info};
 pub use hash::{
     hash128, hash128_many, hash128_many_into, hash256, hash256_many, hash256_many_into,
 };
 pub use prng::{LustroPrng, LustroPrngBatch};
-pub use types::{Hash128, Hash256, RuntimeInfo, Seed256, StreamId};
+#[cfg(feature = "entropy")]
+pub use types::EntropyError;
+pub use types::{ConfigError, Hash128, Hash256, RuntimeInfo, RuntimeOptions, Seed256, StreamId};
 pub use xof::{LustroXof, LustroXofBatch};
 
 pub mod hash;
@@ -54,6 +56,7 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::xof::LustroXofBatchPy>()?;
     m.add_function(wrap_pyfunction!(python::lustro_api_version, m)?)?;
     m.add_function(wrap_pyfunction!(python::runtime_info, m)?)?;
+    m.add_function(wrap_pyfunction!(python::configure, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SEED_LEN", types::LUSTRO_SEED_LEN)?;
     m.add("BLOCK_LEN", types::LUSTRO_BLOCK_LEN)?;

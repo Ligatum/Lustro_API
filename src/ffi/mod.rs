@@ -8,10 +8,11 @@ pub mod types;
 pub mod xof;
 
 use std::ffi::c_char;
+use std::num::NonZeroUsize;
 use std::panic::{catch_unwind, UnwindSafe};
 
 use crate::errors::LustroError;
-use crate::types::{BatchError, DerivePathError};
+use crate::types::{BatchError, DerivePathError, RuntimeOptions};
 
 // Panic guard for exported fns: returns `on_panic` if `f` unwinds.
 // Nothing is rolled back.
@@ -78,6 +79,48 @@ pub extern "C" fn lustro_runtime_backend() -> *const c_char {
             "avx2" => c"avx2".as_ptr(),
             "scalar" => c"scalar".as_ptr(),
             _ => c"unknown".as_ptr(),
+        }
+    })
+}
+
+/// `simd` for `lustro_configure`: follow `LUSTRO_DISABLE_SIMD`.
+pub const LUSTRO_SIMD_KEEP: i32 = 0;
+/// `simd` for `lustro_configure`: allow AVX2.
+pub const LUSTRO_SIMD_AUTO: i32 = 1;
+/// `simd` for `lustro_configure`: scalar only.
+pub const LUSTRO_SIMD_SCALAR: i32 = 2;
+
+// `threads == 0` and `LUSTRO_SIMD_KEEP` leave the setting to the environment.
+pub(crate) fn options_from_c(threads: usize, simd: i32) -> Result<RuntimeOptions, LustroError> {
+    let mut options = RuntimeOptions::new();
+    if let Some(n) = NonZeroUsize::new(threads) {
+        options = options.threads(n);
+    }
+    match simd {
+        LUSTRO_SIMD_KEEP => {}
+        LUSTRO_SIMD_AUTO => options = options.allow_simd(true),
+        LUSTRO_SIMD_SCALAR => options = options.allow_simd(false),
+        _ => return Err(LustroError::InvalidArgument),
+    }
+    Ok(options)
+}
+
+/// Sets threads and SIMD for this process, before first use. `threads`: 0 = not set,
+/// 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
+/// `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
+///
+/// Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. Later calls
+/// return `ALREADY_CONFIGURED`, also with identical arguments. Unknown `simd` returns
+/// `INVALID_ARGUMENT` and changes nothing.
+#[no_mangle]
+pub extern "C" fn lustro_configure(threads: usize, simd: i32) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        match options_from_c(threads, simd) {
+            Ok(options) => match crate::api::configure(options) {
+                Ok(()) => LustroError::Ok,
+                Err(e) => e.into(),
+            },
+            Err(e) => e,
         }
     })
 }

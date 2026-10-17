@@ -1,5 +1,6 @@
 use crate::constants::STREAM_INIT_MASK;
 use crate::core::{erd_round_scalar_ref, idm_scalar_ref};
+use crate::types::{ConfigError, RuntimeOptions};
 
 /// Native API version, returned by `lustro_api_version()`.
 // Independent of the crate version (`Cargo.toml`, Python `__version__`) and of `SNAPSHOT_VERSION`.
@@ -16,6 +17,19 @@ pub fn lustro_api_version() -> u32 {
 /// workers: the pool is not started here.
 pub fn runtime_info() -> crate::types::RuntimeInfo {
     crate::dispatch::runtime_info()
+}
+
+/// Sets the execution settings of this process before first use. A field that is set
+/// replaces the matching environment variables, an unset one follows them.
+///
+/// Fixed once, by an earlier call, a batch call, `suggested_steps()` or `runtime_info()`.
+/// Later calls return [`ConfigError::AlreadyConfigured`], also with identical options.
+/// When calls race, one wins.
+///
+/// `threads` is a pool limit. Without `parallel` the options are accepted and
+/// `runtime_info().threads` stays 0.
+pub fn configure(options: RuntimeOptions) -> Result<(), ConfigError> {
+    crate::dispatch::configure(options)
 }
 
 // ==========================================

@@ -20,13 +20,15 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 python  = ["dep:pyo3", "dep:numpy"]
 ffi     = []
-rand    = ["dep:rand_core"]
+rand    = ["dep:rand_core", "entropy"]
+entropy = ["dep:getrandom", "rand_core?/getrandom"]
 
 [dependencies]
 pyo3   = { version = "0.22", features = ["extension-module"], optional = true }
 numpy  = { version = "0.22", optional = true }
 rayon  = { version = "1.10", optional = true }
 rand_core = { version = "0.6", features = ["alloc"], optional = true }
+getrandom = { version = "0.2", features = ["std"], optional = true }
 
 [build-dependencies]
 cbindgen = "0.27"

@@ -12,6 +12,8 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
+use crate::types::{ConfigError, RuntimeOptions};
+
 // ==========================================
 // CONFIG
 // ==========================================
@@ -115,13 +117,18 @@ const ENV_DISABLE_MT: &str = "LUSTRO_DISABLE_MT";
 const ENV_DISABLE_SIMD: &str = "LUSTRO_DISABLE_SIMD";
 const ENV_NUM_THREADS: &str = "LUSTRO_NUM_THREADS";
 
-// Process-wide settings, read once at the first use of the dispatcher (batch calls,
-// `suggested_steps()`). Later changes to the environment have no effect.
+// Process-wide settings, fixed once: by `configure()`, or else read from the environment
+// at the first use of the dispatcher (batch calls, `suggested_steps()`, `runtime_info()`).
+// Later changes to the environment have no effect.
 // They affect execution only; outputs do not depend on them.
 //
 // - `LUSTRO_DISABLE_MT`: present (any value, `0` included) = never enter the pool.
 // - `LUSTRO_DISABLE_SIMD`: present = scalar backend for streams.
 // - `LUSTRO_NUM_THREADS=N`: pool size, capped at the logical CPU count.
+//
+// A field set in `RuntimeOptions` replaces the variables of the same purpose:
+// `threads` both `LUSTRO_NUM_THREADS` and `LUSTRO_DISABLE_MT`, `allow_simd`
+// `LUSTRO_DISABLE_SIMD`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RuntimeConfig {
     disable_mt: bool,
@@ -130,17 +137,36 @@ struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    // Parses runtime settings. `logical` is the logical CPU count.
-    fn parse(get: impl Fn(&str) -> Option<OsString>, logical: usize) -> Self {
-        let threads = get(ENV_NUM_THREADS)
-            .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
-            .filter(|&n| n > 0)
-            .map(|n| n.min(logical.max(1)))
-            .and_then(NonZeroUsize::new);
+    // Resolves runtime settings: `options` first, then the environment. `logical` is the
+    // logical CPU count.
+    fn parse(
+        options: RuntimeOptions,
+        get: impl Fn(&str) -> Option<OsString>,
+        logical: usize,
+    ) -> Self {
+        let (threads, disable_mt) = match options.threads {
+            // The environment is not consulted for the pool, `LUSTRO_DISABLE_MT` included.
+            Some(n) => {
+                let n = n.min(NonZeroUsize::new(logical).unwrap_or(NonZeroUsize::MIN));
+                (Some(n), n.get() == 1)
+            }
+            None => {
+                let threads = get(ENV_NUM_THREADS)
+                    .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<usize>().ok()))
+                    .filter(|&n| n > 0)
+                    .map(|n| n.min(logical.max(1)))
+                    .and_then(NonZeroUsize::new);
+                let disable_mt =
+                    get(ENV_DISABLE_MT).is_some() || threads.map(NonZeroUsize::get) == Some(1);
+                (threads, disable_mt)
+            }
+        };
 
         RuntimeConfig {
-            disable_mt: get(ENV_DISABLE_MT).is_some() || threads.map(NonZeroUsize::get) == Some(1),
-            disable_simd: get(ENV_DISABLE_SIMD).is_some(),
+            disable_mt,
+            disable_simd: options
+                .allow_simd
+                .map_or_else(|| get(ENV_DISABLE_SIMD).is_some(), |allow| !allow),
             threads,
         }
     }
@@ -170,10 +196,46 @@ fn logical_cpus() -> usize {
 
 static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
-// Settings from the environment, read on first use only.
+// Settings of `cell`; if still unset, taken from the environment.
+fn config_in(
+    cell: &OnceLock<RuntimeConfig>,
+    get: impl Fn(&str) -> Option<OsString>,
+    logical: usize,
+) -> RuntimeConfig {
+    *cell.get_or_init(|| RuntimeConfig::parse(RuntimeOptions::new(), get, logical))
+}
+
+// Fixes the settings of `cell` from `options` unless they are already fixed.
+// `OnceLock` decides a race with `config_in`: the loser keeps the winner's value.
+fn configure_in(
+    cell: &OnceLock<RuntimeConfig>,
+    options: RuntimeOptions,
+    get: impl Fn(&str) -> Option<OsString>,
+    logical: usize,
+) -> Result<(), ConfigError> {
+    cell.set(RuntimeConfig::parse(options, get, logical))
+        .map_err(|_| ConfigError::AlreadyConfigured)
+}
+
+// Process settings; the environment is read on first use only.
 fn runtime_config() -> RuntimeConfig {
-    *RUNTIME_CONFIG
-        .get_or_init(|| RuntimeConfig::parse(|name| std::env::var_os(name), logical_cpus()))
+    if let Some(&cfg) = RUNTIME_CONFIG.get() {
+        return cfg;
+    }
+    config_in(
+        &RUNTIME_CONFIG,
+        |name| std::env::var_os(name),
+        logical_cpus(),
+    )
+}
+
+pub(crate) fn configure(options: RuntimeOptions) -> Result<(), ConfigError> {
+    configure_in(
+        &RUNTIME_CONFIG,
+        options,
+        |name| std::env::var_os(name),
+        logical_cpus(),
+    )
 }
 
 // ==========================================

@@ -18,7 +18,10 @@ typedef enum {
 	LUSTRO_ERROR_UNSUPPORTED_VERSION  = 7,
 	LUSTRO_ERROR_INVALID_KIND         = 8,
 	LUSTRO_ERROR_INVALID_CURSOR       = 9,
-	LUSTRO_ERROR_OUT_OF_MEMORY        = 10
+	LUSTRO_ERROR_OUT_OF_MEMORY        = 10,
+	/* 11..12: reported by lustro_configure */
+	LUSTRO_ERROR_ALREADY_CONFIGURED   = 11,
+	LUSTRO_ERROR_INVALID_ARGUMENT     = 12
 } LustroError;
 
 /**
@@ -62,6 +65,21 @@ typedef enum {
 #define LUSTRO_API_VERSION 1
 
 /**
+ * `simd` for `lustro_configure`: follow `LUSTRO_DISABLE_SIMD`.
+ */
+#define LUSTRO_SIMD_KEEP 0
+
+/**
+ * `simd` for `lustro_configure`: allow AVX2.
+ */
+#define LUSTRO_SIMD_AUTO 1
+
+/**
+ * `simd` for `lustro_configure`: scalar only.
+ */
+#define LUSTRO_SIMD_SCALAR 2
+
+/**
  * PRNG stream. Cloning preserves the exact stream state and future sequence.
  */
 typedef struct LustroPrng LustroPrng;
@@ -94,6 +112,17 @@ uintptr_t lustro_runtime_threads(void);
  * "avx2"). Never NULL; do not free.
  */
 const char *lustro_runtime_backend(void);
+
+/**
+ * Sets threads and SIMD for this process, before first use. `threads`: 0 = not set,
+ * 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
+ * `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
+ *
+ * Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. Later calls
+ * return `ALREADY_CONFIGURED`, also with identical arguments. Unknown `simd` returns
+ * `INVALID_ARGUMENT` and changes nothing.
+ */
+LustroError lustro_configure(uintptr_t threads, int32_t simd);
 
 /**
  * Returns a static NUL-terminated description of an error code.

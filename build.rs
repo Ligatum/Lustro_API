@@ -51,7 +51,10 @@ fn generate_header() {
          \tLUSTRO_ERROR_UNSUPPORTED_VERSION  = 7,\n\
          \tLUSTRO_ERROR_INVALID_KIND         = 8,\n\
          \tLUSTRO_ERROR_INVALID_CURSOR       = 9,\n\
-         \tLUSTRO_ERROR_OUT_OF_MEMORY        = 10\n\
+         \tLUSTRO_ERROR_OUT_OF_MEMORY        = 10,\n\
+         \t/* 11..12: reported by lustro_configure */\n\
+         \tLUSTRO_ERROR_ALREADY_CONFIGURED   = 11,\n\
+         \tLUSTRO_ERROR_INVALID_ARGUMENT     = 12\n\
          } LustroError;"
             .to_string(),
     );

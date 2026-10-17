@@ -29,6 +29,10 @@ pub enum LustroError {
     InvalidCursor = 9,
     /// Reserving a batch lane buffer failed (allocator refusal or capacity overflow).
     OutOfMemory = 10,
+    /// Runtime settings are already fixed (`lustro_configure`).
+    AlreadyConfigured = 11,
+    /// An argument value is not allowed; nothing was changed.
+    InvalidArgument = 12,
 }
 
 impl LustroError {
@@ -46,6 +50,8 @@ impl LustroError {
             8 => Some(LustroError::InvalidKind),
             9 => Some(LustroError::InvalidCursor),
             10 => Some(LustroError::OutOfMemory),
+            11 => Some(LustroError::AlreadyConfigured),
+            12 => Some(LustroError::InvalidArgument),
             _ => None,
         }
     }
@@ -70,6 +76,8 @@ impl LustroError {
             LustroError::InvalidKind => "snapshot kind does not match this type\0",
             LustroError::InvalidCursor => "invalid snapshot cursor value\0",
             LustroError::OutOfMemory => "allocation failed\0",
+            LustroError::AlreadyConfigured => "runtime settings are already fixed\0",
+            LustroError::InvalidArgument => "invalid argument value\0",
         }
     }
 }
@@ -90,6 +98,15 @@ impl From<crate::types::SnapshotError> for LustroError {
             S::InvalidKind => LustroError::InvalidKind,
             S::InvalidCursor => LustroError::InvalidCursor,
             S::InvalidLength => LustroError::InvalidLength,
+        }
+    }
+}
+
+impl From<crate::types::ConfigError> for LustroError {
+    fn from(e: crate::types::ConfigError) -> Self {
+        use crate::types::ConfigError as C;
+        match e {
+            C::AlreadyConfigured => LustroError::AlreadyConfigured,
         }
     }
 }
