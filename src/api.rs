@@ -12,9 +12,13 @@ pub fn lustro_api_version() -> u32 {
     LUSTRO_API_VERSION
 }
 
-/// Execution settings of this process, read from `LUSTRO_*` env on first use
-/// (this call counts). `threads` is the configured pool size, not running
-/// workers: the pool is not started here.
+/// Returns the execution settings of this process.
+///
+/// The values follow the environment (`LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`,
+/// `LUSTRO_NUM_THREADS`), which is read once at the first use of the dispatcher;
+/// this call counts as a use. `threads` is the configured pool size, not a count of
+/// running workers: the pool is not started here and may fail to start. A forked
+/// child process runs single-threaded whatever is reported.
 pub fn runtime_info() -> crate::types::RuntimeInfo {
     crate::dispatch::runtime_info()
 }

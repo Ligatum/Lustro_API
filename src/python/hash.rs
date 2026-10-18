@@ -3,13 +3,14 @@
 use numpy::ndarray::ArrayView2;
 use numpy::{PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList};
+use pyo3::types::PyBytes;
+use std::borrow::Cow;
 
 use crate::hash::hash128 as hash128_impl;
 use crate::hash::hash128_many_into;
 use crate::hash::hash256 as hash256_impl;
 use crate::hash::hash256_many_into;
-use crate::python::list_items;
+use crate::python::{bytes_arg, messages_arg, require_numpy, MessageSeq};
 use crate::types::{Hash128, Hash256};
 
 // ==========================================
@@ -110,21 +111,27 @@ fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
 // HASH API
 // ==========================================
 
-/// 256-bit digest of `data` (bytes of any length) as 32 bytes.
-/// The GIL is released while hashing.
+/// 256-bit digest of `data` (bytes or a byte buffer of any length) as 32 bytes.
+/// `bytes` is not copied; other buffers are copied. The GIL is released while hashing.
 #[pyfunction]
 #[pyo3(name = "hash256")]
-pub fn hash256_py<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
-    let result = py.allow_threads(|| hash256_impl(data));
+pub fn hash256_py<'py>(
+    py: Python<'py>,
+    #[pyo3(from_py_with = "bytes_arg")] data: Cow<'_, [u8]>,
+) -> Bound<'py, PyBytes> {
+    let result = py.allow_threads(|| hash256_impl(&data));
     PyBytes::new_bound(py, result.as_bytes())
 }
 
-/// 128-bit digest of `data` (bytes of any length) as 16 bytes.
-/// The GIL is released while hashing.
+/// 128-bit digest of `data` (bytes or a byte buffer of any length) as 16 bytes.
+/// `bytes` is not copied; other buffers are copied. The GIL is released while hashing.
 #[pyfunction]
 #[pyo3(name = "hash128")]
-pub fn hash128_py<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
-    let result = py.allow_threads(|| hash128_impl(data));
+pub fn hash128_py<'py>(
+    py: Python<'py>,
+    #[pyo3(from_py_with = "bytes_arg")] data: Cow<'_, [u8]>,
+) -> Bound<'py, PyBytes> {
+    let result = py.allow_threads(|| hash128_impl(&data));
     PyBytes::new_bound(py, result.as_bytes())
 }
 
@@ -147,6 +154,7 @@ pub fn hash256_many_py<'py>(
     py: Python<'py>,
     data: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    require_numpy(py)?;
     let data = rows_array(data)?;
     // Use the non-panicking borrow API so conflicting NumPy borrows become Python errors.
     let data = data.try_readonly()?;
@@ -162,6 +170,7 @@ pub fn hash128_many_py<'py>(
     py: Python<'py>,
     data: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    require_numpy(py)?;
     let data = rows_array(data)?;
     let data = data.try_readonly()?;
     let flat = copy_rows(data.as_array()).ok_or_else(non_contiguous_error)?;
@@ -172,29 +181,32 @@ pub fn hash128_many_py<'py>(
 // HASH BATCH API (VARIABLE LENGTH)
 // ==========================================
 
-/// 256-bit digests of a list of bytes objects of any lengths. Returns a uint8
-/// array of shape `(n, 32)`. TypeError for a non-list or a non-bytes item.
-/// The messages are not copied; the GIL is released while hashing.
+/// 256-bit digests of a sequence of bytes-like objects of any lengths. Returns a uint8
+/// array of shape `(n, 32)`. TypeError for a non-sequence (a single string or buffer
+/// included) or an item that is not a byte buffer.
+/// `bytes` items are not copied; other buffers are copied. The GIL is released while hashing.
 #[pyfunction]
 #[pyo3(name = "hash256_many_var")]
 pub fn hash256_many_var_py<'py>(
     py: Python<'py>,
-    messages: &Bound<'py, PyList>,
+    #[pyo3(from_py_with = "messages_arg")] messages: MessageSeq<'py>,
 ) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let items = list_items(messages)?;
-    let rows: Vec<&[u8]> = items.iter().map(|b| b.as_bytes()).collect();
+    require_numpy(py)?;
+    let messages = messages.load()?;
+    let rows = messages.slices();
     digests256(py, &rows)
 }
 
-/// 128-bit digests of a list of bytes objects of any lengths. Same input rules
+/// 128-bit digests of a sequence of bytes-like objects of any lengths. Same input rules
 /// as `hash256_many_var`. Returns a uint8 array of shape `(n, 16)`.
 #[pyfunction]
 #[pyo3(name = "hash128_many_var")]
 pub fn hash128_many_var_py<'py>(
     py: Python<'py>,
-    messages: &Bound<'py, PyList>,
+    #[pyo3(from_py_with = "messages_arg")] messages: MessageSeq<'py>,
 ) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let items = list_items(messages)?;
-    let rows: Vec<&[u8]> = items.iter().map(|b| b.as_bytes()).collect();
+    require_numpy(py)?;
+    let messages = messages.load()?;
+    let rows = messages.slices();
     digests128(py, &rows)
 }

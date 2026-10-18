@@ -4,8 +4,12 @@ pub mod hash;
 pub mod prng;
 pub mod xof;
 
+use numpy::{PyArray1, PyArray3, PyArrayMethods};
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList};
+use pyo3::sync::GILOnceCell;
+use pyo3::types::{PyBytes, PySequence, PyString};
+use std::borrow::Cow;
 
 // PyO3 turns panics into exceptions only when unwinding.
 #[cfg(panic = "abort")]
@@ -109,16 +113,118 @@ pub(crate) fn fill_buffer(
     Ok(())
 }
 
-// Keep the bytes alive while the GIL is released (the list may change meanwhile).
-pub(crate) fn list_items<'py>(messages: &Bound<'py, PyList>) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-    messages
-        .iter()
-        .map(|item| {
-            item.downcast_into::<PyBytes>().map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("messages must be a list of bytes")
+const BYTES_EXPECTED: &str = "expected bytes or a C-contiguous byte buffer";
+
+// Copy of a byte buffer (bytearray, memoryview, array('B'), NumPy uint8, ...), taken with
+// the GIL held. TypeError if there is no buffer, its items are not bytes or it is not
+// C-contiguous; MemoryError if the copy cannot be reserved. TypeError and BufferError
+// from the exporter are folded into that TypeError, other exception types are passed on.
+// The copy protects against other Python threads. Native code that writes to the buffer
+// without the GIL is not covered.
+fn copy_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let bad = || pyo3::exceptions::PyTypeError::new_err(BYTES_EXPECTED);
+    // PyO3 reports a missing buffer and a wrong item format as TypeError/BufferError, which
+    // cannot be told apart from the same types raised by an exporter.
+    let view = PyBuffer::<u8>::get_bound(obj).map_err(|e| {
+        let py = obj.py();
+        if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+            || e.is_instance_of::<pyo3::exceptions::PyBufferError>(py)
+        {
+            bad()
+        } else {
+            e
+        }
+    })?;
+    if !view.is_c_contiguous() {
+        return Err(bad());
+    }
+    let len = view.len_bytes();
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(len).map_err(|_| alloc_error())?;
+    if len != 0 {
+        // SAFETY: `view` is C-contiguous, so `buf_ptr()` covers `len` consecutive bytes,
+        // and it keeps the exporter alive and the buffer in place until it is dropped.
+        let src = unsafe { std::slice::from_raw_parts(view.buf_ptr() as *const u8, len) };
+        copy.extend_from_slice(src);
+    }
+    Ok(copy)
+}
+
+// Bytes-like argument (`from_py_with`). `bytes` is borrowed, any other byte buffer is
+// copied, so the data stays valid and unchanged while the GIL is released.
+pub(crate) fn bytes_arg<'a>(obj: &'a Bound<'_, PyAny>) -> PyResult<Cow<'a, [u8]>> {
+    if let Ok(bytes) = obj.downcast::<PyBytes>() {
+        return Ok(Cow::Borrowed(bytes.as_bytes()));
+    }
+    copy_buffer(obj).map(Cow::Owned)
+}
+
+// One message of a batch: `bytes` stays referenced, other buffers are copies.
+enum Message<'py> {
+    Bytes(Bound<'py, PyBytes>),
+    Copy(Vec<u8>),
+}
+
+// Messages of a batch argument, ready to be used while the GIL is released.
+pub struct Messages<'py>(Vec<Message<'py>>);
+
+impl Messages<'_> {
+    pub(crate) fn slices(&self) -> Vec<&[u8]> {
+        self.0
+            .iter()
+            .map(|m| match m {
+                Message::Bytes(b) => b.as_bytes(),
+                Message::Copy(v) => v.as_slice(),
             })
-        })
-        .collect()
+            .collect()
+    }
+}
+
+// Batch argument (`from_py_with`): only the container is checked here, the items are read
+// by `load()`, so that other argument checks can come first. A single string or buffer is
+// rejected as a whole, even though `memoryview` and `array` are sequences of integers.
+pub struct MessageSeq<'py>(Bound<'py, PySequence>);
+
+pub(crate) fn messages_arg<'py>(obj: &Bound<'py, PyAny>) -> PyResult<MessageSeq<'py>> {
+    let type_error = |msg: &'static str| pyo3::exceptions::PyTypeError::new_err(msg);
+    // SAFETY: `obj` is a valid object pointer and the GIL is held.
+    if obj.is_instance_of::<PyString>()
+        || unsafe { pyo3::ffi::PyObject_CheckBuffer(obj.as_ptr()) } != 0
+    {
+        return Err(type_error(
+            "expected a sequence of bytes-like objects, not a single string or buffer",
+        ));
+    }
+    let seq = obj
+        .downcast::<PySequence>()
+        .map_err(|_| type_error("expected a sequence of bytes-like objects"))?;
+    Ok(MessageSeq(seq.clone()))
+}
+
+impl<'py> MessageSeq<'py> {
+    // TypeError names the first item that is not a byte buffer.
+    pub(crate) fn load(&self) -> PyResult<Messages<'py>> {
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(self.0.len()?)
+            .map_err(|_| alloc_error())?;
+        for (i, item) in self.0.iter()?.enumerate() {
+            let message = match item?.downcast_into::<PyBytes>() {
+                Ok(bytes) => Message::Bytes(bytes),
+                Err(e) => Message::Copy(copy_buffer(&e.into_inner()).map_err(|err| {
+                    if err.is_instance_of::<pyo3::exceptions::PyTypeError>(self.0.py()) {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "messages[{i}]: {BYTES_EXPECTED}"
+                        ))
+                    } else {
+                        err
+                    }
+                })?),
+            };
+            items.push(message);
+        }
+        Ok(Messages(items))
+    }
 }
 
 // Step-major blocks -> little-endian u64 words, 4 per block.
@@ -141,4 +247,94 @@ pub(crate) fn blocks_to_words(blocks: &[[u8; 32]], words: &mut [u64]) {
         w[2] = u64::from_le_bytes(block[16..24].try_into().unwrap());
         w[3] = u64::from_le_bytes(block[24..32].try_into().unwrap());
     }
+}
+
+// Without NumPy, using an array panics. Importing the module up front turns that into
+// an ImportError, and for stream calls it happens before the state has moved.
+pub(crate) fn require_numpy(py: Python<'_>) -> PyResult<()> {
+    static IMPORTED: GILOnceCell<()> = GILOnceCell::new();
+    IMPORTED
+        .get_or_try_init(py, || numpy::get_array_module(py).map(|_| ()))
+        .map(|_| ())
+}
+
+// Zeroed words for a new array; MemoryError if they cannot be reserved.
+fn new_words(len: usize) -> PyResult<Vec<u64>> {
+    let mut words = Vec::new();
+    words.try_reserve_exact(len).map_err(|_| alloc_error())?;
+    words.resize(len, 0);
+    Ok(words)
+}
+
+// Stream bytes are written into the words' memory as is; this turns them into values.
+fn words_from_le(words: &mut [u64]) {
+    #[cfg(target_endian = "big")]
+    for w in words {
+        *w = u64::from_le(*w);
+    }
+    #[cfg(target_endian = "little")]
+    let _ = words;
+}
+
+// New uint64 array of shape `(n,)` with the next `n` stream words, as `next_u64()` returns them.
+// The size check, the NumPy check and the buffer allocation come before `fill`, so their
+// failures leave the state untouched. Array construction happens after `fill`.
+// The GIL is released while `fill` runs.
+pub(crate) fn u64_array<'py>(
+    py: Python<'py>,
+    n: usize,
+    fill: impl FnOnce(&mut [u8]) + Send,
+) -> PyResult<Bound<'py, PyArray1<u64>>> {
+    if n.checked_mul(8).is_none_or(|b| b > isize::MAX as usize) {
+        return Err(pyo3::exceptions::PyOverflowError::new_err(
+            "size exceeds isize::MAX",
+        ));
+    }
+    require_numpy(py)?;
+    let mut words = new_words(n)?;
+    if n != 0 {
+        // SAFETY: the byte view covers exactly the memory of `words`; any bit pattern
+        // is a valid u8 and u64.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, n * 8) };
+        py.allow_threads(|| fill(bytes));
+        words_from_le(&mut words);
+    }
+    Ok(PyArray1::from_vec_bound(py, words))
+}
+
+// New uint64 array of shape `(steps, lanes, 4)` laid out as `fill_blocks()` writes it.
+// The size checks, the NumPy check and the buffer allocation come before `fill`, so their
+// failures leave the state untouched. Array construction and reshape happen after `fill`.
+// The GIL is released while `fill` runs.
+pub(crate) fn blocks_array<'py>(
+    py: Python<'py>,
+    lanes: usize,
+    steps: usize,
+    fill: impl FnOnce(&mut [[u8; 32]]) + Send,
+) -> PyResult<Bound<'py, PyArray3<u64>>> {
+    let too_big =
+        || pyo3::exceptions::PyValueError::new_err("output size exceeds isize::MAX bytes");
+    if steps > isize::MAX as usize {
+        return Err(too_big());
+    }
+    let blocks = lanes.checked_mul(steps).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("n_streams * steps overflows usize")
+    })?;
+    if blocks
+        .checked_mul(32)
+        .is_none_or(|b| b > isize::MAX as usize)
+    {
+        return Err(too_big());
+    }
+    require_numpy(py)?;
+    let mut words = new_words(blocks * 4)?;
+    if blocks != 0 {
+        // SAFETY: `[u8; 32]` has alignment 1 and the view covers exactly the memory of
+        // `words` (4 words per block); any bit pattern is valid.
+        let view =
+            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut [u8; 32], blocks) };
+        py.allow_threads(|| fill(view));
+        words_from_le(&mut words);
+    }
+    PyArray1::from_vec_bound(py, words).reshape([steps, lanes, 4])
 }
