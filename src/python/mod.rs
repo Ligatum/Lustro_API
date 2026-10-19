@@ -124,6 +124,61 @@ pub(crate) fn fill_buffer(
     Ok(())
 }
 
+// Exported buffer, released when dropped. The GIL is held for the whole life of the value.
+struct RawBuffer(pyo3::ffi::Py_buffer);
+
+impl Drop for RawBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the buffer was filled by a successful `PyObject_GetBuffer` and is released once.
+        unsafe { pyo3::ffi::PyBuffer_Release(&mut self.0) };
+    }
+}
+
+// As `fill_buffer`, but for any writable, C-contiguous buffer, whatever its item format
+// (`bytearray`, `array('I')`, a numpy array of any dtype, ...). The stream bytes are written
+// as raw memory, without conversion, and the number of bytes written is returned. The GIL
+// stays held. TypeError for an object without a buffer, a read-only or non-contiguous one;
+// the exporters report those cases with TypeError, BufferError or ValueError.
+pub(crate) fn fill_raw_buffer(
+    buf: &Bound<'_, pyo3::PyAny>,
+    fill: impl FnOnce(&mut [u8]),
+) -> PyResult<usize> {
+    let py = buf.py();
+    let bad = || {
+        pyo3::exceptions::PyTypeError::new_err(
+            "buf must be a writable, C-contiguous bytes-like object",
+        )
+    };
+    let mut view = std::mem::MaybeUninit::<pyo3::ffi::Py_buffer>::uninit();
+    // SAFETY: `buf` is a live object and the GIL is held; on success `view` is initialized.
+    let rc = unsafe {
+        pyo3::ffi::PyObject_GetBuffer(buf.as_ptr(), view.as_mut_ptr(), pyo3::ffi::PyBUF_WRITABLE)
+    };
+    if rc != 0 {
+        let err = PyErr::fetch(py);
+        let folded = err.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+            || err.is_instance_of::<pyo3::exceptions::PyBufferError>(py)
+            || err.is_instance_of::<pyo3::exceptions::PyValueError>(py);
+        return Err(if folded { bad() } else { err });
+    }
+    // SAFETY: `PyObject_GetBuffer` succeeded.
+    let raw = RawBuffer(unsafe { view.assume_init() });
+    // SAFETY: `raw` holds a valid buffer.
+    if unsafe { pyo3::ffi::PyBuffer_IsContiguous(&raw.0, b'C' as std::os::raw::c_char) } == 0 {
+        return Err(bad());
+    }
+    let len = raw.0.len as usize;
+    if len == 0 {
+        return Ok(0);
+    }
+    // SAFETY: the buffer was requested writable and is C-contiguous, so `buf` covers `len`
+    // consecutive bytes. `raw` keeps the export alive, and no Python code runs until `fill`
+    // returns.
+    let slice = unsafe { std::slice::from_raw_parts_mut(raw.0.buf as *mut u8, len) };
+    fill(slice);
+    Ok(len)
+}
+
 const BYTES_EXPECTED: &str = "expected bytes or a C-contiguous byte buffer";
 
 // Copy of a byte buffer (bytearray, memoryview, array('B'), NumPy uint8, ...), taken with

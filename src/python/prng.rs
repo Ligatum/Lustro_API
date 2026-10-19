@@ -112,6 +112,22 @@ impl LustroPrngPy {
         crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
 
+    /// Same as `fill(size)`: returns the next `size` bytes of the stream. The stream has no
+    /// end, so there is no `read()` without a size and a negative `size` raises OverflowError.
+    pub fn read<'py>(&mut self, py: Python<'py>, size: usize) -> PyResult<Bound<'py, PyBytes>> {
+        self.fill(py, size)
+    }
+
+    /// Fills a writable, C-contiguous buffer in place with the next bytes of the stream and
+    /// returns the number of bytes written (`nbytes`, not the number of items). Accepts any
+    /// item format: the bytes are written as raw memory, without conversion, so for a numpy
+    /// array of another dtype the values are a reinterpretation of the stream bytes. The GIL
+    /// is held while writing. Raises TypeError for an object without a buffer, a read-only
+    /// or a non-contiguous buffer. An empty buffer gives 0 and does not move the stream.
+    pub fn readinto(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<usize> {
+        crate::python::fill_raw_buffer(buf, |slice| self.inner.fill_bytes(slice))
+    }
+
     /// Returns an independent generator with identical stream state.
     pub fn copy(&self) -> Self {
         Self {

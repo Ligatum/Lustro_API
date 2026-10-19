@@ -10,7 +10,7 @@ use crate::types::{
 };
 use std::collections::TryReserveError;
 
-// RngCore
+// rand_core (LustroPrng and LustroXof)
 #[cfg(feature = "rand")]
 mod rand_impl;
 
@@ -114,6 +114,28 @@ impl LustroPrng {
         Self {
             state: StreamState::from_parts(s0, s1, step, cursor),
         }
+    }
+}
+
+/// Reads stream bytes like `fill_bytes`: `read` fills the whole buffer and returns its
+/// length, an empty buffer gives `Ok(0)` and does not move the stream.
+///
+/// The stream has no end. Do not use unbounded `read_to_end`; bound the read, for example
+/// with `take`:
+///
+/// ```
+/// use lustro::{LustroPrng, Seed256, StreamId};
+/// use std::io::Read;
+///
+/// let mut rng = LustroPrng::new(&Seed256::from_bytes([0u8; 32]), StreamId(0));
+/// let mut bytes = Vec::new();
+/// rng.by_ref().take(100).read_to_end(&mut bytes).unwrap();
+/// assert_eq!(bytes.len(), 100);
+/// ```
+impl std::io::Read for LustroPrng {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.fill_bytes(buf);
+        Ok(buf.len())
     }
 }
 

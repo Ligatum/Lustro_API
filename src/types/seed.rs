@@ -59,12 +59,11 @@ impl std::error::Error for EntropyError {
 impl Seed256 {
     /// Fills a seed from the operating system's entropy source.
     ///
-    /// Returns an error when the source is unavailable (`rand_core`'s
-    /// `SeedableRng::from_entropy` panics instead); no partially filled seed is returned.
+    /// Returns an error when the source is unavailable; no partially filled seed is returned.
     /// `LustroPrng` does not implement `CryptoRng`.
     pub fn from_entropy() -> Result<Self, EntropyError> {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).map_err(EntropyError)?;
+        getrandom::fill(&mut bytes).map_err(EntropyError)?;
         Ok(Self(bytes))
     }
 }

@@ -117,13 +117,30 @@ const ENV_DISABLE_MT: &str = "LUSTRO_DISABLE_MT";
 const ENV_DISABLE_SIMD: &str = "LUSTRO_DISABLE_SIMD";
 const ENV_NUM_THREADS: &str = "LUSTRO_NUM_THREADS";
 
+// A flag variable is set by `1`, `true`, `on` or `yes`, and not set by `0`, `false`, `off`,
+// `no`, an empty value or no variable (case and surrounding whitespace are ignored). Any
+// other value, one that is not valid UTF-8 included, sets it: disabling is the safe direction.
+fn env_flag(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> bool {
+    let Some(value) = get(name) else {
+        return false;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let text = text.trim();
+    !(text.is_empty()
+        || ["0", "false", "off", "no"]
+            .iter()
+            .any(|f| text.eq_ignore_ascii_case(f)))
+}
+
 // Process-wide settings, fixed once: by `configure()`, or else read from the environment
 // at the first use of the dispatcher (batch calls, `suggested_steps()`, `runtime_info()`).
 // Later changes to the environment have no effect.
 // They affect execution only; outputs do not depend on them.
 //
-// - `LUSTRO_DISABLE_MT`: present (any value, `0` included) = never enter the pool.
-// - `LUSTRO_DISABLE_SIMD`: present = scalar backend for streams.
+// - `LUSTRO_DISABLE_MT`: set (see `env_flag`) = never enter the pool.
+// - `LUSTRO_DISABLE_SIMD`: set = scalar backend for streams.
 // - `LUSTRO_NUM_THREADS=N`: pool size, capped at the logical CPU count.
 //
 // A field set in `RuntimeOptions` replaces the variables of the same purpose:
@@ -157,7 +174,7 @@ impl RuntimeConfig {
                     .map(|n| n.min(logical.max(1)))
                     .and_then(NonZeroUsize::new);
                 let disable_mt =
-                    get(ENV_DISABLE_MT).is_some() || threads.map(NonZeroUsize::get) == Some(1);
+                    env_flag(&get, ENV_DISABLE_MT) || threads.map(NonZeroUsize::get) == Some(1);
                 (threads, disable_mt)
             }
         };
@@ -166,7 +183,7 @@ impl RuntimeConfig {
             disable_mt,
             disable_simd: options
                 .allow_simd
-                .map_or_else(|| get(ENV_DISABLE_SIMD).is_some(), |allow| !allow),
+                .map_or_else(|| env_flag(&get, ENV_DISABLE_SIMD), |allow| !allow),
             threads,
         }
     }

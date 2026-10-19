@@ -109,6 +109,28 @@ impl LustroXof {
     }
 }
 
+/// Reads stream bytes like `fill_bytes`: `read` fills the whole buffer and returns its
+/// length, an empty buffer gives `Ok(0)` and does not move the stream.
+///
+/// The stream has no end. Do not use unbounded `read_to_end`; bound the read, for example
+/// with `take`:
+///
+/// ```
+/// use lustro::LustroXof;
+/// use std::io::Read;
+///
+/// let mut rng = LustroXof::new(b"message");
+/// let mut bytes = Vec::new();
+/// rng.by_ref().take(100).read_to_end(&mut bytes).unwrap();
+/// assert_eq!(bytes.len(), 100);
+/// ```
+impl std::io::Read for LustroXof {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.fill_bytes(buf);
+        Ok(buf.len())
+    }
+}
+
 // ==========================================
 // RUST XOF BATCH API
 // ==========================================

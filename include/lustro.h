@@ -996,6 +996,18 @@ LustroError lustro_xof_batch_import_snapshot(const uint8_t *bytes,
                                              uintptr_t len,
                                              struct LustroXofBatch **out_ctx);
 
+/**
+ * Byte offset of the block for `step` and `lane` in the output of
+ * `lustro_*_batch_fill_blocks`: `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`.
+ * Preconditions: `step < steps`, `lane < batch_len`, and
+ * `steps * batch_len * LUSTRO_BLOCK_LEN` fits in `size_t`.
+ * The arguments are not validated and overflow is not checked.
+ */
+static inline size_t lustro_batch_block_offset(size_t step, size_t batch_len, size_t lane)
+{
+	return (step * batch_len + lane) * LUSTRO_BLOCK_LEN;
+}
+
 #ifdef __cplusplus
 }
 #endif

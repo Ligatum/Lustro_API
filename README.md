@@ -22,6 +22,10 @@ cargo build --release
 
 cargo build --release --features entropy
 
+# rand_core traits for LustroPrng and LustroXof (Rust, also enables entropy)
+
+cargo build --release --features rand
+
 # Python (requires NumPy)
 
 pip install maturin numpy
@@ -196,8 +200,7 @@ The C examples below omit the status checks for brevity.
 **Rust** (`--features entropy`, also enabled by `rand`)
 
 ```rust
-use lustro::prng::LustroPrng;
-use lustro::types::{Seed256, StreamId};
+use lustro::{LustroPrng, Seed256, StreamId};
 
 // Err(EntropyError) if the operating system cannot provide entropy.
 let seed = Seed256::from_entropy()?;
@@ -265,6 +268,7 @@ Read integers, a full block, or any number of bytes from a single stream. `Lustr
 
 ```rust
 use lustro::{LustroPrng, Seed256, StreamId};
+use std::io::Read;
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let mut rng = LustroPrng::new(&seed, StreamId(0));
@@ -276,6 +280,9 @@ let block = rng.next_block();   // [u8; 32]
 
 let mut buf = [0u8; 100];
 rng.fill_bytes(&mut buf);
+
+let mut bytes = Vec::new();
+rng.by_ref().take(100).read_to_end(&mut bytes).unwrap();   // std::io::Read
 ```
 
 **Python**
@@ -320,6 +327,8 @@ lustro_prng_free(rng);
 
 All values are little-endian and taken from the same byte stream: in the examples above `a` is bytes 0–3, `b` bytes 4–11 and `c` bytes 12–27. `next_block()` always advances to a full new 32-byte block and discards the unread rest of the current one. The XOF equivalents are `lustro_xof_next_u32` and so on (C/C++).
 
+In Rust, `LustroPrng` and `LustroXof` also implement `std::io::Read`. `read` fills the whole buffer and returns its length, exactly like `fill_bytes`. The stream has no end, so do not use an unbounded `read_to_end`; bound the read, for example with `take`.
+
 ---
 
 ### Python Notes
@@ -336,10 +345,15 @@ buf = bytearray(1000)
 rng.fill_into(buf)            # bytearray, writable memoryview or NumPy uint8 array
 words = rng.fill_u64(1000)    # NumPy uint64 array of shape (1000,)
 
+data = rng.read(1000)         # same as fill(1000)
+n = rng.readinto(buf)         # n == 1000, any writable C-contiguous buffer
+
 twin = rng.copy()             # same state; copy.copy() and copy.deepcopy() work too
 ```
 
 `fill_u64(n)` needs NumPy and returns a new, writable array with the values that `n` calls of `next_u64()` would give.
+
+`read(size)` is the same as `fill(size)`; there is no `read()` without a size, because the stream has no end. `readinto(buf)` accepts any writable, C-contiguous buffer, whatever its item type (for example `array('I')` or a NumPy `uint32` array). It writes the stream as raw bytes, without conversion, and returns the number of bytes written. `fill_into(buf)` takes byte buffers only.
 
 Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, `hash128_many_var` and `LustroXofBatch` take any sequence of such objects, but not a single string or buffer.
 
@@ -491,6 +505,13 @@ lustro_xof_batch_free(xof);
 lustro_prng_batch_free(prng);
 ```
 
+In C/C++, `lustro_batch_block_offset(step, batch_len, lane)` from `lustro.h` gives the byte offset of one block in the output: `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`. It expects `step < steps` and `lane < batch_len` and does not check its arguments.
+
+````c
+/* lane 2 at step 1 of prng_out above */
+const uint8_t *block = (const uint8_t *)prng_out + lustro_batch_block_offset(1, 4, 2);
+````
+
 ---
 
 ### Batch — Suggested Steps
@@ -536,7 +557,7 @@ lustro_prng_batch_new_range(seed, 0, 0, 4, &prng);
 
 size_t steps = lustro_prng_batch_suggested_steps(prng);
 size_t out_len = steps * lustro_prng_batch_len(prng) * LUSTRO_BLOCK_LEN;
-uint8_t *out = malloc(out_len);
+uint8_t *out = (uint8_t *)malloc(out_len);
 
 lustro_prng_batch_fill_blocks(prng, out, out_len, steps);
 
@@ -783,9 +804,62 @@ for `n` streams.
 
 ---
 
+### rand_core Integration (Rust)
+
+With `--features rand`, `LustroPrng` and `LustroXof` implement the `rand_core` 0.10
+traits `TryRng` and `Rng` (infallible, `Error = Infallible`). `LustroPrng` also
+implements `SeedableRng`. `LustroXof` does not: its input is a message of any
+length, not a fixed seed.
+
+```toml
+[dependencies]
+lustro = { version = "<version>", features = ["rand"] }
+rand_core = "0.10"
+```
+
+```rust
+use lustro::{LustroPrng, LustroXof, Seed256, StreamId};
+use rand_core::{Rng, SeedableRng};
+
+fn draw(rng: &mut impl Rng) -> u64 {
+    rng.next_u64()
+}
+
+// PRNG from a 32-byte seed (stream 0).
+let mut prng = LustroPrng::from_seed([7u8; 32]);
+let a = draw(&mut prng);
+
+// Random seed (needs the system entropy source).
+let mut random = LustroPrng::from(Seed256::from_entropy()?);
+let mut buf = [0u8; 100];
+random.fill_bytes(&mut buf);
+
+// XOF over a message of any length.
+let mut xof = LustroXof::new(b"message");
+let b = draw(&mut xof);
+
+// On a LustroPrng, fork takes a StreamId.
+let mut child = prng.fork(StreamId(1));
+let c = child.next_u64();
+```
+
+- **Same stream:** `Rng` returns the same bytes, from the same position, as the
+  inherent `next_u32`, `next_u64` and `fill_bytes`.
+- **Seeding:** `from_seed` starts at stream 0. `rand_core` 0.10 has no
+  `from_entropy`, so use `LustroPrng::from(Seed256::from_entropy()?)`.
+- **`fork`:** `LustroPrng::fork(StreamId)` shadows `SeedableRng::fork()` on a
+  concrete `LustroPrng`. Only code that is generic over `SeedableRng` calls the
+  trait method.
+- **Quality:** implementing `Rng` is an interface, not a claim about statistical
+  or cryptographic quality. `CryptoRng` is not implemented.
+
+---
+
 ### Runtime Settings
 
 Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before the first batch call.
+
+`LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` are set by `1`, `true`, `on` or `yes` and are not set by `0`, `false`, `off`, `no` or an empty value (case is ignored). Any other value sets them.
 
 **Rust**
 

@@ -59,7 +59,19 @@ fn generate_header() {
             .to_string(),
     );
     config.trailer = Some(
-        "#ifdef __cplusplus\n\
+        "/**\n\
+         \x20* Byte offset of the block for `step` and `lane` in the output of\n\
+         \x20* `lustro_*_batch_fill_blocks`: `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`.\n\
+         \x20* Preconditions: `step < steps`, `lane < batch_len`, and\n\
+         \x20* `steps * batch_len * LUSTRO_BLOCK_LEN` fits in `size_t`.\n\
+         \x20* The arguments are not validated and overflow is not checked.\n\
+         \x20*/\n\
+         static inline size_t lustro_batch_block_offset(size_t step, size_t batch_len, size_t lane)\n\
+         {\n\
+         \treturn (step * batch_len + lane) * LUSTRO_BLOCK_LEN;\n\
+         }\n\
+         \n\
+         #ifdef __cplusplus\n\
          }\n\
          #endif"
             .to_string(),
