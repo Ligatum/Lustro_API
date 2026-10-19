@@ -380,8 +380,10 @@ These guarantees hold across Rust, Python, and C FFI layers.
 - Fork is deterministic: the same parent state and identifier produce the same
   child. The identifier is part of the branch derivation; different identifiers
   are intended to produce different derived streams.
-- Two forks with the same identifier will be identical regardless of how many
-  bytes were consumed from the parent's current output block.
+- Two forks with the same identifier are identical as long as the parent is in
+  the same output block. Reading more bytes from that block does not change the
+  child; the read that moves the parent to the next block does, including the
+  first read of a new stream.
 - `fork_many(ids)` (batch only, PRNG and XOF) derives `ids.len()` children per
   lane, producing a batch of `len() * ids.len()` lanes in parent-major order:
   child `j` of lane `i` is at index `i * ids.len() + j`. Same `step = 0` and
@@ -581,16 +583,6 @@ allocation or size failures may panic.
 Note: these panics are plain Rust panics (`assert_eq!`, `expect`), not `LustroError`
 values — `LustroError` is part of the C FFI ABI only (see §12.3).
 
-**Snapshot Roundtrip** (not shown in README Quick Start)
-
-```rust
-let snapshot = rng.export_snapshot();
-let bytes = snapshot.to_le_bytes();               // 56 bytes
-
-let snapshot2 = LustroPrngSnapshot::from_le_bytes(&bytes)?; // fallible
-let mut restored = LustroPrng::import_snapshot(snapshot2);  // infallible
-```
-
 ---
 
 ### 12.2 Python Bindings
@@ -716,18 +708,6 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 All other behavioral guarantees (fork step=0, hash128 truncation, snapshot
 resume, concatenation guarantee) are as described in
 [§10 Behavioral Guarantees](#10-behavioral-guarantees).
-
-**Batch Example** (illustrates the NumPy contract; not in README)
-
-```python
-import numpy as np
-from lustro import LustroPrngBatch
-
-batch = LustroPrngBatch.new_range(seed, 0, 4)
-steps = 2
-out = np.empty((steps, batch.len(), 4), dtype=np.uint64)
-batch.fill_blocks(out, steps)
-```
 
 ---
 
@@ -971,45 +951,10 @@ All mutating FFI functions operate through `&mut *ctx`. Using the same handle co
 from multiple threads without external synchronization causes a data race. Use a separate 
 handle per thread, or synchronize access to handles shared across threads.
 
-**8. Minimal Examples**
+**8. ctypes Buffer Mapping**
 
-**C — hash + basic PRNG:**
-
-```c
-uint8_t out[32];
-LustroError err = lustro_hash256(data, data_len, out);
-
-LustroPrng *ctx = NULL;
-err = lustro_prng_new(seed, 0, 0, &ctx);
-uint64_t val;
-lustro_prng_next_u64(ctx, &val);
-lustro_prng_free(ctx);
-```
-
-**PRNG lifecycle with snapshot and fork:**
-
-```c
-uint8_t seed[32] = { /* 32 bytes */ };
-LustroPrng *ctx = NULL;
-LustroError err = lustro_prng_new(seed, 0, 0, &ctx);
-if (err != LUSTRO_ERROR_OK) { /* handle failure */ }
-
-uint8_t snap[56];
-lustro_prng_export_snapshot(ctx, snap);
-
-LustroPrng *restored = NULL;
-LustroPrng *child = NULL;
-err = lustro_prng_import_snapshot(snap, &restored);
-err = lustro_prng_fork(ctx, 0, 42, &child);
-
-lustro_prng_free(child);
-lustro_prng_free(restored);
-lustro_prng_free(ctx);
-```
-
-**Python (ctypes) — input/output buffer mapping:**
-
-This repository's reference Python wrapper maps input byte buffers to
+C examples are in the [README](README.md). The following shows how this
+repository's reference Python wrapper maps input byte buffers to
 `ctypes.c_char_p` and writable output buffers to
 `ctypes.create_string_buffer()`. Other bindings may choose different but
 equivalent representations.
