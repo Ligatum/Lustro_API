@@ -29,21 +29,22 @@ impl std::error::Error for DerivePathError {
     }
 }
 
-/// Why a batch could not be built by `try_new_range`, `try_fork_many` or `try_clone`.
+/// Why a batch operation failed in `try_new_range`, `try_fork_many`, `try_clone` or `try_blocks`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BatchError {
-    /// The lane count overflows `usize`.
+    /// A computed size overflows `usize`: the lane count of `try_fork_many`
+    /// (`len() * ids.len()`) or the block count of `try_blocks` (`len() * steps`).
     SizeOverflow,
-    /// Reserving the lane buffer failed (allocator refusal or capacity overflow).
+    /// Reserving a buffer failed (allocator refusal or capacity overflow).
     Reserve(std::collections::TryReserveError),
 }
 
 impl core::fmt::Display for BatchError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            BatchError::SizeOverflow => write!(f, "lane count overflows usize"),
-            BatchError::Reserve(_) => write!(f, "lane buffer reservation failed"),
+            BatchError::SizeOverflow => write!(f, "size overflows usize"),
+            BatchError::Reserve(_) => write!(f, "buffer reservation failed"),
         }
     }
 }

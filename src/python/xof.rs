@@ -82,7 +82,8 @@ impl LustroXofPy {
     /// shape `(n,)`. The GIL is released while generating.
     ///
     /// Raises OverflowError if `8 * n` exceeds isize::MAX, MemoryError if the output
-    /// buffer cannot be allocated. The state is unchanged in these cases.
+    /// buffer cannot be allocated. The state is unchanged in these cases. The array object
+    /// is created after generation, so a failure there does move the state.
     pub fn fill_u64<'py>(
         &mut self,
         py: Python<'py>,
@@ -244,13 +245,24 @@ impl LustroXofBatchPy {
         self.copy()
     }
 
+    /// Returns lane `i` as an independent LustroXof, positioned at the lane's next block.
+    /// The batch is not advanced and later calls on it do not affect the copy.
+    /// Raises IndexError if `i >= len(self)`; a negative `i` raises OverflowError.
+    pub fn lane(&self, i: usize) -> PyResult<LustroXofPy> {
+        self.inner
+            .lane(i)
+            .map(|inner| LustroXofPy { inner })
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("lane index out of range"))
+    }
+
     /// Advances every lane by `steps` stream steps and returns the blocks as a new
     /// writable uint64 array of shape `(steps, len(self), 4)`, laid out as
     /// `fill_blocks()` writes it. The internal buffer is not used. The GIL is released
     /// while generating.
     ///
     /// Raises ValueError if the output size overflows, MemoryError if the output
-    /// buffer cannot be allocated. The state is unchanged in these cases.
+    /// buffer cannot be allocated. The state is unchanged in these cases. The array object
+    /// is created after generation, so a failure there does move the state.
     pub fn blocks<'py>(
         &mut self,
         py: Python<'py>,
@@ -392,6 +404,7 @@ impl LustroXofBatchPy {
     /// `LustroXof.derive_path(messages[i], path)`.
     /// `messages` follows the rules of the constructor. `path` must not be empty
     /// (ValueError). Empty `messages` gives an empty batch.
+    /// Raises MemoryError if the lanes cannot be allocated.
     #[staticmethod]
     pub fn derive_path(
         #[pyo3(from_py_with = "messages_arg")] messages: MessageSeq<'_>,
@@ -405,7 +418,8 @@ impl LustroXofBatchPy {
         let messages = messages.load()?;
         let refs = messages.slices();
         let path_ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
-        let inner = LustroXofBatch::derive_path(&refs, &path_ids);
+        let inner = LustroXofBatch::try_derive_path(&refs, &path_ids)
+            .map_err(crate::python::derive_path_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),

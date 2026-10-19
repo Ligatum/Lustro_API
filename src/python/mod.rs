@@ -82,6 +82,17 @@ pub(crate) fn alloc_error() -> pyo3::PyErr {
     pyo3::exceptions::PyMemoryError::new_err("allocation failed")
 }
 
+// Error of a batch `try_derive_path`. The callers check `path` first, so `EmptyPath`
+// is not expected here.
+pub(crate) fn derive_path_error(e: crate::types::DerivePathError) -> pyo3::PyErr {
+    match e {
+        crate::types::DerivePathError::EmptyPath => {
+            pyo3::exceptions::PyValueError::new_err("path must not be empty")
+        }
+        crate::types::DerivePathError::Reserve(_) => alloc_error(),
+    }
+}
+
 // Wrong type, dtype or ndim of an array argument.
 pub(crate) fn array_type_error(name: &str, expected: &str) -> pyo3::PyErr {
     pyo3::exceptions::PyTypeError::new_err(format!("{name} must be {expected}"))

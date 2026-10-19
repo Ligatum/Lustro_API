@@ -52,7 +52,7 @@ fn generate_header() {
          \tLUSTRO_ERROR_INVALID_KIND         = 8,\n\
          \tLUSTRO_ERROR_INVALID_CURSOR       = 9,\n\
          \tLUSTRO_ERROR_OUT_OF_MEMORY        = 10,\n\
-         \t/* 11..12: reported by lustro_configure */\n\
+         \t/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane */\n\
          \tLUSTRO_ERROR_ALREADY_CONFIGURED   = 11,\n\
          \tLUSTRO_ERROR_INVALID_ARGUMENT     = 12\n\
          } LustroError;"

@@ -115,7 +115,7 @@ import lustro
 rows = np.zeros((3, 16), dtype=np.uint8)
 digests = lustro.hash256_many(rows)  # uint8 array, shape (3, 32)
 
-# Messages of any length: a list of bytes.
+# Messages of any length: a sequence of bytes or byte buffers.
 digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
 ```
 
@@ -324,7 +324,7 @@ All values are little-endian and taken from the same byte stream: in the example
 
 ### Python Notes
 
-Single streams (`LustroPrng`, `LustroXof`) can also return or fill larger amounts of bytes, and can be copied:
+Single streams (`LustroPrng`, `LustroXof`) can also return or fill larger amounts of data, and can be copied:
 
 ```python
 from lustro import LustroPrng
@@ -334,9 +334,14 @@ rng = LustroPrng(bytes(32), 0)
 data = rng.fill(1000)         # bytes
 buf = bytearray(1000)
 rng.fill_into(buf)            # bytearray, writable memoryview or NumPy uint8 array
+words = rng.fill_u64(1000)    # NumPy uint64 array of shape (1000,)
 
 twin = rng.copy()             # same state; copy.copy() and copy.deepcopy() work too
 ```
+
+`fill_u64(n)` needs NumPy and returns a new, writable array with the values that `n` calls of `next_u64()` would give.
+
+Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, `hash128_many_var` and `LustroXofBatch` take any sequence of such objects, but not a single string or buffer.
 
 An instance must not be used by several threads at the same time (an overlapping call raises `RuntimeError`). Use `copy()`, `fork()` or separate instances instead. The installed version is available as `lustro.__version__`, and the package ships type stubs (`lustro.pyi`, `py.typed`).
 
@@ -417,6 +422,9 @@ let messages = [
 let mut xof = LustroXofBatch::new(&messages);
 let mut xof_out = vec![[0u8; 32]; xof.len() * steps];
 xof.fill_blocks(&mut xof_out, steps);
+
+// Or let the library allocate the vector:
+let more = prng.blocks(steps); // Vec<[u8; 32]>, prng.len() * steps blocks
 ```
 
 **Python**
@@ -436,9 +444,12 @@ prng.fill_blocks(prng_out, steps)
 xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
 xof_out = np.empty((steps, len(xof), 4), dtype=np.uint64)
 xof.fill_blocks(xof_out, steps)
+
+# Or let the library allocate the array:
+prng_out = prng.blocks(steps)
 ```
 
-`fill_blocks(out, steps)` writes one 32-byte block per stream per step, step-major: stream `i` at step `s` is block `s * n + i` (`n` = number of streams). In Python that is `out[s, i]`, with `out` shaped `(steps, n_streams, 4)`; each block is four `uint64` values.
+`fill_blocks(out, steps)` writes one 32-byte block per stream per step, step-major: stream `i` at step `s` is block `s * n + i` (`n` = number of streams). In Python that is `out[s, i]`, with `out` shaped `(steps, n_streams, 4)`; each block is four `uint64` values. `blocks(steps)` (Rust and Python) returns the same blocks in a newly allocated result: a `Vec<[u8; 32]>` in Rust, a new, writable array of that shape in Python.
 
 **C / C++**
 
@@ -533,7 +544,62 @@ free(out);
 lustro_prng_batch_free(prng);
 ```
 
-The same API is available for XOF batches. In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call; `release_buffer()` frees it earlier.
+The same API is available for XOF batches. In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call; `release_buffer()` frees it earlier. `blocks()` does not use that buffer.
+
+---
+
+### Batch — Single Lane
+
+Take one lane out of a batch as a single stream. The stream continues the lane: its next block is the block the batch would write for that lane next. The batch is not changed, and the two evolve independently afterwards.
+
+**Rust**
+
+```rust
+use lustro::{LustroPrngBatch, Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
+let mut prng = LustroPrngBatch::new(&seed, &ids);
+
+prng.blocks(2);
+
+// None if the index is out of range.
+let mut lane = prng.lane(1).expect("lane in range");
+let block = lane.next_block();
+```
+
+**Python**
+
+```python
+from lustro import LustroPrngBatch
+
+prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
+prng.blocks(2)
+
+lane = prng.lane(1)  # IndexError if the index is out of range
+block = lane.next_block()
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
+LustroPrngBatch *prng = NULL;
+lustro_prng_batch_new_range(seed, 0, 0, 4, &prng);
+
+LustroPrng *lane = NULL;
+LustroError err = lustro_prng_batch_lane(prng, 1, &lane);  /* LUSTRO_ERROR_INVALID_ARGUMENT if index >= len */
+
+uint8_t block[LUSTRO_BLOCK_LEN];
+lustro_prng_next_block(lane, block);
+
+lustro_prng_free(lane);  /* a single stream, not a batch */
+lustro_prng_batch_free(prng);
+```
+
+`LustroXofBatch` has the same `lane` and returns a `LustroXof`. The result is an ordinary single stream, so it supports typed reads, `fork` and snapshots. `lane(i).fork(id)` equals child `i` of `fork` called with `id` at position `i`. An out-of-range index gives `None` (Rust), `IndexError` (Python) or `LUSTRO_ERROR_INVALID_ARGUMENT` (C/C++).
 
 ---
 
@@ -651,7 +717,7 @@ stream's state. The same API is available for XOF, via
 `LustroXofBatch::derive_path(messages, path)` (Rust),
 `LustroXofBatch.derive_path(messages, path)` (Python), and
 `lustro_xof_batch_derive_path(message_ptrs, message_lens, n_messages, path_hi, path_lo, n_path, &out_ctx)`
-(C/C++), using a list of messages instead of a seed and root identifiers.
+(C/C++), using a list of messages instead of a seed and root identifiers. In Python the messages can be any sequence of `bytes` or byte buffers.
 
 ---
 

@@ -280,6 +280,18 @@ impl StreamState {
         (self.s0, self.s1, self.step, self.cursor)
     }
 
+    // Stream at the next block of a batch lane. Lanes are block-aligned, so there is no
+    // partly read block (cursor 32 = empty output buffer).
+    #[inline]
+    pub(crate) fn from_block_aligned(s0: u128, s1: u128, step: u64) -> Self {
+        Self {
+            s0,
+            s1,
+            step,
+            cursor: 32,
+        }
+    }
+
     // Reconstructs StreamState from internal state components.
     // Panics unless `cursor` is in `1..=32`.
     #[inline]

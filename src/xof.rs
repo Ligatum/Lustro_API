@@ -178,6 +178,43 @@ impl LustroXofBatch {
         dispatch_streams(&mut self.streams, out, steps);
     }
 
+    /// Advances every lane by `steps` and returns the blocks in the layout of `fill_blocks`:
+    /// `out[step * len() + lane]`. Panics if `len() * steps` overflows `usize` or the
+    /// buffer cannot be allocated.
+    pub fn blocks(&mut self, steps: usize) -> Vec<[u8; 32]> {
+        match self.try_blocks(steps) {
+            Ok(out) => out,
+            Err(BatchError::SizeOverflow) => panic!("blocks: len() * steps overflows usize"),
+            Err(BatchError::Reserve(e)) => panic!("blocks: output allocation failed: {e:?}"),
+        }
+    }
+
+    /// As `blocks`, returning `Err(BatchError::SizeOverflow)` if `len() * steps` overflows
+    /// `usize`, or `Err(BatchError::Reserve)` if reserving the output fails (also when it
+    /// would exceed `isize::MAX` bytes). The state is unchanged on error.
+    pub fn try_blocks(&mut self, steps: usize) -> Result<Vec<[u8; 32]>, BatchError> {
+        let count = self
+            .streams
+            .len()
+            .checked_mul(steps)
+            .ok_or(BatchError::SizeOverflow)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(count).map_err(BatchError::Reserve)?;
+        out.resize(count, [0u8; 32]);
+        self.fill_blocks(&mut out, steps);
+        Ok(out)
+    }
+
+    /// Copy of lane `i` as a single stream, positioned at the lane's next block.
+    /// Later calls on the batch do not affect it. `None` if `i >= len()`.
+    #[must_use]
+    pub fn lane(&self, i: usize) -> Option<LustroXof> {
+        let lane = self.streams.get(i)?;
+        Some(LustroXof {
+            state: StreamState::from_block_aligned(lane.s0, lane.s1, lane.step),
+        })
+    }
+
     /// Derives one child stream per lane using the corresponding identifier.
     /// `ids.len()` must equal `len()`.
     pub fn fork(&self, ids: &[StreamId]) -> Self {

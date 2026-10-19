@@ -180,7 +180,7 @@ pub unsafe extern "C" fn lustro_xof_fill(
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer.
+/// and must not overlap any input buffer or the memory of `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_clone(
     ctx: *const LustroXof,
@@ -203,7 +203,7 @@ pub unsafe extern "C" fn lustro_xof_clone(
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer.
+/// and must not overlap any input buffer or the memory of `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork(
     ctx: *const LustroXof,
@@ -357,7 +357,7 @@ pub unsafe extern "C" fn lustro_xof_batch_free(ctx: *mut LustroXofBatch) {
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer.
+/// and must not overlap any input buffer or the memory of `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_clone(
     ctx: *const LustroXofBatch,
@@ -368,6 +368,30 @@ pub unsafe extern "C" fn lustro_xof_batch_clone(
             return Err(LustroError::InvalidPointer);
         }
         (*ctx).try_clone().map_err(batch_status)
+    })
+}
+
+/// Copies lane `index` of the batch as a single stream, positioned at the lane's next block.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`, `InvalidArgument` if `index >= len`.
+/// The batch is not advanced and later calls on it do not affect the copy.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer or the memory of `ctx`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_lane(
+    ctx: *const LustroXofBatch,
+    index: usize,
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        (*ctx).lane(index).ok_or(LustroError::InvalidArgument)
     })
 }
 
@@ -467,7 +491,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
 /// when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer.
+/// and must not overlap any input buffer or the memory of `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork(
     ctx: *const LustroXofBatch,
@@ -503,7 +527,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
 /// `ids_hi` and `ids_lo` must each be valid for `k` readable elements
 /// when `k > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer.
+/// and must not overlap any input buffer or the memory of `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     ctx: *const LustroXofBatch,
@@ -571,7 +595,7 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer.
+/// and must not overlap any input buffer or the memory of `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_range(
     ctx: *const LustroXofBatch,
