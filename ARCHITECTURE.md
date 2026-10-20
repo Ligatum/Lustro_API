@@ -94,6 +94,18 @@ Domain::Xof  = 0x03
 Hash, PRNG, and XOF each use a distinct domain. `fork()` reuses the parent's
 domain (`Domain::Prng` for PRNG and `Domain::Xof` for XOF).
 
+The stream identifier is XORed into the second half of the state before the
+mixing step, so for one input state different identifiers give different
+inputs to that step. This applies to every derivation: `new`, the batch
+constructors, the roots of `derive_path`, and `fork`. Across input states the
+mapping is not unique: two states of the same construction with the same first
+16 bytes, whose second halves differ by `a ^ b`, give the same stream for
+identifiers `a` and `b`. For example, `new(X, 1)` equals `new(Y, 0)` when `Y`
+is `X` with the lowest bit of byte 16 flipped (counting from 0). Seeds with a
+counter or another pattern in the second half can run into this; states
+produced by the engine are not expected to. One seed with different
+identifiers avoids it.
+
 ---
 
 ## 4. Absorption / Hash & XOF-Init Model
@@ -382,8 +394,15 @@ These guarantees hold across Rust, Python, and C FFI layers.
   are intended to produce different derived streams.
 - Two forks with the same identifier are identical as long as the parent is in
   the same output block. Reading more bytes from that block does not change the
-  child; the read that moves the parent to the next block does, including the
-  first read of a new stream.
+  child; the read that moves the parent to the next block changes the state the
+  child is derived from, including the first read of a new stream.
+- The 32 bytes of an output block are the stream state (`s0`, `s1`) at that
+  point. A full block and the number of blocks generated so far are enough to
+  compute every following block; nothing is claimed about going backwards.
+  `fork(id)` follows from this: once a PRNG has generated a block, it gives the
+  same child as `LustroPrng::new` seeded with the latest generated block and
+  the same identifier. Lustro makes no cryptographic claim, so this is not a
+  security boundary.
 - `fork_many(ids)` (batch only, PRNG and XOF) derives `ids.len()` children per
   lane, producing a batch of `len() * ids.len()` lanes in parent-major order:
   child `j` of lane `i` is at index `i * ids.len() + j`. Same `step = 0` and
@@ -664,7 +683,7 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 | `LustroXof.import_snapshot(bytes)`                        | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
 | `LustroXof.derive_path(message, path)`                    | `message` | Python `bytes`, any length (staticmethod) |
 |                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`) |
-| `LustroXofBatch(messages)`                                | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) → returns shape `(n, 32)`, dtype `uint8` |
+| `LustroXofBatch(messages)`                                | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) |
 | `LustroXofBatch.fill_blocks(out, steps)`                  | `out`, `steps` | writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == len(batch)`; Python `int`. Wrong type → `TypeError`; shape mismatch or non-C-contiguous → `ValueError` |
 | `LustroXofBatch.blocks(steps)`                            | `steps` | Python `int`, `steps >= 0` (`OverflowError` if negative or above `2⁶⁴ - 1`) → returns a new writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, laid out as `fill_blocks` writes it. `ValueError` if the output size overflows, `MemoryError` if the output buffer cannot be allocated; the state is unchanged on these errors, but not if creating the array object fails after generation. A very large `steps` gives `ValueError` also for an empty batch, because NumPy rejects the shape `(steps, 0, 4)` (the limit depends on NumPy; Rust and C return an empty result there) |
 | `LustroXofBatch.lane(i)`                                  | `i` | Python `int`, `0 ≤ i < len(batch)` → returns a new `LustroXof` at the lane's next block, independent of the batch. `IndexError` if `i >= len(batch)`, `OverflowError` if negative or above `2⁶⁴ - 1`, `TypeError` for a non-int |
@@ -1007,12 +1026,16 @@ fit in `size_t`.
    This version does not provide secret-memory protection.
 2. **No automatic zeroization** — `Seed256` and internal stream state are not
    cleared on drop.
-3. **No hidden generator state** — each PRNG/XOF instance owns its own state.
+3. **Not a cryptographic generator.** Lustro makes no cryptographic claim. An
+   output block is the stream state, so a full block and the step counter give
+   every following block. Do not rely on seeds or output where
+   unpredictability is required.
+4. **No hidden generator state** — each PRNG/XOF instance owns its own state.
    The Rayon thread pool used for batch parallelism is shared execution state,
    not generator state. If pool creation fails due to system limits, execution
    falls back to single-threaded mode. A process forked after the pool was
    created does not reuse it; the child runs single-threaded.
-4. **FFI/Python panic handling.** All release builds use `panic = "unwind"`. 
+5. **FFI/Python panic handling.** All release builds use `panic = "unwind"`. 
    FFI functions that are panic-guarded catch internal unwinds and return their 
    documented failure value — `LustroError::InternalPanic` for error-returning 
    functions, constructors included (`*out_ctx` stays `NULL`). Python bindings require
@@ -1022,13 +1045,13 @@ fit in `size_t`.
    This does not protect against fatal process-level conditions or builds with a
    different panic strategy. Violating the FFI pointer preconditions, for example
    by passing an invalid non-null pointer, remains undefined behavior.
-5. **Thread safety** — the underlying Rust contexts
+6. **Thread safety** — the underlying Rust contexts
    (`LustroPrng`, `LustroPrngBatch`, `LustroXof`, `LustroXofBatch`) provide no
    internal synchronization. Shared handles or objects must not be mutated
    concurrently without the synchronization required by the binding.
    For C FFI, this means caller-side synchronization around shared pointers;
    Python also applies the usual GIL and object-borrowing rules.
-6. **Entropy** — `Seed256::from_entropy()` (`feature = "entropy"`) reads the
+7. **Entropy** — `Seed256::from_entropy()` (`feature = "entropy"`) reads the
    operating system's entropy source through `getrandom` and never returns a
    partially filled seed. It is not exposed through C FFI or Python; callers
    there use their own source (for example `os.urandom(32)`).

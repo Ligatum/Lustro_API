@@ -37,7 +37,7 @@ cargo build --release --features ffi
 
 ```
 
-All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead of just aborting the process. See ARCHITECTURE.md §13.
+All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead of just aborting the process.
 
 ## Speed Test
 
@@ -364,7 +364,7 @@ lustro_xof_free(twin);
 lustro_xof_free(xof);
 ```
 
-The clone keeps the position inside the current block as well. To clone a batch, see [Batch Clone](#batch-clone).
+The clone keeps the position inside the current block as well.
 
 ---
 
@@ -454,7 +454,9 @@ lustro_xof_free(child);
 lustro_xof_free(xof);
 ```
 
-The same parent state and identifier always give the same child. Reading more bytes from the block the parent is already in does not change the child; moving the parent on to a later block does. The child starts at its own first block and does not inherit the parent's position. For many children at once, see [Batch Fork](#batch-fork).
+The same parent state and identifier always give the same child. Reading more bytes from the block the parent is already in does not change the child; moving the parent on to a later block changes the state it is derived from. The child starts at its own first block and does not inherit the parent's position.
+
+The output block holds the two state words `fork()` derives from, so once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` seeded with that block and the same identifier. Whoever knows the block can derive the children; Lustro makes no cryptographic claim. Two seeds (or parent states) with the same first half, whose second halves differ by the XOR of two identifiers, give the same stream for those identifiers; see [ARCHITECTURE.md](ARCHITECTURE.md), section 3.
 
 ---
 
@@ -1024,7 +1026,7 @@ In Rust, `clone()` aborts the process if the lanes cannot be allocated; `try_clo
 
 ### Batch Fork
 
-Create multiple child streams.
+Create multiple child streams. The parent is not changed.
 
 **Rust**
 
@@ -1352,8 +1354,6 @@ if (err != LUSTRO_ERROR_OK) {
 lustro_xof_free(restored);
 lustro_xof_free(xof);
 ```
-
-For a whole batch, see [Batch Snapshot](#batch-snapshot).
 
 ---
 
