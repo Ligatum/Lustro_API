@@ -646,17 +646,17 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 | `hash128_many(data)`                                      | `data` | 2D `numpy.ndarray`, dtype `uint8`, shape `(n, msg_len)`, rows contiguous (`ValueError` otherwise; `TypeError` for wrong type/dtype) → returns shape `(n, 16)`, dtype `uint8` |
 | `hash128_many_var(messages)`                              | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) → returns shape `(n, 16)`, dtype `uint8` |
 | `LustroPrng(seed, stream_id=0)`                           | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) |
-|                                                           | `stream_id` | Python `int`, `0 ≤ stream_id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`); default `0` |
+|                                                           | `stream_id` | Python `int`, `0 ≤ stream_id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`); default `0` |
 | `LustroPrng.fill(size)`                                   | `size` | Python `int` → returns `bytes` of that length |
 | `LustroPrng.fill_into(buf)`                               | `buf` | writable, C-contiguous buffer of bytes (e.g. `bytearray`, `memoryview`), filled in place to its full length (`TypeError` otherwise) |
 | `LustroPrng.read(size)`                                   | `size` | Python `int`, same as `fill(size)` → returns `bytes` of that length (`OverflowError` if negative; there is no form without `size`) |
 | `LustroPrng.readinto(buf)`                                | `buf` | writable, C-contiguous buffer with any item format (e.g. `bytearray`, `memoryview`, `array('I')`, NumPy array of any dtype), filled in place to its full length with raw stream bytes, without conversion → returns the number of bytes written (not items). `TypeError` for `bytes`, objects without a buffer, read-only or non-contiguous buffers; the stream is not moved then. An empty buffer returns `0` and does not move the stream |
 | `LustroPrng.fill_u64(n)`                                  | `n` | Python `int`, `n >= 0` (`OverflowError` if negative, above `2⁶⁴ - 1`, or if `8 * n` exceeds `isize::MAX`) → returns a new writable `numpy.ndarray`, shape `(n,)`, dtype `uint64`, equal to `n` calls of `next_u64()`. `MemoryError` if the output buffer cannot be allocated; the state is unchanged on these errors, but not if creating the array object fails after generation |
-| `LustroPrng.fork(id)`                                     | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`) |
+| `LustroPrng.fork(id)`                                     | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
 | `LustroPrng.export_snapshot()`                            | — | returns `bytes`, exactly 56 bytes |
 | `LustroPrng.import_snapshot(bytes)`                       | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
 | `LustroPrng.derive_path(seed, path)`                      | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
-|                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`) |
+|                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
 | `LustroPrngBatch(seed, stream_ids)`                       | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) |
 |                                                           | `stream_ids` | Python `list[int]` |
 | `LustroPrngBatch.new_range(seed, first_stream_id, count)` | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
@@ -668,7 +668,7 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 | `LustroPrngBatch.fork_many(ids)`                          | `ids` | Python `list[int]` (`ValueError` if `len() * len(ids)` overflows) |
 | `LustroPrngBatch.fork_range(first)`                       | `first` | Python `int` |
 | `LustroPrngBatch.derive_path(seed, roots, path)`          | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
-|                                                           | `roots`, `path` | Python `list[int]`; `path` non-empty (`ValueError` if empty), `roots` may be empty (empty batch); each id `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
+|                                                           | `roots`, `path` | Python `list[int]`; `path` non-empty (`ValueError` if empty), `roots` may be empty (empty batch); each id `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
 | `LustroPrngBatch.copy()` / `LustroXofBatch.copy()`        | — | returns an independent batch (`MemoryError` if the lanes cannot be allocated); also `copy.copy()` / `copy.deepcopy()` |
 | `LustroPrngBatch.export_snapshot()`                       | — | returns `bytes`, variable length |
 | `LustroPrngBatch.import_snapshot(bytes)`                  | `bytes` | Python `bytes`, variable length (staticmethod) |
@@ -678,11 +678,11 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 | `LustroXof.read(size)`                                    | `size` | Python `int`, same as `fill(size)` → returns `bytes` of that length (`OverflowError` if negative; there is no form without `size`) |
 | `LustroXof.readinto(buf)`                                 | `buf` | writable, C-contiguous buffer with any item format (e.g. `bytearray`, `memoryview`, `array('I')`, NumPy array of any dtype), filled in place to its full length with raw stream bytes, without conversion → returns the number of bytes written (not items). `TypeError` for `bytes`, objects without a buffer, read-only or non-contiguous buffers; the stream is not moved then. An empty buffer returns `0` and does not move the stream |
 | `LustroXof.fill_u64(n)`                                   | `n` | Python `int`, `n >= 0` (`OverflowError` if negative, above `2⁶⁴ - 1`, or if `8 * n` exceeds `isize::MAX`) → returns a new writable `numpy.ndarray`, shape `(n,)`, dtype `uint64`, equal to `n` calls of `next_u64()`. `MemoryError` if the output buffer cannot be allocated; the state is unchanged on these errors, but not if creating the array object fails after generation |
-| `LustroXof.fork(id)`                                      | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`) |
+| `LustroXof.fork(id)`                                      | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
 | `LustroXof.export_snapshot()`                             | — | returns `bytes`, exactly 56 bytes |
 | `LustroXof.import_snapshot(bytes)`                        | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
 | `LustroXof.derive_path(message, path)`                    | `message` | Python `bytes`, any length (staticmethod) |
-|                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`) |
+|                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
 | `LustroXofBatch(messages)`                                | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) |
 | `LustroXofBatch.fill_blocks(out, steps)`                  | `out`, `steps` | writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == len(batch)`; Python `int`. Wrong type → `TypeError`; shape mismatch or non-C-contiguous → `ValueError` |
 | `LustroXofBatch.blocks(steps)`                            | `steps` | Python `int`, `steps >= 0` (`OverflowError` if negative or above `2⁶⁴ - 1`) → returns a new writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, laid out as `fill_blocks` writes it. `ValueError` if the output size overflows, `MemoryError` if the output buffer cannot be allocated; the state is unchanged on these errors, but not if creating the array object fails after generation. A very large `steps` gives `ValueError` also for an empty batch, because NumPy rejects the shape `(steps, 0, 4)` (the limit depends on NumPy; Rust and C return an empty result there) |
@@ -691,14 +691,14 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 | `LustroXofBatch.fork_many(ids)`                           | `ids` | Python `list[int]` (`ValueError` if `len() * len(ids)` overflows) |
 | `LustroXofBatch.fork_range(first)`                        | `first` | Python `int` |
 | `LustroXofBatch.derive_path(messages, path)`              | `messages` | sequence of `bytes` or byte buffers (staticmethod; `TypeError` as for `hash256_many_var`) |
-|                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`ValueError` if negative, `OverflowError` if `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
+|                                                           | `path` | Python `list[int]`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
 | `LustroXofBatch.export_snapshot()`                        | — | returns `bytes`, variable length |
 | `LustroXofBatch.import_snapshot(bytes)`                   | `bytes` | Python `bytes`, variable length (staticmethod) |
 
 **Python-Specific Notes**
 
 - The following methods release the GIL while the underlying Rust computation
-  runs (`py.allow_threads`), allowing other Python threads to run concurrently:
+  runs (`py.detach`), allowing other Python threads to run concurrently:
   `hash256`/`hash128`, `hash256_many`/`hash128_many`, `hash256_many_var`/`hash128_many_var`;
   `LustroPrng`/`LustroXof.fill`, `read`, `fill_u64`; `LustroPrngBatch`/`LustroXofBatch.fill_blocks`, `blocks`.
   **`fill_into()` and `readinto()` do not release the GIL** — they write into the caller's buffer

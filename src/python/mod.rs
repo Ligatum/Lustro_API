@@ -7,7 +7,7 @@ pub mod xof;
 use numpy::{PyArray1, PyArray3, PyArrayMethods};
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PySequence, PyString};
 use std::borrow::Cow;
 
@@ -28,7 +28,7 @@ pub fn lustro_api_version() -> u32 {
 #[pyfunction]
 pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     let info = crate::api::runtime_info();
-    let d = pyo3::types::PyDict::new_bound(py);
+    let d = pyo3::types::PyDict::new(py);
     d.set_item("backend", info.backend)?;
     d.set_item("threads", info.threads)?;
     Ok(d)
@@ -109,7 +109,7 @@ pub(crate) fn fill_buffer(
              (bytearray, memoryview, numpy uint8 array)",
         )
     };
-    let view = pyo3::buffer::PyBuffer::<u8>::get_bound(buf).map_err(|_| bad())?;
+    let view = pyo3::buffer::PyBuffer::<u8>::get(buf).map_err(|_| bad())?;
     if view.readonly() || !view.is_c_contiguous() {
         return Err(bad());
     }
@@ -191,7 +191,7 @@ fn copy_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     let bad = || pyo3::exceptions::PyTypeError::new_err(BYTES_EXPECTED);
     // PyO3 reports a missing buffer and a wrong item format as TypeError/BufferError, which
     // cannot be told apart from the same types raised by an exporter.
-    let view = PyBuffer::<u8>::get_bound(obj).map_err(|e| {
+    let view = PyBuffer::<u8>::get(obj).map_err(|e| {
         let py = obj.py();
         if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
             || e.is_instance_of::<pyo3::exceptions::PyBufferError>(py)
@@ -219,10 +219,29 @@ fn copy_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 // Bytes-like argument (`from_py_with`). `bytes` is borrowed, any other byte buffer is
 // copied, so the data stays valid and unchanged while the GIL is released.
 pub(crate) fn bytes_arg<'a>(obj: &'a Bound<'_, PyAny>) -> PyResult<Cow<'a, [u8]>> {
-    if let Ok(bytes) = obj.downcast::<PyBytes>() {
+    if let Ok(bytes) = obj.cast::<PyBytes>() {
         return Ok(Cow::Borrowed(bytes.as_bytes()));
     }
     copy_buffer(obj).map(Cow::Owned)
+}
+
+// u128 argument (`from_py_with`). A negative int is `OverflowError` on every Python
+// version, PyO3 gives `ValueError` for it on 3.13.
+pub(crate) fn u128_arg(obj: &Bound<'_, PyAny>) -> PyResult<u128> {
+    obj.extract::<u128>().map_err(|e| {
+        let py = obj.py();
+        if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) && obj.lt(0).unwrap_or(false) {
+            pyo3::exceptions::PyOverflowError::new_err("can't convert negative int to unsigned")
+        } else {
+            e
+        }
+    })
+}
+
+// List of u128 ids (`from_py_with`), same rules per item as `u128_arg`.
+pub(crate) fn ids_arg(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u128>> {
+    let items: Vec<Bound<'_, PyAny>> = obj.extract()?;
+    items.iter().map(u128_arg).collect()
 }
 
 // One message of a batch: `bytes` stays referenced, other buffers are copies.
@@ -262,7 +281,7 @@ pub(crate) fn messages_arg<'py>(obj: &Bound<'py, PyAny>) -> PyResult<MessageSeq<
         ));
     }
     let seq = obj
-        .downcast::<PySequence>()
+        .cast::<PySequence>()
         .map_err(|_| type_error("expected a sequence of bytes-like objects"))?;
     Ok(MessageSeq(seq.clone()))
 }
@@ -274,8 +293,8 @@ impl<'py> MessageSeq<'py> {
         items
             .try_reserve_exact(self.0.len()?)
             .map_err(|_| alloc_error())?;
-        for (i, item) in self.0.iter()?.enumerate() {
-            let message = match item?.downcast_into::<PyBytes>() {
+        for (i, item) in self.0.try_iter()?.enumerate() {
+            let message = match item?.cast_into::<PyBytes>() {
                 Ok(bytes) => Message::Bytes(bytes),
                 Err(e) => Message::Copy(copy_buffer(&e.into_inner()).map_err(|err| {
                     if err.is_instance_of::<pyo3::exceptions::PyTypeError>(self.0.py()) {
@@ -318,7 +337,7 @@ pub(crate) fn blocks_to_words(blocks: &[[u8; 32]], words: &mut [u64]) {
 // Without NumPy, using an array panics. Importing the module up front turns that into
 // an ImportError, and for stream calls it happens before the state has moved.
 pub(crate) fn require_numpy(py: Python<'_>) -> PyResult<()> {
-    static IMPORTED: GILOnceCell<()> = GILOnceCell::new();
+    static IMPORTED: PyOnceLock<()> = PyOnceLock::new();
     IMPORTED
         .get_or_try_init(py, || numpy::get_array_module(py).map(|_| ()))
         .map(|_| ())
@@ -362,10 +381,10 @@ pub(crate) fn u64_array<'py>(
         // SAFETY: the byte view covers exactly the memory of `words`; any bit pattern
         // is a valid u8 and u64.
         let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, n * 8) };
-        py.allow_threads(|| fill(bytes));
+        py.detach(|| fill(bytes));
         words_from_le(&mut words);
     }
-    Ok(PyArray1::from_vec_bound(py, words))
+    Ok(PyArray1::from_vec(py, words))
 }
 
 // New uint64 array of shape `(steps, lanes, 4)` laid out as `fill_blocks()` writes it.
@@ -399,8 +418,8 @@ pub(crate) fn blocks_array<'py>(
         // `words` (4 words per block); any bit pattern is valid.
         let view =
             unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut [u8; 32], blocks) };
-        py.allow_threads(|| fill(view));
+        py.detach(|| fill(view));
         words_from_le(&mut words);
     }
-    PyArray1::from_vec_bound(py, words).reshape([steps, lanes, 4])
+    PyArray1::from_vec(py, words).reshape([steps, lanes, 4])
 }

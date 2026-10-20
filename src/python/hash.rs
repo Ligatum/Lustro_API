@@ -34,7 +34,7 @@ impl FlatRows {
     }
 }
 
-// Own copy — can't hold a &[u8] into NumPy's buffer across allow_threads().
+// Own copy — can't hold a &[u8] into NumPy's buffer across detach().
 // Row-contiguous views (a[::2], a[:, :16]) are accepted, `None` if any row is not.
 fn copy_rows(view: ArrayView2<u8>) -> Option<FlatRows> {
     let (n, len) = view.dim();
@@ -64,13 +64,13 @@ fn non_contiguous_error() -> PyErr {
 
 // Digests go straight into the output array buffer.
 fn rows_array<'a, 'py>(data: &'a Bound<'py, PyAny>) -> PyResult<&'a Bound<'py, PyArray2<u8>>> {
-    data.downcast::<PyArray2<u8>>()
+    data.cast::<PyArray2<u8>>()
         .map_err(|_| crate::python::array_type_error("data", "a 2D numpy.ndarray of dtype uint8"))
 }
 
 fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArray2<u8>>> {
     let n = rows.len();
-    let out_arr = PyArray2::<u8>::zeros_bound(py, [n, 32], false);
+    let out_arr = PyArray2::<u8>::zeros(py, [n, 32], false);
     {
         let mut out_rw = out_arr.readwrite();
         let out_slice = out_rw.as_slice_mut().map_err(|_| {
@@ -82,7 +82,7 @@ fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
         let out_blocks: &mut [Hash256] =
             unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash256, n) };
 
-        py.allow_threads(|| hash256_many_into(rows, out_blocks));
+        py.detach(|| hash256_many_into(rows, out_blocks));
     }
     Ok(out_arr)
 }
@@ -90,7 +90,7 @@ fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
 // Digests go straight into the output array buffer.
 fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArray2<u8>>> {
     let n = rows.len();
-    let out_arr = PyArray2::<u8>::zeros_bound(py, [n, 16], false);
+    let out_arr = PyArray2::<u8>::zeros(py, [n, 16], false);
     {
         let mut out_rw = out_arr.readwrite();
         let out_slice = out_rw.as_slice_mut().map_err(|_| {
@@ -102,7 +102,7 @@ fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
         let out_blocks: &mut [Hash128] =
             unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash128, n) };
 
-        py.allow_threads(|| hash128_many_into(rows, out_blocks));
+        py.detach(|| hash128_many_into(rows, out_blocks));
     }
     Ok(out_arr)
 }
@@ -117,10 +117,10 @@ fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
 #[pyo3(name = "hash256")]
 pub fn hash256_py<'py>(
     py: Python<'py>,
-    #[pyo3(from_py_with = "bytes_arg")] data: Cow<'_, [u8]>,
+    #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
 ) -> Bound<'py, PyBytes> {
-    let result = py.allow_threads(|| hash256_impl(&data));
-    PyBytes::new_bound(py, result.as_bytes())
+    let result = py.detach(|| hash256_impl(&data));
+    PyBytes::new(py, result.as_bytes())
 }
 
 /// 128-bit digest of `data` (bytes or a byte buffer of any length) as 16 bytes.
@@ -129,10 +129,10 @@ pub fn hash256_py<'py>(
 #[pyo3(name = "hash128")]
 pub fn hash128_py<'py>(
     py: Python<'py>,
-    #[pyo3(from_py_with = "bytes_arg")] data: Cow<'_, [u8]>,
+    #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
 ) -> Bound<'py, PyBytes> {
-    let result = py.allow_threads(|| hash128_impl(&data));
-    PyBytes::new_bound(py, result.as_bytes())
+    let result = py.detach(|| hash128_impl(&data));
+    PyBytes::new(py, result.as_bytes())
 }
 
 // ==========================================
@@ -189,7 +189,7 @@ pub fn hash128_many_py<'py>(
 #[pyo3(name = "hash256_many_var")]
 pub fn hash256_many_var_py<'py>(
     py: Python<'py>,
-    #[pyo3(from_py_with = "messages_arg")] messages: MessageSeq<'py>,
+    #[pyo3(from_py_with = messages_arg)] messages: MessageSeq<'py>,
 ) -> PyResult<Bound<'py, PyArray2<u8>>> {
     require_numpy(py)?;
     let messages = messages.load()?;
@@ -203,7 +203,7 @@ pub fn hash256_many_var_py<'py>(
 #[pyo3(name = "hash128_many_var")]
 pub fn hash128_many_var_py<'py>(
     py: Python<'py>,
-    #[pyo3(from_py_with = "messages_arg")] messages: MessageSeq<'py>,
+    #[pyo3(from_py_with = messages_arg)] messages: MessageSeq<'py>,
 ) -> PyResult<Bound<'py, PyArray2<u8>>> {
     require_numpy(py)?;
     let messages = messages.load()?;

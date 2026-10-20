@@ -87,7 +87,7 @@ impl StepsPolicy {
 
 const SCALAR_STEPS: StepsPolicy = StepsPolicy {
     table: &[(95, 16), (111, 12)],
-    tail: 32,
+    tail: 1,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -106,7 +106,7 @@ const AVX2_STEPS: StepsPolicy = StepsPolicy {
         (118_000, 2),
         (180_000, 1),
     ],
-    tail: 32,
+    tail: 1,
 };
 
 // ==========================================

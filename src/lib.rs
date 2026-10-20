@@ -48,7 +48,7 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_py, m)?)?;
     m.add(
         "SnapshotError",
-        m.py().get_type_bound::<python::SnapshotError>(),
+        m.py().get_type::<python::SnapshotError>(),
     )?;
     m.add_class::<python::prng::LustroPrngPy>()?;
     m.add_class::<python::prng::LustroPrngBatchPy>()?;

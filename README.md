@@ -26,7 +26,7 @@ cargo build --release --features entropy
 
 cargo build --release --features rand
 
-# Python (requires NumPy)
+# Python 3.9-3.13 (requires NumPy)
 
 pip install maturin numpy
 maturin develop --release

@@ -24,8 +24,8 @@ rand    = ["dep:rand_core", "entropy"]
 entropy = ["dep:getrandom"]
 
 [dependencies]
-pyo3   = { version = "0.22", features = ["extension-module"], optional = true }
-numpy  = { version = "0.22", optional = true }
+pyo3   = { version = "0.29", features = ["extension-module"], optional = true }
+numpy  = { version = "0.29", optional = true }
 rayon  = { version = "1.10", optional = true }
 rand_core = { version = "0.10", optional = true }
 getrandom = { version = "0.4", features = ["std"], optional = true }

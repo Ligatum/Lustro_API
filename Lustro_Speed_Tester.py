@@ -1,8 +1,10 @@
 """
 lustro.dll speed test (ctypes), normalized per engine round. lustro.dll must be in the same directory.
 Batch calls use the `steps` suggested by the library for the given N.
+Multi-stream sections run one single stream per process and report the aggregate.
 """
 
+import array
 import ctypes
 import multiprocessing
 import os
@@ -16,8 +18,9 @@ import time
 MIN_TIME = 1.0
 MIN_ITERS = 100
 
-# Spread over single-thread, pool, cache-resident and memory-bound batches.
-BATCH_SIZES = [64, 256, 1024, 4096, 16384, 65536, 131072, 196608]
+# Output per call = N * steps * 32 B (Batch size column). The largest sizes are meant to
+# go past L3.
+BATCH_SIZES = [64, 256, 1024, 4096, 16384, 65536, 131072, 196608, 1 << 20]
 
 # Exact multiple of 32 B: no terminator round (absorb_with_domain, api.rs).
 HASH_MSG_LEN_BASELINE = 32
@@ -34,6 +37,13 @@ HASH_SWEEP_N = 16384
 # are dominated by call overhead.
 SINGLE_HASH_LENGTHS = [32, 1024, 65536, 1 << 20]
 SINGLE_FILL_SIZES = [4096, 65536, 1 << 20, 16 << 20]
+
+# Multi-stream: one stream and one buffer per process. 64 KiB is cache-resident, 16 MiB is not.
+# Memory use ~ procs * size.
+MULTI_FILL_SIZES = [64 << 10, 16 << 20]
+MULTI_TIME = 2.0
+MULTI_WARMUP = 0.2
+MULTI_BARRIER_TIMEOUT = 120.0
 
 
 def hash_rounds_for_len(msg_len: int) -> int:
@@ -54,6 +64,17 @@ HW_THREADS = os.cpu_count() or 1
 DLL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lustro.dll")
 
 ENV_VARS = ("LUSTRO_DISABLE_MT", "LUSTRO_DISABLE_SIMD", "LUSTRO_NUM_THREADS")
+
+
+def proc_counts():
+    """1, 2, 4, ... below HW_THREADS, then HW_THREADS itself."""
+    counts = []
+    t = 1
+    while t < HW_THREADS:
+        counts.append(t)
+        t *= 2
+    counts.append(HW_THREADS)
+    return counts
 
 
 # =========================================================
@@ -108,6 +129,25 @@ def summarize(times, n_elements, rounds_per_elem, total_bytes):
     }
 
 
+def summarize_multi(results, size):
+    """
+    results: one {"calls", "elapsed"} per process. Aggregate rate is the sum of the
+    per-process rates, each over its own timed window.
+    """
+    rounds_per_call = size // 32
+    rates = [r["calls"] * rounds_per_call / r["elapsed"] for r in results]
+    agg = sum(rates)
+    return {
+        "procs": len(results),
+        "agg_rps": agg,
+        "rounds_total": sum(r["calls"] for r in results) * rounds_per_call,
+        "gib_s": agg * 32 / (1024 ** 3),
+        "ns_agg": 1e9 / agg,
+        "ns_proc": sum(1e9 / r for r in rates) / len(rates),
+        "min_max": min(rates) / max(rates),
+    }
+
+
 COL = {
     "pipeline": 13,
     "size": 10,
@@ -121,13 +161,36 @@ COL = {
 }
 WIDTH = sum(COL.values()) + 3 * (len(COL) - 1)
 
+COL_MULTI = {
+    "pipeline": 10,
+    "size": 10,
+    "procs": 6,
+    "rounds": 12,
+    "tp": 12,
+    "ns_agg": 12,
+    "ns_proc": 12,
+    "scale": 8,
+    "minmax": 8,
+}
+WIDTH_MULTI = sum(COL_MULTI.values()) + 3 * (len(COL_MULTI) - 1)
+
 
 def make_header():
     return (
         f"{'Pipeline':<{COL['pipeline']}} | {'Batch size':<{COL['size']}} | "
         f"{'N':<{COL['n']}} | {'Steps':>{COL['steps']}} | {'Rounds':>{COL['rounds']}} | "
         f"{'p50 (ms)':>{COL['p50']}} | {'p95 (ms)':>{COL['p95']}} | "
-        f"{'Throughput':>{COL['tp']}} | {'ns/round':>{COL['ns']}}"
+        f"{'Data rate':>{COL['tp']}} | {'ns/round':>{COL['ns']}}"
+    )
+
+
+def make_multi_header():
+    return (
+        f"{'Pipeline':<{COL_MULTI['pipeline']}} | {'Size/call':<{COL_MULTI['size']}} | "
+        f"{'Procs':>{COL_MULTI['procs']}} | {'Rounds':>{COL_MULTI['rounds']}} | "
+        f"{'Data rate':>{COL_MULTI['tp']}} | {'ns/round agg':>{COL_MULTI['ns_agg']}} | "
+        f"{'ns/round proc':>{COL_MULTI['ns_proc']}} | {'Scaling':>{COL_MULTI['scale']}} | "
+        f"{'Min/Max':>{COL_MULTI['minmax']}}"
     )
 
 
@@ -139,6 +202,19 @@ def print_row(label, n, steps, size_bytes, data):
         f"{n:<{COL['n']}} | {steps_str:>{COL['steps']}} | {data['rounds_total']:>{COL['rounds']}} | "
         f"{data['p50_ms']:>{COL['p50']}.4f} | {data['p95_ms']:>{COL['p95']}.4f} | "
         f"{tp_str:>{COL['tp']}} | {data['ns_per_round']:>{COL['ns']}.2f}"
+    )
+
+
+def print_multi_row(label, size_bytes, data, scaling):
+    tp_str = f"{data['gib_s']:.2f} GiB/s"
+    scale_str = f"{scaling * 100:.0f}%"
+    minmax_str = f"{data['min_max'] * 100:.0f}%"
+    print(
+        f"{label:<{COL_MULTI['pipeline']}} | {format_size(size_bytes):<{COL_MULTI['size']}} | "
+        f"{data['procs']:>{COL_MULTI['procs']}} | {data['rounds_total']:>{COL_MULTI['rounds']}} | "
+        f"{tp_str:>{COL_MULTI['tp']}} | {data['ns_agg']:>{COL_MULTI['ns_agg']}.2f} | "
+        f"{data['ns_proc']:>{COL_MULTI['ns_proc']}.2f} | {scale_str:>{COL_MULTI['scale']}} | "
+        f"{minmax_str:>{COL_MULTI['minmax']}}"
     )
 
 
@@ -216,6 +292,17 @@ def u8_buf(data: bytes):
     return (ctypes.c_uint8 * n).from_buffer_copy(data) if n else (ctypes.c_uint8 * 0)()
 
 
+def open_single(lib, kind):
+    """Single PRNG or XOF stream: (ctx, fill, free, fill_name)."""
+    if kind == "PRNG":
+        seed = u8_buf(bytes(range(32)))
+        ctx = new_ctx(lib.lustro_prng_new, seed, 0, 0)
+        return ctx, lib.lustro_prng_fill, lib.lustro_prng_free, "lustro_prng_fill"
+    msg = u8_buf(b"m0")
+    ctx = new_ctx(lib.lustro_xof_new, msg, 2)
+    return ctx, lib.lustro_xof_fill, lib.lustro_xof_free, "lustro_xof_fill"
+
+
 # =========================================================
 # WORKERS
 # =========================================================
@@ -270,19 +357,7 @@ def fill_single_worker(kind, size, q):
     """
     try:
         lib = load_lib()
-
-        if kind == "PRNG":
-            seed = u8_buf(bytes(range(32)))
-            ctx = new_ctx(lib.lustro_prng_new, seed, 0, 0)
-            fill = lib.lustro_prng_fill
-            free = lib.lustro_prng_free
-            fill_name = "lustro_prng_fill"
-        else:
-            msg = u8_buf(b"m0")
-            ctx = new_ctx(lib.lustro_xof_new, msg, 2)
-            fill = lib.lustro_xof_fill
-            free = lib.lustro_xof_free
-            fill_name = "lustro_xof_fill"
+        ctx, fill, free, fill_name = open_single(lib, kind)
 
         try:
             out = (ctypes.c_uint8 * size)()
@@ -302,12 +377,60 @@ def fill_single_worker(kind, size, q):
         q.put({"error": repr(e)})
 
 
+def multi_fill_worker(kind, size, barrier, q):
+    """
+    One process of the multi-stream test: own stream, own buffer. All processes
+    start the timed window together (barrier) and fill for MULTI_TIME.
+    """
+    try:
+        lib = load_lib()
+        ctx, fill, free, fill_name = open_single(lib, kind)
+
+        try:
+            out = (ctypes.c_uint8 * size)()
+            out_ptr = ctypes.cast(out, U8P)
+
+            def call():
+                err = fill(ctx, out_ptr, size)
+                if err != 0:
+                    raise RuntimeError(f"{fill_name} returned error {err}")
+
+            warm_end = time.perf_counter() + MULTI_WARMUP
+            call()
+            while time.perf_counter() < warm_end:
+                call()
+
+            barrier.wait(timeout=MULTI_BARRIER_TIMEOUT)
+
+            calls = 0
+            start = time.perf_counter()
+            deadline = start + MULTI_TIME
+            while True:
+                call()
+                calls += 1
+                now = time.perf_counter()
+                if now >= deadline:
+                    break
+            q.put({"calls": calls, "elapsed": now - start})
+        finally:
+            free(ctx)
+    except Exception as e:
+        try:
+            barrier.abort()
+        except Exception:
+            pass
+        q.put({"error": repr(e)})
+
+
 def _make_xof_batch(lib, n):
-    messages = [f"m{i}".encode() for i in range(n)]
-    bufs = [u8_buf(m) for m in messages]  # keep alive until lustro_xof_batch_new returns
-    ptr_array = (U8P * n)(*[ctypes.cast(b, U8P) for b in bufs])
-    len_array = (SizeT * n)(*[len(m) for m in messages])
-    return new_ctx(lib.lustro_xof_batch_new, ptr_array, len_array, n)
+    # One flat buffer of n fixed 8 B messages; pointers are offsets into it.
+    blob = u8_buf(array.array("Q", range(n)).tobytes())
+    base = ctypes.addressof(blob)
+    ptr_array = (SizeT * n)(*range(base, base + 8 * n, 8))
+    len_array = (SizeT * n)(*([8] * n))
+    return new_ctx(
+        lib.lustro_xof_batch_new, ctypes.cast(ptr_array, ctypes.POINTER(U8P)), len_array, n
+    )
 
 
 def stream_batch_worker(kind, n, q):
@@ -378,6 +501,40 @@ def run_worker(func, args):
     return res
 
 
+def run_multi(kind, size, procs):
+    """Runs `procs` multi_fill_worker processes together, returns their results."""
+    barrier = multiprocessing.Barrier(procs)
+    q = multiprocessing.Queue()
+    workers = [
+        multiprocessing.Process(target=multi_fill_worker, args=(kind, size, barrier, q))
+        for _ in range(procs)
+    ]
+    for p in workers:
+        p.start()
+
+    results = []
+    while len(results) < procs:
+        try:
+            results.append(q.get(timeout=1.0))
+        except queue.Empty:
+            if not any(p.is_alive() for p in workers):
+                try:
+                    results.append(q.get(timeout=1.0))
+                except queue.Empty:
+                    break
+    for p in workers:
+        p.join()
+
+    if len(results) < procs:
+        raise RuntimeError(f"multi worker: {len(results)} of {procs} processes reported")
+    # A broken barrier is a consequence; report the original error.
+    errors = [r["error"] for r in results if "error" in r]
+    if errors:
+        primary = [e for e in errors if "BrokenBarrierError" not in e] or errors
+        raise RuntimeError(f"multi worker returned error: {primary[0]}")
+    return results
+
+
 # =========================================================
 # PIPELINE SECTIONS: one per menu entry, each prints its own table.
 # =========================================================
@@ -438,6 +595,27 @@ def make_stream_section(kind):
     return section
 
 
+def make_multi_section(kind):
+    def section(hdr):
+        title = (
+            f"{kind}_FILL x N PROCESSES  (one single stream per process, aggregate; "
+            f"{MULTI_TIME:g} s window)"
+        )
+        print(f"\n{title:^{WIDTH_MULTI}}")
+        print(make_multi_header())
+        print("-" * WIDTH_MULTI)
+        for size in MULTI_FILL_SIZES:
+            base = None
+            for procs in proc_counts():
+                data = summarize_multi(run_multi(kind, size, procs), size)
+                if base is None:
+                    base = data["agg_rps"]
+                scaling = data["agg_rps"] / (procs * base)
+                print_multi_row(f"{kind}_MULTI", size, data, scaling)
+            print("-" * WIDTH_MULTI)
+    return section
+
+
 SECTIONS = {
     1: ("HASH256_MANY (baseline, msg_len=32)", section_hash_baseline),
     2: ("HASH256_MANY message-length sweep", section_hash_sweep),
@@ -446,6 +624,8 @@ SECTIONS = {
     5: ("HASH256 (single message)", section_hash_single),
     6: ("PRNG_FILL (single stream)", make_fill_single_section("PRNG")),
     7: ("XOF_FILL (single stream)", make_fill_single_section("XOF")),
+    8: ("PRNG_FILL (many single streams, one per process)", make_multi_section("PRNG")),
+    9: ("XOF_FILL (many single streams, one per process)", make_multi_section("XOF")),
 }
 LAST_SECTION = max(SECTIONS)
 
@@ -493,34 +673,38 @@ def main():
 
     choice = prompt_selection()
     hdr = make_header()
+    width = max(WIDTH, WIDTH_MULTI)
 
-    print("=" * WIDTH)
-    print(f"{'LUSTRO.DLL -- BATCH SPEED TEST (normalized per round)':^{WIDTH}}")
-    print(f"{'DLL: ' + DLL_PATH:^{WIDTH}}")
-    print(f"{'HW logical threads: ' + str(HW_THREADS):^{WIDTH}}")
+    print("=" * width)
+    print(f"{'LUSTRO.DLL -- SPEED TEST (normalized per round)':^{width}}")
+    print(f"{'DLL: ' + DLL_PATH:^{width}}")
+    print(f"{'HW logical threads: ' + str(HW_THREADS):^{width}}")
     env = [f"{k}={os.environ[k]}" for k in ENV_VARS if k in os.environ]
     if env:
-        print(f"{'Env: ' + ' '.join(env):^{WIDTH}}")
+        print(f"{'Env: ' + ' '.join(env):^{width}}")
     if choice == 0:
-        print(f"{'Running: ALL sections':^{WIDTH}}")
+        print(f"{'Running: ALL sections':^{width}}")
     else:
-        print(f"{'Running: section ' + str(choice) + ' - ' + SECTIONS[choice][0]:^{WIDTH}}")
-    print("=" * WIDTH)
+        print(f"{'Running: section ' + str(choice) + ' - ' + SECTIONS[choice][0]:^{width}}")
+    print("=" * width)
 
     sections_to_run = range(1, LAST_SECTION + 1) if choice == 0 else [choice]
     for i in sections_to_run:
         _, fn = SECTIONS[i]
         fn(hdr)
 
-    if choice == 0:
-        print("\n" + "=" * WIDTH)
-        print(
-            "ns/round is normalized per engine round, so it compares across tables.\n"
-            "Steps is the value suggested by the library for that N.\n"
-            "Single-instance rows (HASH256, *_FILL) include ctypes call overhead; compare\n"
-            "them only at large sizes."
-        )
-        print("=" * WIDTH)
+    print("\n" + "=" * width)
+    print(
+        "ns/round is per engine round, comparable across tables.\n"
+        "Data rate: input bytes for HASH rows, output bytes for stream rows.\n"
+        "Steps: value suggested by the library for that N.\n"
+        "Small calls (N=64, small sizes) and single-instance rows (HASH256, *_FILL)\n"
+        "include ctypes call overhead.\n"
+        "Multi-stream: ns/round agg = wall time per round over all procs, ns/round proc = mean\n"
+        "per proc, Scaling = agg / (procs * agg at 1 proc), Min/Max = slowest / fastest proc.\n"
+        "Procs are logical threads, SMT and clocks lower Scaling above the physical core count."
+    )
+    print("=" * width)
 
 
 if __name__ == "__main__":

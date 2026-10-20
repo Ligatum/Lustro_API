@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
-use crate::python::bytes_arg;
+use crate::python::{bytes_arg, ids_arg, u128_arg};
 use crate::types::{Seed256, StreamId};
 
 // ==========================================
@@ -32,8 +32,8 @@ impl LustroPrngPy {
     #[new]
     #[pyo3(signature = (seed, stream_id=0))]
     pub fn new(
-        #[pyo3(from_py_with = "bytes_arg")] seed: Cow<'_, [u8]>,
-        stream_id: u128,
+        #[pyo3(from_py_with = bytes_arg)] seed: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = u128_arg)] stream_id: u128,
     ) -> PyResult<Self> {
         if seed.len() != 32 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -63,7 +63,7 @@ impl LustroPrngPy {
 
     /// Next full 32-byte block. Unread bytes of the current block are discarded.
     pub fn next_block<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new_bound(py, &self.inner.next_block())
+        PyBytes::new(py, &self.inner.next_block())
     }
 
     /// Returns the next `size` bytes of the stream. The GIL is released while generating.
@@ -76,8 +76,8 @@ impl LustroPrngPy {
                 "size exceeds isize::MAX",
             ));
         }
-        PyBytes::new_bound_with(py, size, |buf| {
-            py.allow_threads(|| self.inner.fill_bytes(buf));
+        PyBytes::new_with(py, size, |buf| {
+            py.detach(|| self.inner.fill_bytes(buf));
             Ok(())
         })
         .map_err(|e| {
@@ -145,7 +145,7 @@ impl LustroPrngPy {
 
     /// Derives a child generator from the current state and `id`.
     /// The parent is not advanced.
-    pub fn fork(&self, id: u128) -> Self {
+    pub fn fork(&self, #[pyo3(from_py_with = u128_arg)] id: u128) -> Self {
         Self {
             inner: self.inner.fork(StreamId(id)),
         }
@@ -156,8 +156,8 @@ impl LustroPrngPy {
     /// `path` must not be empty (ValueError).
     #[staticmethod]
     pub fn derive_path(
-        #[pyo3(from_py_with = "bytes_arg")] seed: Cow<'_, [u8]>,
-        path: Vec<u128>,
+        #[pyo3(from_py_with = bytes_arg)] seed: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = ids_arg)] path: Vec<u128>,
     ) -> PyResult<Self> {
         if seed.len() != 32 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -184,14 +184,14 @@ impl LustroPrngPy {
     /// Exports the current state as 56 bytes.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
-        PyBytes::new_bound(py, &snapshot.to_le_bytes())
+        PyBytes::new(py, &snapshot.to_le_bytes())
     }
 
     /// Restores a generator from `export_snapshot()` bytes.
     /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or cursor.
     #[staticmethod]
     pub fn import_snapshot(
-        #[pyo3(from_py_with = "bytes_arg")] bytes: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = bytes_arg)] bytes: Cow<'_, [u8]>,
     ) -> PyResult<Self> {
         let array_ref: &[u8; 56] = (&*bytes).try_into().map_err(|_| {
             crate::python::SnapshotError::new_err("snapshot must be exactly 56 bytes")
@@ -230,8 +230,8 @@ impl LustroPrngBatchPy {
     /// `seed` must be exactly 32 bytes (ValueError otherwise).
     #[new]
     pub fn new(
-        #[pyo3(from_py_with = "bytes_arg")] seed: Cow<'_, [u8]>,
-        stream_ids: Vec<u128>,
+        #[pyo3(from_py_with = bytes_arg)] seed: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = ids_arg)] stream_ids: Vec<u128>,
     ) -> PyResult<Self> {
         if seed.len() != 32 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -251,8 +251,8 @@ impl LustroPrngBatchPy {
     /// (modulo 2**128). Raises MemoryError if the lanes cannot be allocated.
     #[staticmethod]
     pub fn new_range(
-        #[pyo3(from_py_with = "bytes_arg")] seed: Cow<'_, [u8]>,
-        first_stream_id: u128,
+        #[pyo3(from_py_with = bytes_arg)] seed: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = u128_arg)] first_stream_id: u128,
         count: usize,
     ) -> PyResult<Self> {
         if seed.len() != 32 {
@@ -366,7 +366,7 @@ impl LustroPrngBatchPy {
         steps: usize,
     ) -> PyResult<()> {
         crate::python::require_numpy(py)?;
-        let out = out.downcast::<PyArray3<u64>>().map_err(|_| {
+        let out = out.cast::<PyArray3<u64>>().map_err(|_| {
             crate::python::array_type_error("out", "a 3D numpy.ndarray of dtype uint64")
         })?;
         // Read before borrowing: `try_readwrite` itself does not touch the data.
@@ -397,7 +397,7 @@ impl LustroPrngBatchPy {
             ));
         }
 
-        // Validate contiguity first; the scope drops the borrow before allow_threads.
+        // Validate contiguity first; the scope drops the borrow before detach.
         {
             let mut out_arr = out.as_array_mut();
             if out_arr.as_slice_mut().is_none() {
@@ -417,7 +417,7 @@ impl LustroPrngBatchPy {
         }
         let buf = &mut self.blocks_buf[..needed];
 
-        py.allow_threads(|| self.inner.fill_blocks(buf, steps));
+        py.detach(|| self.inner.fill_blocks(buf, steps));
 
         // Step-major blocks map 1:1 onto the C-contiguous (steps, n, 4) output.
         // Re-borrow the output after the GIL is reacquired.
@@ -433,7 +433,7 @@ impl LustroPrngBatchPy {
     }
 
     /// Derives one child per lane; `len(ids)` must equal `len(self)` (ValueError).
-    pub fn fork(&self, ids: Vec<u128>) -> PyResult<Self> {
+    pub fn fork(&self, #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>) -> PyResult<Self> {
         if ids.len() != self.inner.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "ids length must match batch stream count",
@@ -449,7 +449,7 @@ impl LustroPrngBatchPy {
 
     /// Derives `len(ids)` children per lane. Parent-major order:
     /// child `j` of lane `i` is lane `i * len(ids) + j` of the result.
-    pub fn fork_many(&self, ids: Vec<u128>) -> PyResult<Self> {
+    pub fn fork_many(&self, #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>) -> PyResult<Self> {
         self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")
         })?;
@@ -470,9 +470,9 @@ impl LustroPrngBatchPy {
     /// Raises MemoryError if the lanes cannot be allocated.
     #[staticmethod]
     pub fn derive_path(
-        #[pyo3(from_py_with = "bytes_arg")] seed: Cow<'_, [u8]>,
-        roots: Vec<u128>,
-        path: Vec<u128>,
+        #[pyo3(from_py_with = bytes_arg)] seed: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = ids_arg)] roots: Vec<u128>,
+        #[pyo3(from_py_with = ids_arg)] path: Vec<u128>,
     ) -> PyResult<Self> {
         if seed.len() != 32 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -496,7 +496,7 @@ impl LustroPrngBatchPy {
     }
 
     /// Derives one child per lane with ids `first`, `first + 1`, ... (modulo 2**128).
-    pub fn fork_range(&self, first: u128) -> Self {
+    pub fn fork_range(&self, #[pyo3(from_py_with = u128_arg)] first: u128) -> Self {
         let inner = self.inner.fork_range(StreamId(first));
         Self {
             inner,
@@ -507,14 +507,14 @@ impl LustroPrngBatchPy {
     /// Exports the current state as `16 + len(self) * 48` bytes.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
-        PyBytes::new_bound(py, &snapshot.to_le_bytes())
+        PyBytes::new(py, &snapshot.to_le_bytes())
     }
 
     /// Restores a batch from `export_snapshot()` bytes.
     /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or lane count.
     #[staticmethod]
     pub fn import_snapshot(
-        #[pyo3(from_py_with = "bytes_arg")] bytes: Cow<'_, [u8]>,
+        #[pyo3(from_py_with = bytes_arg)] bytes: Cow<'_, [u8]>,
     ) -> PyResult<Self> {
         let snapshot = crate::types::LustroPrngBatchSnapshot::from_le_bytes(&bytes)
             .map_err(crate::python::snapshot_error)?;
