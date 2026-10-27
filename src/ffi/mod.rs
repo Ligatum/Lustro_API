@@ -109,7 +109,8 @@ pub(crate) fn options_from_c(threads: usize, simd: i32) -> Result<RuntimeOptions
 /// 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
 /// `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
 ///
-/// Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. Later calls
+/// Fixed once, by an earlier call, a batch call, `*_batch_suggested_steps` or
+/// `lustro_runtime_*`. Later calls
 /// return `ALREADY_CONFIGURED`, also with identical arguments. Unknown `simd` returns
 /// `INVALID_ARGUMENT` and changes nothing.
 #[no_mangle]

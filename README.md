@@ -1,5 +1,7 @@
 **Please note the API is currently in its beta stage. I'm still working on a list of functionality updates.**
 
+**Edit: 27.10.26. I will be uploading a breaking change patch in the coming week or two at most. It'll be the only one before going out of beta. Lustro 1.0.1 will be the initial post-beta release.**
+
 # Lustro API
 
 Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
@@ -282,7 +284,7 @@ In Rust, `LustroPrng` and `LustroXof` also implement `std::io::Read`. `read` fil
 
 ### Clone
 
-Copy a stream with its exact state. The copy is independent: both continue with the same bytes, and neither affects the other.
+Copy a stream with its exact state. The copy is independent: both continue with the same bytes, and neither affects the other. The clone keeps the position inside the current block as well.
 
 **Rust**
 
@@ -363,8 +365,6 @@ lustro_xof_clone(xof, &twin);
 lustro_xof_free(twin);
 lustro_xof_free(xof);
 ```
-
-The clone keeps the position inside the current block as well.
 
 ---
 
@@ -538,6 +538,8 @@ every identifier in `path` is a `fork`, since the message already is the root.
 
 Many independent streams in one object, for PRNG and XOF alike.
 
+A PRNG or XOF batch produces output in steps: `fill_blocks(out, steps)` writes `steps` blocks for every stream. `steps` only sets how much one call produces. The same total split over several calls gives every stream the same blocks. `suggested_steps()` returns a `steps` chosen for speed at the current number of streams and backend (`LUSTRO_DISABLE_SIMD` can change it). It is a hint only: any `steps` gives correct output. The output holds `len() * steps` blocks, so with many streams check its size before allocating.
+
 ### Batch Hash
 
 Hash many messages in one call.
@@ -602,7 +604,7 @@ let seed = Seed256::from_bytes([0u8; 32]);
 let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
 let mut prng = LustroPrngBatch::new(&seed, &ids);
 
-let steps = 2;
+let steps = prng.suggested_steps(); // or a fixed number, e.g. 2
 let mut out = vec![[0u8; 32]; prng.len() * steps];
 prng.fill_blocks(&mut out, steps);
 
@@ -617,7 +619,7 @@ use lustro::LustroXofBatch;
 let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
 let mut xof = LustroXofBatch::new(&messages);
 
-let steps = 2;
+let steps = xof.suggested_steps(); // or a fixed number, e.g. 2
 let mut out = vec![[0u8; 32]; xof.len() * steps];
 xof.fill_blocks(&mut out, steps);
 
@@ -633,7 +635,7 @@ from lustro import LustroPrngBatch
 
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
 
-steps = 2
+steps = prng.suggested_steps()  # or a fixed number, e.g. 2
 out = np.empty((steps, len(prng), 4), dtype=np.uint64)
 prng.fill_blocks(out, steps)
 
@@ -648,7 +650,7 @@ from lustro import LustroXofBatch
 
 xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
 
-steps = 2
+steps = xof.suggested_steps()  # or a fixed number, e.g. 2
 out = np.empty((steps, len(xof), 4), dtype=np.uint64)
 xof.fill_blocks(out, steps)
 
@@ -657,10 +659,13 @@ more = xof.blocks(steps)
 
 `fill_blocks(out, steps)` writes one 32-byte block per stream per step, step-major: stream `i` at step `s` is block `s * n + i` (`n` = number of streams). In Python that is `out[s, i]`, with `out` shaped `(steps, n_streams, 4)`; each block is four `uint64` values. `blocks(steps)` (Rust and Python) returns the same blocks in a newly allocated result: a `Vec<[u8; 32]>` in Rust, a new, writable array of that shape in Python.
 
+In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call; `release_buffer()` frees it earlier. `blocks()` does not use that buffer.
+
 **C / C++**
 
 ```c
 /* PRNG */
+#include <stdlib.h>
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -671,118 +676,7 @@ uint64_t ids_lo[4] = {0, 1, 2, 3};
 LustroPrngBatch *prng = NULL;
 lustro_prng_batch_new(seed, ids_hi, ids_lo, 4, &prng);
 
-#define STEPS 2
-
-uint8_t out[STEPS][4][LUSTRO_BLOCK_LEN];
-lustro_prng_batch_fill_blocks(
-    prng, (uint8_t *)out, sizeof(out), STEPS
-);
-
-lustro_prng_batch_free(prng);
-```
-
-```c
-/* XOF */
-#include "lustro.h"
-
-const uint8_t *messages[] = {
-    (const uint8_t *)"msg0",
-    (const uint8_t *)"msg1",
-    (const uint8_t *)"msg2"
-};
-uintptr_t lengths[] = {4, 4, 4};
-
-LustroXofBatch *xof = NULL;
-lustro_xof_batch_new(messages, lengths, 3, &xof);
-
-#define STEPS 2
-
-uint8_t out[STEPS][3][LUSTRO_BLOCK_LEN];
-lustro_xof_batch_fill_blocks(
-    xof, (uint8_t *)out, sizeof(out), STEPS
-);
-
-lustro_xof_batch_free(xof);
-```
-
-In C/C++, `lustro_batch_block_offset(step, batch_len, lane)` from `lustro.h` gives the byte offset of one block in the output: `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`. It expects `step < steps` and `lane < batch_len` and does not check its arguments.
-
-````c
-/* lane 2 at step 1 of the PRNG output above */
-const uint8_t *block = (const uint8_t *)out + lustro_batch_block_offset(1, 4, 2);
-````
-
----
-
-### Batch Suggested Steps
-
-`suggested_steps()` returns a recommended `steps` for the current number of streams. It is a speed hint only: it does not change the output or the state of the batch, and the bytes of each stream do not depend on how the steps are split across calls.
-
-**Rust**
-
-```rust
-// PRNG
-use lustro::{LustroPrngBatch, Seed256, StreamId};
-
-let seed = Seed256::from_bytes([0u8; 32]);
-let ids = [StreamId(0), StreamId(1), StreamId(2), StreamId(3)];
-let mut prng = LustroPrngBatch::new(&seed, &ids);
-
-let steps = prng.suggested_steps();
-let mut out = vec![[0u8; 32]; prng.len() * steps];
-prng.fill_blocks(&mut out, steps);
-```
-
-```rust
-// XOF
-use lustro::LustroXofBatch;
-
-let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
-let mut xof = LustroXofBatch::new(&messages);
-
-let steps = xof.suggested_steps();
-let mut out = vec![[0u8; 32]; xof.len() * steps];
-xof.fill_blocks(&mut out, steps);
-```
-
-**Python**
-
-```python
-# PRNG
-import numpy as np
-from lustro import LustroPrngBatch
-
-prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
-
-steps = prng.suggested_steps()
-out = np.empty((steps, len(prng), 4), dtype=np.uint64)
-prng.fill_blocks(out, steps)
-```
-
-```python
-# XOF
-import numpy as np
-from lustro import LustroXofBatch
-
-xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
-
-steps = xof.suggested_steps()
-out = np.empty((steps, len(xof), 4), dtype=np.uint64)
-xof.fill_blocks(out, steps)
-```
-
-**C / C++**
-
-```c
-/* PRNG */
-#include <stdlib.h>
-#include "lustro.h"
-
-uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrngBatch *prng = NULL;
-lustro_prng_batch_new_range(seed, 0, 0, 4, &prng);
-
-size_t steps = lustro_prng_batch_suggested_steps(prng);
+size_t steps = lustro_prng_batch_suggested_steps(prng);  /* or a fixed number, e.g. 2 */
 size_t out_len = steps * lustro_prng_batch_len(prng) * LUSTRO_BLOCK_LEN;
 uint8_t *out = (uint8_t *)malloc(out_len);
 
@@ -807,7 +701,7 @@ uintptr_t lengths[] = {4, 4, 4};
 LustroXofBatch *xof = NULL;
 lustro_xof_batch_new(messages, lengths, 3, &xof);
 
-size_t steps = lustro_xof_batch_suggested_steps(xof);
+size_t steps = lustro_xof_batch_suggested_steps(xof);  /* or a fixed number, e.g. 2 */
 size_t out_len = steps * lustro_xof_batch_len(xof) * LUSTRO_BLOCK_LEN;
 uint8_t *out = (uint8_t *)malloc(out_len);
 
@@ -817,7 +711,12 @@ free(out);
 lustro_xof_batch_free(xof);
 ```
 
-In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call; `release_buffer()` frees it earlier. `blocks()` does not use that buffer.
+In C/C++, `lustro_batch_block_offset(step, batch_len, lane)` from `lustro.h` gives the byte offset of one block in the output: `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`. It expects `step < steps` and `lane < batch_len` and does not check its arguments.
+
+```c
+/* lane 2 at step 0 of the PRNG output above */
+const uint8_t *block = out + lustro_batch_block_offset(0, 4, 2);
+```
 
 ---
 
@@ -1565,8 +1464,8 @@ An instance must not be used by several threads at the same time (an overlapping
 
 With `--features rand`, `LustroPrng` and `LustroXof` implement the `rand_core` 0.10
 traits `TryRng` and `Rng` (infallible, `Error = Infallible`). `LustroPrng` also
-implements `SeedableRng`. `LustroXof` does not: its input is a message of any
-length, not a fixed seed.
+implements `SeedableRng`. For `LustroXof` its input is a message of any
+length.
 
 ```toml
 [dependencies]

@@ -24,42 +24,106 @@ use crate::types::{ConfigError, RuntimeOptions};
 // Tunable hash parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HashParams {
-    /// Minimum message count to use pool.
+    /// Message count that alone qualifies a batch (of at least 2) for the pool.
     pub(crate) mt_threshold_messages: usize,
-    /// Minimum total input bytes to use pool.
+    /// Total input bytes that alone qualify a batch (of at least 2) for the pool.
     pub(crate) mt_threshold_bytes: usize,
+    /// Rayon work items per pool thread; see `hash_min_len`.
+    pub(crate) tasks_per_thread: usize,
 }
 
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 const HASH_PARAMS: HashParams = HashParams {
-    mt_threshold_messages: 1664,
-    mt_threshold_bytes: 64 * 1024,
+    mt_threshold_messages: 2048,
+    mt_threshold_bytes: 80 * 1024,
+    tasks_per_thread: 4,
 };
+const _: () = assert!(HASH_PARAMS.tasks_per_thread > 0);
 
 // STREAM POLICY PARAMETERS
-// `chunk` must be non-zero, and a multiple of 4 for the AVX2 x4 kernel.
+
+// Lanes per Rayon work item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChunkRule {
+    // `ceil4(n / near_tasks)`, cut to `floor4(rounds / steps)` (at least 4), but never
+    // below `ceil4(n / threads)`: no more items than pool threads. Multiples of 4 for
+    // the AVX2 x4 kernel; the scalar backend uses them as well.
+    Adaptive { near_tasks: usize, rounds: usize },
+}
+
+impl ChunkRule {
+    fn chunk_for(self, n: usize, steps: usize, threads: usize) -> usize {
+        let ChunkRule::Adaptive { near_tasks, rounds } = self;
+        // Overflow only for n near usize::MAX; one item then.
+        let x4 = |v: usize| v.checked_next_multiple_of(4).unwrap_or(v).max(4);
+        let even = x4(n.div_ceil(near_tasks));
+        let cap = ((rounds / steps.max(1)) & !3).max(4);
+        let per_thread = x4(n.div_ceil(threads.max(1)));
+        even.min(cap).max(per_thread)
+    }
+}
 
 /// Tunable stream parameters of one backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StreamParams {
-    // Lanes per Rayon work item.
-    pub(crate) chunk: usize,
+    pub(crate) chunk: ChunkRule,
     // Minimum `lanes * steps` required for Rayon.
     pub(crate) mt_threshold_work: usize,
+    // Minimum Rayon work items; a smaller pool lowers it to the pool size, never below 2.
+    pub(crate) min_tasks: usize,
 }
 
-const SCALAR_STREAM: StreamParams = StreamParams {
-    chunk: 32,
-    mt_threshold_work: 1536,
-};
-const _: () = assert!(SCALAR_STREAM.chunk > 0);
+impl StreamParams {
+    // Lanes per work item for `n` lanes, `steps` steps and `threads` pool workers.
+    pub(crate) fn chunk_for(self, n: usize, steps: usize, threads: usize) -> usize {
+        self.chunk.chunk_for(n, steps, threads)
+    }
 
+    // Rayon or the calling thread for this workload, before caller restrictions.
+    // A pool of one worker never gets Rayon.
+    pub(crate) fn parallel_for(self, n: usize, steps: usize, threads: usize) -> Parallel {
+        if threads < 2 {
+            return Parallel::Single;
+        }
+        let chunk = self.chunk_for(n, steps, threads);
+        let min_tasks = self.min_tasks.min(threads).max(2);
+        if n.saturating_mul(steps) < self.mt_threshold_work || n.div_ceil(chunk) < min_tasks {
+            Parallel::Single
+        } else {
+            Parallel::Rayon { chunk }
+        }
+    }
+}
+
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
+const SCALAR_STREAM: StreamParams = StreamParams {
+    chunk: ChunkRule::Adaptive {
+        near_tasks: 8,
+        rounds: 512,
+    },
+    mt_threshold_work: 4096,
+    min_tasks: 4,
+};
+const _: () = assert!(matches!(
+    SCALAR_STREAM.chunk,
+    ChunkRule::Adaptive { near_tasks, rounds } if near_tasks > 0 && rounds > 0
+));
+
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 const AVX2_STREAM: StreamParams = StreamParams {
-    chunk: 64,
-    mt_threshold_work: 2048,
+    chunk: ChunkRule::Adaptive {
+        near_tasks: 8,
+        rounds: 768,
+    },
+    mt_threshold_work: 6144,
+    min_tasks: 4,
 };
 #[cfg(target_arch = "x86_64")]
-const _: () = assert!(AVX2_STREAM.chunk > 0 && AVX2_STREAM.chunk.is_multiple_of(4));
+const _: () = assert!(matches!(
+    AVX2_STREAM.chunk,
+    ChunkRule::Adaptive { near_tasks, rounds } if near_tasks > 0 && rounds > 0
+));
 
 // AVX2 BACKEND SELECTION
 // Minimum lanes for one x4 kernel group.
@@ -68,8 +132,8 @@ const AVX2_MIN_LANES: usize = 4;
 
 // Suggested `steps` by lane count. Same policy for PRNG and XOF.
 // Each entry is `(max_n, steps)`; `tail` applies above the last entry.
-// Larger `steps` amortizes call cost; for larger batches, reduce `steps`
-// to limit cache pressure. Small-N entries also avoid premature MT.
+// Larger `steps` amortizes call cost; mid-size batches use fewer steps to limit
+// cache pressure. Above the table, `tail` amortizes lane state traffic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StepsPolicy {
     table: &'static [(usize, usize)],
@@ -85,28 +149,42 @@ impl StepsPolicy {
     }
 }
 
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 const SCALAR_STEPS: StepsPolicy = StepsPolicy {
-    table: &[(95, 16), (111, 12)],
-    tail: 1,
+    table: &[
+        (640, 512),
+        (1280, 256),
+        (2560, 128),
+        (3413, 96),
+        (5120, 64),
+        (10_000, 32),
+        (13_600, 24),
+        (20_000, 16),
+        (23_500, 12),
+        (40_960, 8),
+        (81_920, 4),
+        (180_000, 1),
+    ],
+    tail: 4,
 };
 
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 const AVX2_STEPS: StepsPolicy = StepsPolicy {
     table: &[
-        (64, 32),
-        (85, 24),
-        (127, 16),
-        (159, 12),
-        (11_800, 32),
-        (14_500, 24),
-        (23_500, 16),
-        (28_500, 12),
-        (43_000, 8),
-        (75_000, 4),
+        (640, 512),
+        (1280, 256),
+        (2560, 128),
+        (3413, 96),
+        (5120, 64),
+        (10_240, 32),
+        (20_000, 16),
+        (32_768, 8),
+        (80_000, 4),
         (118_000, 2),
-        (180_000, 1),
+        (190_000, 1),
     ],
-    tail: 1,
+    tail: 4,
 };
 
 // ==========================================
@@ -137,11 +215,14 @@ fn env_flag(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> bool {
 // Process-wide settings, fixed once: by `configure()`, or else read from the environment
 // at the first use of the dispatcher (batch calls, `suggested_steps()`, `runtime_info()`).
 // Later changes to the environment have no effect.
-// They affect execution only; outputs do not depend on them.
+// They select how batches run; for the same inputs and `steps` the output bytes do not
+// depend on them. `suggested_steps()` follows the backend, so `LUSTRO_DISABLE_SIMD` can
+// change it.
 //
 // - `LUSTRO_DISABLE_MT`: set (see `env_flag`) = never enter the pool.
 // - `LUSTRO_DISABLE_SIMD`: set = scalar backend for streams.
 // - `LUSTRO_NUM_THREADS=N`: pool size, capped at the logical CPU count.
+// - A pool of one worker (set, or one logical CPU) also disables MT.
 //
 // A field set in `RuntimeOptions` replaces the variables of the same purpose:
 // `threads` both `LUSTRO_NUM_THREADS` and `LUSTRO_DISABLE_MT`, `allow_simd`
@@ -150,7 +231,8 @@ fn env_flag(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> bool {
 struct RuntimeConfig {
     disable_mt: bool,
     disable_simd: bool,
-    threads: Option<NonZeroUsize>,
+    // Pool size: `threads` if set, else the logical CPU count at parse time.
+    workers: usize,
 }
 
 impl RuntimeConfig {
@@ -179,12 +261,14 @@ impl RuntimeConfig {
             }
         };
 
+        let workers = threads.map_or(logical.max(1), NonZeroUsize::get);
+
         RuntimeConfig {
-            disable_mt,
+            disable_mt: disable_mt || workers < 2,
             disable_simd: options
                 .allow_simd
                 .map_or_else(|| env_flag(&get, ENV_DISABLE_SIMD), |allow| !allow),
-            threads,
+            workers,
         }
     }
 
@@ -269,17 +353,14 @@ static POOL_OWNER: AtomicU32 = AtomicU32::new(0);
 // Initializes the dispatcher's Rayon pool once.
 // A process that inherited the pool through `fork` uses the single-threaded fallback.
 #[cfg(feature = "parallel")]
-pub(crate) fn init_pool() {
+fn init_pool() {
     let pid = std::process::id();
     let _ = POOL_OWNER.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire);
     if POOL_OWNER.load(Ordering::Acquire) != pid {
         return;
     }
     RAYON_POOL.get_or_init(|| {
-        let workers = runtime_config()
-            .threads
-            .map_or_else(logical_cpus, NonZeroUsize::get);
-
+        let workers = runtime_config().workers;
         ThreadPoolBuilder::new().num_threads(workers).build().ok()
     });
 }
@@ -344,7 +425,7 @@ fn hash128_into(m: &[u8], domain: u128, out: &mut [u8; 16]) {
 pub(crate) enum HashParallel {
     // Calling thread only.
     Single,
-    // Rayon pool, one message per work item.
+    // Rayon pool, `hash_min_len` messages or more per work item.
     Rayon,
 }
 
@@ -387,6 +468,14 @@ pub(crate) fn plan_hash_with(parallel: ParallelPref, count: usize, total_bytes: 
     }
 }
 
+// Fewest messages per Rayon work item for `count` messages on `threads` workers:
+// `ceil(count / (threads * tasks_per_thread))`, at least 1.
+#[cfg(feature = "parallel")]
+pub(crate) fn hash_min_len(count: usize, threads: usize) -> usize {
+    let items = threads.max(1).saturating_mul(HASH_PARAMS.tasks_per_thread);
+    count.div_ceil(items).max(1)
+}
+
 // Runs a hash batch under `plan`. `absorb_into` writes the digest of a message.
 fn execute_hash<const N: usize>(
     plan: HashPlan,
@@ -400,11 +489,13 @@ fn execute_hash<const N: usize>(
         HashParallel::Rayon => {
             #[cfg(feature = "parallel")]
             if let Some(pool) = get_or_init_pool() {
+                let min_len = hash_min_len(messages.len(), pool.current_num_threads());
                 pool.install(|| {
                     messages
                         .par_iter()
                         .copied()
                         .zip(out.par_iter_mut())
+                        .with_min_len(min_len)
                         .for_each(|(m, o)| absorb_into(m, domain, o));
                 });
                 return;
@@ -437,10 +528,11 @@ pub(crate) struct StreamLane {
 }
 
 // Raw output pointer shared between workers.
-// Workers write disjoint blocks only (see `dispatch_streams`).
 #[derive(Clone, Copy)]
 struct OutPtr(*mut [u8; 32]);
 
+// SAFETY: built in `execute_streams` from the exclusively borrowed `out`. Workers get
+// disjoint lane ranges and (step, lane) maps to one block, so no two write the same block.
 unsafe impl Send for OutPtr {}
 unsafe impl Sync for OutPtr {}
 
@@ -452,8 +544,14 @@ impl OutPtr {
     }
 }
 
+// Lanes and steps per block in `process_lanes_scalar`.
+const SCALAR_BLOCK_LANES: usize = 4;
+const SCALAR_BLOCK_STEPS: usize = 8;
+
 // Advances `lanes` by `steps` stream steps. The block of lane `first + i` at
-// step `s` is written to `out[s * n + first + i]`.
+// step `s` is written to `out[s * n + first + i]`. For `steps > 1` the work goes
+// in blocks of `SCALAR_BLOCK_LANES` lanes by `SCALAR_BLOCK_STEPS` steps; a lane
+// block keeps its state in locals within a step block.
 //
 // SAFETY: `out` must be valid for `n * steps` blocks, `first + lanes.len() <= n`,
 // and no other thread may write to this lane range.
@@ -466,8 +564,8 @@ unsafe fn process_lanes_scalar(
     steps: usize,
 ) {
     debug_assert!(first + lanes.len() <= n);
-    for s in 0..steps {
-        let row = out.add(s * n + first);
+    if steps == 1 {
+        let row = out.add(first);
         for (i, lane) in lanes.iter_mut().enumerate() {
             let (s0, s1) = crate::api::stream_step(lane.s0, lane.s1, lane.step);
             lane.step = lane.step.wrapping_add(1);
@@ -477,6 +575,36 @@ unsafe fn process_lanes_scalar(
             block[..16].copy_from_slice(&s0.to_le_bytes());
             block[16..].copy_from_slice(&s1.to_le_bytes());
         }
+        return;
+    }
+    let mut s_first = 0;
+    while s_first < steps {
+        let s_end = steps.min(s_first + SCALAR_BLOCK_STEPS);
+        let mut base = first;
+        for block in lanes.chunks_mut(SCALAR_BLOCK_LANES) {
+            let k = block.len();
+            let mut st = [(0u128, 0u128, 0u64); SCALAR_BLOCK_LANES];
+            for (j, lane) in block.iter().enumerate() {
+                st[j] = (lane.s0, lane.s1, lane.step);
+            }
+            for s in s_first..s_end {
+                let row = out.add(s * n + base);
+                for (j, lane) in st[..k].iter_mut().enumerate() {
+                    let (s0, s1) = crate::api::stream_step(lane.0, lane.1, lane.2);
+                    *lane = (s0, s1, lane.2.wrapping_add(1));
+                    let dst = &mut *row.add(j);
+                    dst[..16].copy_from_slice(&s0.to_le_bytes());
+                    dst[16..].copy_from_slice(&s1.to_le_bytes());
+                }
+            }
+            for (lane, &(s0, s1, step)) in block.iter_mut().zip(&st[..k]) {
+                lane.s0 = s0;
+                lane.s1 = s1;
+                lane.step = step;
+            }
+            base += k;
+        }
+        s_first = s_end;
     }
 }
 
@@ -614,16 +742,19 @@ pub(crate) struct DispatchPlan {
     pub(crate) parallel: Parallel,
 }
 
-// Execution mode of `backend` for `n` lanes and `work = lanes * steps`.
-// `single` keeps the workload on the calling thread.
-fn plan_for(backend: Backend, single: bool, n: usize, work: usize) -> DispatchPlan {
-    let params = backend.stream_params();
-    let parallel = if single || n.div_ceil(params.chunk) < 2 || work < params.mt_threshold_work {
+// Execution mode of `backend` for `n` lanes and `steps` steps on a pool of `threads`
+// workers. `single` keeps the workload on the calling thread.
+fn plan_for(
+    backend: Backend,
+    single: bool,
+    n: usize,
+    steps: usize,
+    threads: usize,
+) -> DispatchPlan {
+    let parallel = if single {
         Parallel::Single
     } else {
-        Parallel::Rayon {
-            chunk: params.chunk,
-        }
+        backend.stream_params().parallel_for(n, steps, threads)
     };
     DispatchPlan { backend, parallel }
 }
@@ -655,19 +786,20 @@ pub(crate) struct Overrides {
     pub(crate) parallel: ParallelPref,
 }
 
-// Chooses backend and execution mode for `n` lanes and `steps` stream steps, within the
-// caller's restrictions. Parallelism uses the stream parameters of the chosen backend.
+// Chooses backend and execution mode for `n` lanes and `steps` stream steps on a pool of
+// `threads` workers, within the caller's restrictions. Parallelism uses the stream
+// parameters of the chosen backend.
 // Pure: no CPU detection, no pool access.
 pub(crate) fn plan_streams_with(
     caps: Caps,
     overrides: Overrides,
     n: usize,
     steps: usize,
+    threads: usize,
 ) -> DispatchPlan {
-    let work = n.saturating_mul(steps);
     let backend = backend_for(caps, overrides, n);
     let single = overrides.parallel == ParallelPref::Single;
-    plan_for(backend, single, n, work)
+    plan_for(backend, single, n, steps, threads)
 }
 
 // Backend for `n` lanes within the caller's restriction.
@@ -685,25 +817,15 @@ pub(crate) fn suggested_steps_with(caps: Caps, overrides: Overrides, n: usize) -
 }
 
 // Backend and thread count for the given capabilities and config; no pool access.
-// `logical` is the logical CPU count.
-fn runtime_info_with(
-    caps: Caps,
-    config: RuntimeConfig,
-    logical: usize,
-) -> crate::types::RuntimeInfo {
-    // Largest batch: AVX2 whenever it is available.
+// `threads` is the configured pool size: if the pool cannot be built, or after `fork`,
+// batches still run on the calling thread.
+fn runtime_info_with(caps: Caps, config: RuntimeConfig) -> crate::types::RuntimeInfo {
+    // Backend of the largest batch, within `LUSTRO_DISABLE_SIMD`.
     let backend = backend_for(caps, config.overrides(), usize::MAX);
     #[cfg(feature = "parallel")]
-    let threads = if config.disable_mt {
-        0
-    } else {
-        config.threads.map_or(logical, NonZeroUsize::get)
-    };
+    let threads = if config.disable_mt { 0 } else { config.workers };
     #[cfg(not(feature = "parallel"))]
-    let threads = {
-        let _ = logical;
-        0
-    };
+    let threads = 0;
     crate::types::RuntimeInfo {
         backend: backend.name(),
         threads,
@@ -712,7 +834,7 @@ fn runtime_info_with(
 
 // Settings of the current CPU and runtime config. Reads the config like any dispatch.
 pub(crate) fn runtime_info() -> crate::types::RuntimeInfo {
-    runtime_info_with(Caps::detect(), runtime_config(), logical_cpus())
+    runtime_info_with(Caps::detect(), runtime_config())
 }
 
 // Suggested `steps` for the current CPU and runtime config.
@@ -732,7 +854,8 @@ pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]], s
     );
 }
 
-// As `dispatch_streams` for the given capability and restriction.
+// As `dispatch_streams` for the given capability and restriction. The pool size is
+// that of the runtime config.
 fn dispatch_streams_with(
     caps: Caps,
     overrides: Overrides,
@@ -740,7 +863,8 @@ fn dispatch_streams_with(
     out: &mut [[u8; 32]],
     steps: usize,
 ) {
-    let plan = plan_streams_with(caps, overrides, lanes.len(), steps);
+    let threads = runtime_config().workers;
+    let plan = plan_streams_with(caps, overrides, lanes.len(), steps, threads);
     execute_streams(plan, lanes, out, steps);
 }
 

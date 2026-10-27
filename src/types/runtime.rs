@@ -9,7 +9,7 @@ pub struct RuntimeInfo {
     /// up; hashing and single streams are always scalar.
     pub backend: &'static str,
     /// Threads for parallel batches. 0 = batches run on the calling thread
-    /// (disabled by the environment or built without `parallel`).
+    /// (disabled by the settings or built without `parallel`).
     pub threads: usize,
 }
 

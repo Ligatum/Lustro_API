@@ -2,9 +2,11 @@
 lustro.dll speed test (ctypes), normalized per engine round. lustro.dll must be in the same directory.
 Batch calls use the `steps` suggested by the library for the given N.
 Multi-stream sections run one single stream per process and report the aggregate.
+Optional arguments: section number (0-10) and variant (auto, scalar, st, compare).
 """
 
 import array
+import contextlib
 import ctypes
 import multiprocessing
 import os
@@ -20,7 +22,8 @@ MIN_ITERS = 100
 
 # Output per call = N * steps * 32 B (Batch size column). The largest sizes are meant to
 # go past L3.
-BATCH_SIZES = [64, 256, 1024, 4096, 16384, 65536, 131072, 196608, 1 << 20]
+HASH_BATCH_SIZES = [64, 256, 1024, 2048, 4096, 16384, 65536, 131072, 196608, 1 << 20]
+STREAM_BATCH_SIZES = [8, 16, 32, 64, 256, 1024, 4096, 16384, 65536, 131072, 196608, 1 << 20]
 
 # Exact multiple of 32 B: no terminator round (absorb_with_domain, api.rs).
 HASH_MSG_LEN_BASELINE = 32
@@ -31,6 +34,9 @@ HASH_MSG_LENGTHS = [16, 31, 32, 33, 64, 65, 128, 256, 512, 768, 1024, 2048, 4096
 
 # N for the length sweep.
 HASH_SWEEP_N = 16384
+
+# (N, msg_len): few messages with a large total input, 64 KiB against 128 KiB.
+HASH_BYTES_CELLS = [(256, 256), (256, 512), (1024, 64), (1024, 128)]
 
 # Single-instance calls: message lengths for lustro_hash256, buffer sizes for
 # lustro_prng_fill / lustro_xof_fill. One ctypes call is timed, so small sizes
@@ -64,6 +70,19 @@ HW_THREADS = os.cpu_count() or 1
 DLL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lustro.dll")
 
 ENV_VARS = ("LUSTRO_DISABLE_MT", "LUSTRO_DISABLE_SIMD", "LUSTRO_NUM_THREADS")
+
+# Variants: environment of the worker process. "compare" times auto and st side by side.
+ST_ENV = {"LUSTRO_DISABLE_MT": "1"}
+MODE_ENV = {
+    "auto": {},
+    "scalar": {"LUSTRO_DISABLE_SIMD": "1"},
+    "st": ST_ENV,
+    "compare": {},
+}
+MODES = tuple(MODE_ENV)
+PLAIN_MODES = ("auto",)
+MT_MODES = ("auto", "st", "compare")
+STREAM_MODES = MODES
 
 
 def proc_counts():
@@ -158,8 +177,10 @@ COL = {
     "p95": 10,
     "tp": 12,
     "ns": 10,
+    "vs": 8,
 }
-WIDTH = sum(COL.values()) + 3 * (len(COL) - 1)
+WIDTH = sum(COL.values()) - COL["vs"] + 3 * (len(COL) - 2)
+WIDTH_CMP = WIDTH + 3 + COL["vs"]
 
 COL_MULTI = {
     "pipeline": 10,
@@ -175,13 +196,27 @@ COL_MULTI = {
 WIDTH_MULTI = sum(COL_MULTI.values()) + 3 * (len(COL_MULTI) - 1)
 
 
-def make_header():
-    return (
+def make_header(compare=False):
+    head = (
         f"{'Pipeline':<{COL['pipeline']}} | {'Batch size':<{COL['size']}} | "
         f"{'N':<{COL['n']}} | {'Steps':>{COL['steps']}} | {'Rounds':>{COL['rounds']}} | "
         f"{'p50 (ms)':>{COL['p50']}} | {'p95 (ms)':>{COL['p95']}} | "
         f"{'Data rate':>{COL['tp']}} | {'ns/round':>{COL['ns']}}"
     )
+    if compare:
+        head += f" | {'vs ST':>{COL['vs']}}"
+    return head
+
+
+def table_width(mode):
+    return WIDTH_CMP if mode == "compare" else WIDTH
+
+
+def table_start(title, mode):
+    width = table_width(mode)
+    print(f"\n{title:^{width}}")
+    print(make_header(mode == "compare"))
+    print("-" * width)
 
 
 def make_multi_header():
@@ -194,15 +229,18 @@ def make_multi_header():
     )
 
 
-def print_row(label, n, steps, size_bytes, data):
+def print_row(label, n, steps, size_bytes, data, vs_st=None):
     tp_str = f"{data['gib_s']:.2f} GiB/s"
     steps_str = "-" if steps is None else str(steps)
-    print(
+    line = (
         f"{label:<{COL['pipeline']}} | {format_size(size_bytes):<{COL['size']}} | "
         f"{n:<{COL['n']}} | {steps_str:>{COL['steps']}} | {data['rounds_total']:>{COL['rounds']}} | "
         f"{data['p50_ms']:>{COL['p50']}.4f} | {data['p95_ms']:>{COL['p95']}.4f} | "
         f"{tp_str:>{COL['tp']}} | {data['ns_per_round']:>{COL['ns']}.2f}"
     )
+    if vs_st is not None:
+        line += f" | {f'{vs_st:.2f}x':>{COL['vs']}}"
+    print(line)
 
 
 def print_multi_row(label, size_bytes, data, scaling):
@@ -242,6 +280,11 @@ def load_lib():
 
     lib.lustro_api_version.restype = ctypes.c_uint32
     lib.lustro_api_version.argtypes = []
+
+    lib.lustro_runtime_backend.restype = ctypes.c_char_p
+    lib.lustro_runtime_backend.argtypes = []
+    lib.lustro_runtime_threads.restype = SizeT
+    lib.lustro_runtime_threads.argtypes = []
 
     lib.lustro_hash256.restype = ctypes.c_int32
     lib.lustro_hash256.argtypes = [U8P, SizeT, U8P]
@@ -306,6 +349,17 @@ def open_single(lib, kind):
 # =========================================================
 # WORKERS
 # =========================================================
+def info_worker(q):
+    try:
+        lib = load_lib()
+        q.put({
+            "backend": lib.lustro_runtime_backend().decode(),
+            "threads": lib.lustro_runtime_threads(),
+        })
+    except Exception as e:
+        q.put({"error": repr(e)})
+
+
 def hash_batch_worker(n, msg_len, q):
     try:
         lib = load_lib()
@@ -479,10 +533,26 @@ def stream_batch_worker(kind, n, q):
         q.put({"error": repr(e)})
 
 
-def run_worker(func, args):
+@contextlib.contextmanager
+def child_env(extra):
+    """Sets `extra` in this process while a child is started; the child inherits it."""
+    saved = {k: os.environ.get(k) for k in extra}
+    os.environ.update(extra)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def run_worker(func, args, env=None):
     q = multiprocessing.Queue()
     p = multiprocessing.Process(target=func, args=(*args, q))
-    p.start()
+    with child_env(env or {}):
+        p.start()
     res = None
     while res is None:
         try:
@@ -538,65 +608,67 @@ def run_multi(kind, size, procs):
 # =========================================================
 # PIPELINE SECTIONS: one per menu entry, each prints its own table.
 # =========================================================
-def section_hash_baseline(hdr):
-    title = (
+def emit(label, n, func, args, mode):
+    res = run_worker(func, args, MODE_ENV[mode])
+    vs_st = None
+    if mode == "compare":
+        st = run_worker(func, args, ST_ENV)
+        vs_st = st["result"]["p50_ms"] / res["result"]["p50_ms"]
+    print_row(label, n, res["steps"], res["size_bytes"], res["result"], vs_st)
+
+
+def section_hash_baseline(mode):
+    table_start(
         f"HASH256_MANY  ({hash_rounds_for_len(HASH_MSG_LEN_BASELINE)} round / message, "
-        f"msg_len={HASH_MSG_LEN_BASELINE})"
+        f"msg_len={HASH_MSG_LEN_BASELINE})",
+        mode,
     )
-    print(f"\n{title:^{WIDTH}}")
-    print(hdr)
-    print("-" * WIDTH)
-    for n in BATCH_SIZES:
-        res = run_worker(hash_batch_worker, (n, HASH_MSG_LEN_BASELINE))
-        print_row("HASH", n, res["steps"], res["size_bytes"], res["result"])
+    for n in HASH_BATCH_SIZES:
+        emit("HASH", n, hash_batch_worker, (n, HASH_MSG_LEN_BASELINE), mode)
 
 
-def section_hash_sweep(hdr):
-    title = f"HASH256_MANY -- MSG LENGTH SWEEP (N={HASH_SWEEP_N} fixed; N column below = msg_len)"
-    print(f"\n{title:^{WIDTH}}")
-    print(hdr)
-    print("-" * WIDTH)
+def section_hash_sweep(mode):
+    table_start(
+        f"HASH256_MANY -- MSG LENGTH SWEEP (N={HASH_SWEEP_N} fixed; N column below = msg_len)",
+        mode,
+    )
     for msg_len in HASH_MSG_LENGTHS:
-        res = run_worker(hash_batch_worker, (HASH_SWEEP_N, msg_len))
-        print_row(f"HASH_L{msg_len}", msg_len, res["steps"], res["size_bytes"], res["result"])
+        emit(f"HASH_L{msg_len}", msg_len, hash_batch_worker, (HASH_SWEEP_N, msg_len), mode)
 
 
-def section_hash_single(hdr):
-    title = "HASH256  (single message per call; N column = msg_len; includes ctypes call overhead)"
-    print(f"\n{title:^{WIDTH}}")
-    print(hdr)
-    print("-" * WIDTH)
+def section_hash_bytes(mode):
+    table_start("HASH256_MANY -- FEW LONG MESSAGES (label = msg_len)", mode)
+    for n, msg_len in HASH_BYTES_CELLS:
+        emit(f"HASH_L{msg_len}", n, hash_batch_worker, (n, msg_len), mode)
+
+
+def section_hash_single(mode):
+    table_start(
+        "HASH256  (single message per call; N column = msg_len; includes ctypes call overhead)",
+        mode,
+    )
     for msg_len in SINGLE_HASH_LENGTHS:
-        res = run_worker(hash_single_worker, (msg_len,))
-        print_row(f"HASH_L{msg_len}", msg_len, res["steps"], res["size_bytes"], res["result"])
+        emit(f"HASH_L{msg_len}", msg_len, hash_single_worker, (msg_len,), mode)
 
 
 def make_fill_single_section(kind):
-    def section(hdr):
-        title = f"{kind}_FILL  (single stream, N=1; includes ctypes call overhead)"
-        print(f"\n{title:^{WIDTH}}")
-        print(hdr)
-        print("-" * WIDTH)
+    def section(mode):
+        table_start(f"{kind}_FILL  (single stream, N=1; includes ctypes call overhead)", mode)
         for size in SINGLE_FILL_SIZES:
-            res = run_worker(fill_single_worker, (kind, size))
-            print_row(f"{kind}_FILL", 1, res["steps"], res["size_bytes"], res["result"])
+            emit(f"{kind}_FILL", 1, fill_single_worker, (kind, size), mode)
     return section
 
 
 def make_stream_section(kind):
-    def section(hdr):
-        title = f"{kind}_BATCH_FILL_BLOCKS  (steps chosen by the library)"
-        print(f"\n{title:^{WIDTH}}")
-        print(hdr)
-        print("-" * WIDTH)
-        for n in BATCH_SIZES:
-            res = run_worker(stream_batch_worker, (kind, n))
-            print_row(kind, n, res["steps"], res["size_bytes"], res["result"])
+    def section(mode):
+        table_start(f"{kind}_BATCH_FILL_BLOCKS  (steps chosen by the library)", mode)
+        for n in STREAM_BATCH_SIZES:
+            emit(kind, n, stream_batch_worker, (kind, n), mode)
     return section
 
 
 def make_multi_section(kind):
-    def section(hdr):
+    def section(mode):
         title = (
             f"{kind}_FILL x N PROCESSES  (one single stream per process, aggregate; "
             f"{MULTI_TIME:g} s window)"
@@ -617,15 +689,16 @@ def make_multi_section(kind):
 
 
 SECTIONS = {
-    1: ("HASH256_MANY (baseline, msg_len=32)", section_hash_baseline),
-    2: ("HASH256_MANY message-length sweep", section_hash_sweep),
-    3: ("PRNG_BATCH_FILL_BLOCKS", make_stream_section("PRNG")),
-    4: ("XOF_BATCH_FILL_BLOCKS", make_stream_section("XOF")),
-    5: ("HASH256 (single message)", section_hash_single),
-    6: ("PRNG_FILL (single stream)", make_fill_single_section("PRNG")),
-    7: ("XOF_FILL (single stream)", make_fill_single_section("XOF")),
-    8: ("PRNG_FILL (many single streams, one per process)", make_multi_section("PRNG")),
-    9: ("XOF_FILL (many single streams, one per process)", make_multi_section("XOF")),
+    1: ("HASH256_MANY (baseline, msg_len=32)", section_hash_baseline, MT_MODES),
+    2: ("HASH256_MANY message-length sweep", section_hash_sweep, MT_MODES),
+    3: ("PRNG_BATCH_FILL_BLOCKS", make_stream_section("PRNG"), STREAM_MODES),
+    4: ("XOF_BATCH_FILL_BLOCKS", make_stream_section("XOF"), STREAM_MODES),
+    5: ("HASH256 (single message)", section_hash_single, PLAIN_MODES),
+    6: ("PRNG_FILL (single stream)", make_fill_single_section("PRNG"), PLAIN_MODES),
+    7: ("XOF_FILL (single stream)", make_fill_single_section("XOF"), PLAIN_MODES),
+    8: ("PRNG_FILL (many single streams, one per process)", make_multi_section("PRNG"), PLAIN_MODES),
+    9: ("XOF_FILL (many single streams, one per process)", make_multi_section("XOF"), PLAIN_MODES),
+    10: ("HASH256_MANY few long messages", section_hash_bytes, MT_MODES),
 }
 LAST_SECTION = max(SECTIONS)
 
@@ -639,10 +712,11 @@ def prompt_selection():
     for i in range(1, LAST_SECTION + 1):
         print(f"  {i} - {SECTIONS[i][0]}")
 
-    if len(sys.argv) > 1:
-        raw = sys.argv[1]
-    else:
+    interactive = len(sys.argv) <= 1
+    if interactive:
         raw = input(f"Choice [0-{LAST_SECTION}]: ").strip()
+    else:
+        raw = sys.argv[1]
 
     try:
         choice = int(raw)
@@ -654,7 +728,35 @@ def prompt_selection():
         print(f"ERROR: invalid choice {choice}, expected a number 0-{LAST_SECTION}")
         sys.exit(1)
 
-    return choice
+    if interactive:
+        if choice != 0 and SECTIONS[choice][2] == PLAIN_MODES:
+            return choice, "auto"
+        print("Variant:")
+        print("  auto    - default settings")
+        print("  scalar  - AVX2 off (stream batches only)")
+        print("  st      - Rayon off, calling thread only")
+        print("  compare - auto and st side by side, 'vs ST' column")
+        mode = input("Variant [auto]: ").strip().lower() or "auto"
+    else:
+        mode = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "auto"
+
+    if mode not in MODES:
+        print(f"ERROR: invalid variant '{mode}', expected one of: {', '.join(MODES)}")
+        sys.exit(1)
+    if choice != 0 and mode not in SECTIONS[choice][2]:
+        print(f"ERROR: section {choice} is not affected by variant '{mode}'")
+        sys.exit(1)
+
+    return choice, mode
+
+
+def runtime_lines(mode):
+    runs = [("auto", {}), ("st", ST_ENV)] if mode == "compare" else [(mode, MODE_ENV[mode])]
+    lines = []
+    for name, env in runs:
+        info = run_worker(info_worker, (), env)
+        lines.append(f"{name}: backend={info['backend']}, threads={info['threads']}")
+    return lines
 
 
 # =========================================================
@@ -671,9 +773,8 @@ def main():
         print(f"ERROR: cannot use {DLL_PATH}: {e}")
         sys.exit(1)
 
-    choice = prompt_selection()
-    hdr = make_header()
-    width = max(WIDTH, WIDTH_MULTI)
+    choice, mode = prompt_selection()
+    width = max(WIDTH_CMP, WIDTH_MULTI)
 
     print("=" * width)
     print(f"{'LUSTRO.DLL -- SPEED TEST (normalized per round)':^{width}}")
@@ -682,6 +783,9 @@ def main():
     env = [f"{k}={os.environ[k]}" for k in ENV_VARS if k in os.environ]
     if env:
         print(f"{'Env: ' + ' '.join(env):^{width}}")
+    print(f"{'Variant: ' + mode:^{width}}")
+    for line in runtime_lines(mode):
+        print(f"{line:^{width}}")
     if choice == 0:
         print(f"{'Running: ALL sections':^{width}}")
     else:
@@ -690,8 +794,11 @@ def main():
 
     sections_to_run = range(1, LAST_SECTION + 1) if choice == 0 else [choice]
     for i in sections_to_run:
-        _, fn = SECTIONS[i]
-        fn(hdr)
+        title, fn, modes = SECTIONS[i]
+        if mode not in modes:
+            print(f"\n[{i}] {title}: skipped, not affected by variant '{mode}'")
+            continue
+        fn(mode)
 
     print("\n" + "=" * width)
     print(
@@ -700,6 +807,9 @@ def main():
         "Steps: value suggested by the library for that N.\n"
         "Small calls (N=64, small sizes) and single-instance rows (HASH256, *_FILL)\n"
         "include ctypes call overhead.\n"
+        "Calls are timed back to back, so the thread pool stays active between them.\n"
+        "Variants: scalar = AVX2 off, st = Rayon off, vs ST = p50 with Rayon off / p50 of auto.\n"
+        "AVX2 is used for stream batches of 4 or more lanes; hashing and single streams are scalar.\n"
         "Multi-stream: ns/round agg = wall time per round over all procs, ns/round proc = mean\n"
         "per proc, Scaling = agg / (procs * agg at 1 proc), Min/Max = slowest / fastest proc.\n"
         "Procs are logical threads, SMT and clocks lower Scaling above the physical core count."

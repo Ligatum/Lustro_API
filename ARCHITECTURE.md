@@ -288,26 +288,30 @@ This affects only formatting; `to_le_bytes()` / `from_le_bytes()` are unaffected
 
 ## 9. Execution Policy
 
-Thresholds used by the dispatch layer to select the scalar or Rayon path.
+Thresholds used by the dispatch layer to select the scalar or Rayon path, tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 
 ```text
 Hash parallelization
-  Rayon path if (count >= 1664 messages OR total input >= 64 KiB)
+  Rayon path if (count >= 2048 messages OR total input >= 80 KiB)
   AND count >= 2
+  messages per Rayon work item: at least ceil(count / (threads × 4))
 
 Stream parallelization (`fill_blocks`)
 
 Scalar backend:
-  parallel work-size threshold: 1536 (lanes × steps)
-  parallel chunk size:          32 lanes
+  parallel work-size threshold: 4096 (lanes × steps)
+  lanes per Rayon work item:    ceil4(lanes / 8), at most floor4(512 / steps),
+                                at least 4 and at least ceil4(lanes / threads)
 
 AVX2 backend (`x86_64`, AVX2 available):
   minimum lanes for AVX2:       4
-  parallel work-size threshold: 2048 (lanes × steps)
-  parallel chunk size:          64 lanes
+  parallel work-size threshold: 6144 (lanes × steps)
+  lanes per Rayon work item:    as scalar, with 768 in place of 512
   AVX2 kernel width:            4 lanes
 
-Parallel execution requires at least 2 Rayon work chunks.
+Parallel execution needs a pool of at least 2 threads and at least
+min(4, threads) Rayon work items. ceil4 / floor4 round up / down to a
+multiple of 4.
 ```
 
 ### Runtime Execution Controls
@@ -352,8 +356,9 @@ variables and later `configure()` calls have no effect.
 ### Suggested steps
 
 `suggested_steps()` on `LustroPrngBatch` / `LustroXofBatch` returns a `steps`
-hint for `fill_blocks` based on the lane count. It is a hint only; the same
-policy applies to PRNG and XOF.
+hint for `fill_blocks` from a table of the stream backend, keyed by the lane count,
+so `LUSTRO_DISABLE_SIMD` can change it. It is a hint only: the output for a given
+`steps` does not depend on it, and the same policy applies to PRNG and XOF.
 
 ---
 
@@ -858,7 +863,9 @@ There are five categories:
 - **Value-returning functions** (`*_len`, `*_snapshot_size`, `*_suggested_steps`,
   `lustro_runtime_threads` → `uintptr_t`; `lustro_api_version` → `uint32_t`;
   `lustro_strerror`, `lustro_runtime_backend` → `const char*`) — value returned
-  directly, no error path. `lustro_strerror(int32_t code)` returns a static
+  directly, no error path. `*_len`, `*_snapshot_size` and `*_suggested_steps`
+  return 0 for a `NULL` context (`*_suggested_steps` also after a caught panic);
+  a valid batch gets a `steps` of at least 1. `lustro_strerror(int32_t code)` returns a static
   NUL-terminated description, never `NULL` and not to be freed; an unknown `code`
   gives `"unknown error code"`. `lustro_runtime_backend()` returns `"scalar"` or
   `"avx2"` under the same rules.
@@ -902,7 +909,7 @@ Output buffers:
 | `*_next_u128` | `out` | 16 bytes |
 | `*_next_block` | `out` | 32 bytes |
 | `*_export_snapshot` (single-context, PRNG/XOF) | `out` | 56 bytes |
-| `*_batch_fill_blocks` | `out` | `n_lanes × steps × 32` bytes — matches `sizeof(...)` on a `[steps][n][32]` array, as in the README batch example. The block of `lane` at `step` starts at byte `lustro_batch_block_offset(step, n_lanes, lane)` |
+| `*_batch_fill_blocks` | `out` | `n_lanes × steps × 32` bytes, the size of a `uint8_t [steps][n_lanes][32]` array. The block of `lane` at `step` starts at byte `lustro_batch_block_offset(step, n_lanes, lane)` |
 | `*_batch_export_snapshot` | `out` | `16 + n_lanes × 48` bytes — call `*_batch_snapshot_size(ctx)` first |
 
 Input buffers:
