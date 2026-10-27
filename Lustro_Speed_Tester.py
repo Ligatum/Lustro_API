@@ -2,7 +2,7 @@
 lustro.dll speed test (ctypes), normalized per engine round. lustro.dll must be in the same directory.
 Batch calls use the `steps` suggested by the library for the given N.
 Multi-stream sections run one single stream per process and report the aggregate.
-Optional arguments: section number (0-10) and variant (auto, scalar, st, compare).
+Optional arguments: section number (0-10) and variant (1-4, or auto, scalar, st, compare).
 """
 
 import array
@@ -80,6 +80,12 @@ MODE_ENV = {
     "compare": {},
 }
 MODES = tuple(MODE_ENV)
+VARIANT_HELP = {
+    "auto": "library defaults",
+    "scalar": "AVX2 off (stream batches only)",
+    "st": "Rayon off, calling thread only",
+    "compare": "auto and st side by side, 'vs ST' column",
+}
 PLAIN_MODES = ("auto",)
 MT_MODES = ("auto", "st", "compare")
 STREAM_MODES = MODES
@@ -691,14 +697,14 @@ def make_multi_section(kind):
 SECTIONS = {
     1: ("HASH256_MANY (baseline, msg_len=32)", section_hash_baseline, MT_MODES),
     2: ("HASH256_MANY message-length sweep", section_hash_sweep, MT_MODES),
-    3: ("PRNG_BATCH_FILL_BLOCKS", make_stream_section("PRNG"), STREAM_MODES),
-    4: ("XOF_BATCH_FILL_BLOCKS", make_stream_section("XOF"), STREAM_MODES),
-    5: ("HASH256 (single message)", section_hash_single, PLAIN_MODES),
-    6: ("PRNG_FILL (single stream)", make_fill_single_section("PRNG"), PLAIN_MODES),
-    7: ("XOF_FILL (single stream)", make_fill_single_section("XOF"), PLAIN_MODES),
-    8: ("PRNG_FILL (many single streams, one per process)", make_multi_section("PRNG"), PLAIN_MODES),
-    9: ("XOF_FILL (many single streams, one per process)", make_multi_section("XOF"), PLAIN_MODES),
-    10: ("HASH256_MANY few long messages", section_hash_bytes, MT_MODES),
+    3: ("HASH256_MANY few long messages", section_hash_bytes, MT_MODES),
+    4: ("HASH256 (single message)", section_hash_single, PLAIN_MODES),
+    5: ("PRNG_BATCH_FILL_BLOCKS", make_stream_section("PRNG"), STREAM_MODES),
+    6: ("XOF_BATCH_FILL_BLOCKS", make_stream_section("XOF"), STREAM_MODES),
+    7: ("PRNG_FILL (single stream)", make_fill_single_section("PRNG"), PLAIN_MODES),
+    8: ("XOF_FILL (single stream)", make_fill_single_section("XOF"), PLAIN_MODES),
+    9: ("PRNG_FILL (many single streams, one per process)", make_multi_section("PRNG"), PLAIN_MODES),
+    10: ("XOF_FILL (many single streams, one per process)", make_multi_section("XOF"), PLAIN_MODES),
 }
 LAST_SECTION = max(SECTIONS)
 
@@ -706,15 +712,31 @@ LAST_SECTION = max(SECTIONS)
 # =========================================================
 # SELECTION MENU
 # =========================================================
+def parse_variant(raw):
+    raw = raw.strip().lower()
+    if not raw:
+        return "auto"
+    if raw.isdigit():
+        idx = int(raw)
+        if idx not in range(1, len(MODES) + 1):
+            print(f"ERROR: invalid variant {idx}, expected a number 1-{len(MODES)}")
+            sys.exit(1)
+        return MODES[idx - 1]
+    if raw not in MODES:
+        print(f"ERROR: invalid variant '{raw}', expected 1-{len(MODES)} or one of: {', '.join(MODES)}")
+        sys.exit(1)
+    return raw
+
+
 def prompt_selection():
     print("Select which test to run:")
-    print("  0 - RUN ALL")
+    print("  0 - RUN ALL (default)")
     for i in range(1, LAST_SECTION + 1):
         print(f"  {i} - {SECTIONS[i][0]}")
 
     interactive = len(sys.argv) <= 1
     if interactive:
-        raw = input(f"Choice [0-{LAST_SECTION}]: ").strip()
+        raw = input(f"Choice [0-{LAST_SECTION}, Enter = 0]: ").strip() or "0"
     else:
         raw = sys.argv[1]
 
@@ -731,18 +753,14 @@ def prompt_selection():
     if interactive:
         if choice != 0 and SECTIONS[choice][2] == PLAIN_MODES:
             return choice, "auto"
-        print("Variant:")
-        print("  auto    - default settings")
-        print("  scalar  - AVX2 off (stream batches only)")
-        print("  st      - Rayon off, calling thread only")
-        print("  compare - auto and st side by side, 'vs ST' column")
-        mode = input("Variant [auto]: ").strip().lower() or "auto"
+        print("Select variant:")
+        for i, name in enumerate(MODES, 1):
+            default = " (default)" if name == "auto" else ""
+            print(f"  {i} - {name}: {VARIANT_HELP[name]}{default}")
+        mode = parse_variant(input(f"Variant [1-{len(MODES)}, Enter = 1]: "))
     else:
-        mode = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "auto"
+        mode = parse_variant(sys.argv[2]) if len(sys.argv) > 2 else "auto"
 
-    if mode not in MODES:
-        print(f"ERROR: invalid variant '{mode}', expected one of: {', '.join(MODES)}")
-        sys.exit(1)
     if choice != 0 and mode not in SECTIONS[choice][2]:
         print(f"ERROR: section {choice} is not affected by variant '{mode}'")
         sys.exit(1)
