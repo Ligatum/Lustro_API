@@ -538,21 +538,21 @@ every identifier in `path` is a `fork`, since the message already is the root.
 
 ### Batch Hash
 
-Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; `*_many_var` takes messages of any lengths. NOTE: The `*_many_var` is not tuned as far as `*_many_fixed` (kernel and FFI path); for messages of one length please use `*_many_fixed`.
+Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; `*_many_var` takes messages of any lengths.
 
 **Rust**
 
 ```rust
 use lustro::{hash256_many_fixed_into, hash256_many_var, Hash256};
 
-// Messages of any length.
-let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
-let digests = hash256_many_var(&messages);
-
 // Messages of one length, stored back to back.
 let data = [0u8; 3 * 16];
 let mut out = vec![Hash256::default(); 3];
 hash256_many_fixed_into(&data, 16, &mut out);
+
+// Messages of any length.
+let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
+let digests = hash256_many_var(&messages);
 ```
 
 `hash256_many_var_into(&messages, &mut out)` writes into a slice you provide. `hash256_many_fixed_into` panics if `data.len() != out.len() * message_len`.

@@ -295,7 +295,7 @@ Thresholds used by the dispatch layer to select the scalar or Rayon path, tuned 
 ```text
 Hash parallelization (batch)
 
-Scalar backend:
+Scalar backend (fixed and variable length: separate parameters, same values):
   Rayon path if (count >= 2048 messages OR total input >= 80 KiB)
   AND count >= 2
   messages per Rayon work item: at least ceil(count / (threads × 4))
@@ -309,11 +309,15 @@ AVX2 backend, fixed length (`x86_64`, AVX2 available):
 
 AVX2 backend, variable length:
   minimum messages for AVX2:    4
-  Rayon path if (count >= 2048 messages OR total input >= 96 KiB)
+  Rayon path if (count >= 3072 messages OR total input >= 192 KiB)
   AND count >= 16
   messages per Rayon work item: as for fixed length
 
 AVX2 kernels process 4 messages per group; the last 0..=3 messages run scalar.
+For variable lengths, messages are taken in windows of up to 256. If the first groups of a
+window do not already have equal block counts, the window is regrouped by block count so
+that the lanes of a group finish together. A group of unequal lengths whose lanes would be
+less than 40% busy (sum of blocks < 1.6 × longest) runs scalar.
 
 Stream parallelization (`fill_blocks`)
 

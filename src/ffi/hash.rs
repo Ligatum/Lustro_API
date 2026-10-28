@@ -2,6 +2,7 @@
 
 use super::guarded;
 use super::types::{buf_in, buf_out, fits_slice, ranges_overlap, slice_in, slice_out};
+use crate::dispatch::RawMessages;
 use crate::errors::LustroError;
 use crate::hash::{hash128, hash256};
 
@@ -288,7 +289,7 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
+        let mut total_bytes = 0usize;
         for i in 0..n {
             if !fits_slice::<u8>(lens[i]) {
                 return LustroError::InvalidLength;
@@ -298,10 +299,10 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
                 Some(false) => {}
                 None => return LustroError::InvalidLength,
             }
-            match buf_in(ptrs[i], lens[i]) {
-                Some(m) => messages.push(m),
-                None => return LustroError::InvalidPointer,
+            if buf_in(ptrs[i], lens[i]).is_none() {
+                return LustroError::InvalidPointer;
             }
+            total_bytes = total_bytes.saturating_add(lens[i]);
         }
 
         let out_blocks: &mut [[u8; 32]] = match slice_out(out_ptr as *mut [u8; 32], n) {
@@ -309,8 +310,11 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        crate::api::absorb_hash256_var_into(
-            &messages,
+        // SAFETY: tables and messages were validated above and do not overlap `out`.
+        let messages = unsafe { RawMessages::new(ptrs, lens) };
+        crate::api::absorb_hash256_var_raw_into(
+            messages,
+            total_bytes,
             crate::constants::Domain::Hash as u128,
             out_blocks,
         );
@@ -396,7 +400,7 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        let mut messages: Vec<&[u8]> = Vec::with_capacity(n);
+        let mut total_bytes = 0usize;
         for i in 0..n {
             if !fits_slice::<u8>(lens[i]) {
                 return LustroError::InvalidLength;
@@ -406,10 +410,10 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
                 Some(false) => {}
                 None => return LustroError::InvalidLength,
             }
-            match buf_in(ptrs[i], lens[i]) {
-                Some(m) => messages.push(m),
-                None => return LustroError::InvalidPointer,
+            if buf_in(ptrs[i], lens[i]).is_none() {
+                return LustroError::InvalidPointer;
             }
+            total_bytes = total_bytes.saturating_add(lens[i]);
         }
 
         let out_blocks: &mut [[u8; 16]] = match slice_out(out_ptr as *mut [u8; 16], n) {
@@ -417,8 +421,11 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        crate::api::absorb_hash128_var_into(
-            &messages,
+        // SAFETY: tables and messages were validated above and do not overlap `out`.
+        let messages = unsafe { RawMessages::new(ptrs, lens) };
+        crate::api::absorb_hash128_var_raw_into(
+            messages,
+            total_bytes,
             crate::constants::Domain::Hash as u128,
             out_blocks,
         );

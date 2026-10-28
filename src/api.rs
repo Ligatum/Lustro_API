@@ -136,17 +136,41 @@ fn finalize_terminator(s0: u128, s1: u128, remainder: &[u8]) -> (u128, u128) {
         remainder.len() < 32,
         "finalize_terminator: remainder must be a partial block"
     );
-    let mut buf = [0u8; 32];
-    buf[..remainder.len()].copy_from_slice(remainder);
-    buf[remainder.len()] = 0x80;
-    let b0 = u128::from_le_bytes(buf[..16].try_into().unwrap());
-    let mut b1 = u128::from_le_bytes(buf[16..].try_into().unwrap());
-    // Fold the low half into the high half for short remainders.
-    if remainder.len() < 16 {
-        b1 ^= b0;
-    }
+    let (b0, b1) = terminator_block(remainder);
     let (y0, y1) = evaluate_scalar(s0 ^ b0, s1 ^ b1);
     (y0 ^ s0, y1 ^ s1)
+}
+
+// Final block as (b0, b1): the remainder, then 0x80, then zeros. For a remainder shorter
+// than 16 bytes the low half is folded into the high half. Built from overlapping reads
+// instead of a copy into a buffer.
+#[inline]
+fn terminator_block(r: &[u8]) -> (u128, u128) {
+    let n = r.len();
+    if n >= 16 {
+        let lo = u128::from_le_bytes(r[..16].try_into().unwrap());
+        // The top `n - 16` bytes of the last 16 are the bytes past the first 16.
+        let last = u128::from_le_bytes(r[n - 16..].try_into().unwrap());
+        let hi = last.checked_shr(8 * (32 - n) as u32).unwrap_or(0) | (0x80u128 << (8 * (n - 16)));
+        return (lo, hi);
+    }
+    let lo = if n >= 8 {
+        let a = u64::from_le_bytes(r[..8].try_into().unwrap()) as u128;
+        let b = u64::from_le_bytes(r[n - 8..].try_into().unwrap()) as u128;
+        a | (b << (8 * (n - 8)))
+    } else if n >= 4 {
+        let a = u32::from_le_bytes(r[..4].try_into().unwrap()) as u128;
+        let b = u32::from_le_bytes(r[n - 4..].try_into().unwrap()) as u128;
+        a | (b << (8 * (n - 4)))
+    } else if n > 0 {
+        // First, middle and last byte cover 1..=3 bytes.
+        let w = r[0] as u128 | (r[n >> 1] as u128) << 8 | (r[n - 1] as u128) << 16;
+        w & ((1u128 << (8 * n)) - 1)
+    } else {
+        0
+    };
+    let lo = lo | (0x80u128 << (8 * n));
+    (lo, lo)
 }
 
 // Hashes `out.len()` messages of `message_len` bytes each, stored back to back in `data`.
@@ -175,6 +199,26 @@ pub(crate) fn absorb_hash256_var_into(messages: &[&[u8]], domain: u128, out: &mu
 
 pub(crate) fn absorb_hash128_var_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
     crate::dispatch::dispatch_hash128_var_into(messages, domain, out);
+}
+
+#[cfg(feature = "ffi")]
+pub(crate) fn absorb_hash256_var_raw_into(
+    messages: crate::dispatch::RawMessages<'_>,
+    total_bytes: usize,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) {
+    crate::dispatch::dispatch_hash256_var_raw_into(messages, total_bytes, domain, out);
+}
+
+#[cfg(feature = "ffi")]
+pub(crate) fn absorb_hash128_var_raw_into(
+    messages: crate::dispatch::RawMessages<'_>,
+    total_bytes: usize,
+    domain: u128,
+    out: &mut [[u8; 16]],
+) {
+    crate::dispatch::dispatch_hash128_var_raw_into(messages, total_bytes, domain, out);
 }
 
 // ==========================================

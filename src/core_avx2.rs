@@ -381,7 +381,6 @@ unsafe fn store_soa_ptr(w0: U64x4, w1: U64x4, w2: U64x4, w3: U64x4, p: *mut u64)
 // IDM CORE
 // ======================================================
 
-// SIMD IMPLEMENTATION OF IDM MIXING CORE
 #[inline(always)]
 unsafe fn idm_core(
     mut a: U64x4,
@@ -445,9 +444,10 @@ unsafe fn idm_core(
 }
 
 // ======================================================
-// LANE PREPARE
+// ERD CORE
 // ======================================================
 
+// LANE PREPARE
 #[inline(always)]
 unsafe fn lane_prepare(s0_xor: U128x4, s1_xor: U128x4, consts: &SimdConsts) -> (U64x4, U64x4) {
     // Build the first working stream.
@@ -485,9 +485,7 @@ unsafe fn lane_prepare(s0_xor: U128x4, s1_xor: U128x4, consts: &SimdConsts) -> (
     (v0, v1)
 }
 
-// ======================================================
 // LANE KEY SCHEDULE
-// ======================================================
 // Derives per-lane rotation keys from the prepared working streams.
 
 #[inline(always)]
@@ -515,9 +513,7 @@ unsafe fn lane_key_schedule(v0: U64x4, v1: U64x4, consts: &SimdConsts) -> (U64x4
     (k0, k1)
 }
 
-// ======================================================
 // LANE MIX ROTATE
-// ======================================================
 // Applies variable-rotation mixing using the
 // rotation keys produced by lane_key_schedule().
 //
@@ -546,9 +542,7 @@ unsafe fn lane_mix_rotate(
     (v0, v1)
 }
 
-// ======================================================
 // LANE FINALIZE AND PROJECT
-// ======================================================
 // Finalizes the working streams and converts them into bounded rotation values.
 
 #[inline(always)]
@@ -584,9 +578,7 @@ unsafe fn lane_finalize_and_project(v0: U64x4, v1: U64x4, consts: &SimdConsts) -
     (rot0, rot1)
 }
 
-// ======================================================
 // LANE APPLY ROTATION
-// ======================================================
 // Applies the final variable 128-bit rotation to the state.
 
 #[inline(always)]
@@ -899,7 +891,16 @@ pub(crate) unsafe fn hash_fixed_x4<const N: usize>(
 
 // A group of unequal lengths goes to the masked kernel when its blocks fill at least this
 // percentage of the lanes' steps (sum of blocks / (4 * longest)), else scalar.
-const MIN_GROUP_FILL_PCT: usize = 40;
+pub(crate) const MIN_GROUP_FILL_PCT: usize = 40;
+
+// Messages regrouped together by block count (at most 256: the order is kept as bytes).
+const VAR_WINDOW: usize = 256;
+
+// Groups at the start of a window that decide whether it is regrouped.
+const VAR_SAMPLE_GROUPS: usize = 4;
+
+// Up to this many blocks the order is a counting sort, above it a comparison sort.
+const COUNTING_SORT_MAX_BLOCKS: usize = 64;
 
 // Number of absorb steps of a message (the padded last block counts).
 #[inline(always)]
@@ -907,24 +908,46 @@ fn message_blocks(m: &[u8]) -> usize {
     m.len() / 32 + (!m.len().is_multiple_of(32) || m.is_empty()) as usize
 }
 
-// Block `j` of `m` as one 32-byte row: a full block, the padded last block (folded like
-// `finalize_terminator`), or zero once the message is finished.
+// Last partial block of a message as one 32-byte row: `rem` bytes (1..=31) at `p`, then 0x80,
+// the rest zero; for `rem < 16` the high half repeats the low one, like `finalize_terminator`.
+// Reads exactly `rem` bytes of `p`.
 #[inline(always)]
-unsafe fn load_row_var(m: &[u8], j: usize, tail: &mut [u8; 32]) -> __m256i {
+unsafe fn tail_row(p: *const u8, rem: usize) -> __m256i {
+    debug_assert!((1..32).contains(&rem));
+    let (n4, r4) = (rem / 4, rem % 4);
+    let iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    // Whole 4-byte words; masked-out words are not read.
+    let words = _mm256_maskload_epi32(
+        p as *const i32,
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(n4 as i32), iota),
+    );
+    // The last `r4` (0..=3) bytes in one word: first, middle and last byte, each kept or
+    // cleared by `r4`. With `r4 == 0` the indices stay inside the message and the word is cleared.
+    let i0 = 4 * n4 - (r4 == 0) as usize;
+    let b = |i: usize| *p.add(i) as u32;
+    let w = b(i0) | b(i0 + (r4 >> 1)) << 8 | b(i0 + r4 - 1) << 16;
+    let w = (w & ((1u32 << (8 * r4)) - 1)) | (0x80u32 << (8 * r4));
+    let slot = _mm256_cmpeq_epi32(iota, _mm256_set1_epi32(n4 as i32));
+    let row = _mm256_or_si256(words, _mm256_and_si256(slot, _mm256_set1_epi32(w as i32)));
+    let dup = _mm256_permute2x128_si256(row, row, 0x00);
+    _mm256_blendv_epi8(row, dup, _mm256_set1_epi32(-((rem < 16) as i32)))
+}
+
+// Block `j` of `m` as one 32-byte row: a full block, the padded last block, or zero once the
+// message is finished.
+#[inline(always)]
+unsafe fn load_row_var(m: &[u8], j: usize) -> __m256i {
     let full = m.len() / 32;
     if j < full {
         _mm256_loadu_si256(m.as_ptr().add(32 * j) as *const __m256i)
     } else if j == full && (!m.len().is_multiple_of(32) || m.is_empty()) {
         let rem = m.len() - 32 * full;
-        *tail = [0u8; 32];
-        std::ptr::copy_nonoverlapping(m.as_ptr().add(32 * full), tail.as_mut_ptr(), rem);
-        tail[rem] = 0x80;
-        if rem < 16 {
-            // The high half is still zero here.
-            let (lo, hi) = tail.split_at_mut(16);
-            hi.copy_from_slice(lo);
+        if rem == 0 {
+            // Empty message: only the padding byte, in both halves.
+            _mm256_setr_epi32(0x80, 0, 0, 0, 0x80, 0, 0, 0)
+        } else {
+            tail_row(m.as_ptr().add(32 * full), rem)
         }
-        _mm256_loadu_si256(tail.as_ptr() as *const __m256i)
     } else {
         _mm256_setzero_si256()
     }
@@ -971,13 +994,12 @@ unsafe fn absorb_group_var_x4(
         s1 = xor_u128(x1, s1);
     }
 
-    let mut tail = [0u8; 32];
     for j in min_full..max_blocks {
         let (b0, b1) = rows_to_blocks(
-            load_row_var(msgs[0], j, &mut tail),
-            load_row_var(msgs[1], j, &mut tail),
-            load_row_var(msgs[2], j, &mut tail),
-            load_row_var(msgs[3], j, &mut tail),
+            load_row_var(msgs[0], j),
+            load_row_var(msgs[1], j),
+            load_row_var(msgs[2], j),
+            load_row_var(msgs[3], j),
         );
         let active = _mm256_cmpgt_epi64(blocks_v, _mm256_set1_epi64x(j as i64));
         let mut x0 = xor_u128(s0, b0);
@@ -997,23 +1019,20 @@ unsafe fn absorb_group_var_x4(
     (s0, s1)
 }
 
-// HASHES `out.len()` MESSAGES OF ANY LENGTHS, 4 PER GROUP; THE LAST 0..=3 RUN SCALAR.
-// A group of equal lengths takes the `absorb_group_x4` path; a group of unequal lengths
-// the masked kernel, or scalar when `25 * sum_of_blocks < min_fill_pct * longest_in_blocks`
-// (`min_fill_pct` = 0: never scalar).
+// HASHES `out.len()` MESSAGES OF ANY LENGTHS IN THE GIVEN ORDER, 4 PER GROUP; THE LAST 0..=3
+// RUN SCALAR. A group of equal lengths takes the `absorb_group_x4` path; a group of unequal
+// lengths the masked kernel, or scalar when
+// `25 * sum_of_blocks < min_fill_pct * longest_in_blocks` (`min_fill_pct` = 0: never scalar).
 // `N` IS THE DIGEST LENGTH, 16 OR 32.
 // PRECONDITION: CPU supports AVX2 (caller checks at runtime).
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn hash_var_x4_with<const N: usize>(
+unsafe fn hash_var_x4_in_order<const N: usize>(
     messages: &[&[u8]],
     domain: u128,
     out: &mut [[u8; N]],
     min_fill_pct: usize,
+    consts: &SimdConsts,
 ) {
-    const { assert!(N == 16 || N == 32) };
-    assert_eq!(messages.len(), out.len(), "hash_var_x4: length mismatch");
-
-    let consts = make_consts();
     let groups = out.len() / 4;
 
     for (msgs, block) in messages.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
@@ -1025,7 +1044,7 @@ pub(crate) unsafe fn hash_var_x4_with<const N: usize>(
                 msgs[2].as_ptr(),
                 msgs[3].as_ptr(),
             ];
-            absorb_group_x4(&ptrs, len, domain, &consts)
+            absorb_group_x4(&ptrs, len, domain, consts)
         } else {
             let sum: usize = msgs.iter().map(|m| message_blocks(m)).sum();
             let max = msgs.iter().map(|m| message_blocks(m)).max().unwrap_or(0);
@@ -1036,7 +1055,7 @@ pub(crate) unsafe fn hash_var_x4_with<const N: usize>(
                 }
                 continue;
             }
-            absorb_group_var_x4([msgs[0], msgs[1], msgs[2], msgs[3]], domain, &consts)
+            absorb_group_var_x4([msgs[0], msgs[1], msgs[2], msgs[3]], domain, consts)
         };
         store_digests_x4(s0, s1, block);
     }
@@ -1045,6 +1064,158 @@ pub(crate) unsafe fn hash_var_x4_with<const N: usize>(
         let (s0, s1) = crate::api::absorb_with_domain(m, domain);
         write_digest(d, s0, s1);
     }
+}
+
+// Whether each of the first `VAR_SAMPLE_GROUPS` groups of `messages` has one block count,
+// i.e. the given order already fills the lanes.
+#[inline(always)]
+fn sample_uniform(messages: &[&[u8]]) -> bool {
+    messages.chunks_exact(4).take(VAR_SAMPLE_GROUPS).all(|g| {
+        let b = message_blocks(g[0]);
+        g[1..].iter().all(|m| message_blocks(m) == b)
+    })
+}
+
+// Same as `hash_var_x4_in_order`, but the groups are formed after ordering the messages by
+// block count, so that the lanes of a group finish together. A digest goes to the position
+// of its message. Takes 4..=`VAR_WINDOW` messages.
+// PRECONDITION: CPU supports AVX2 (caller checks at runtime).
+#[target_feature(enable = "avx2")]
+unsafe fn hash_var_x4_regrouped<const N: usize>(
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    min_fill_pct: usize,
+    consts: &SimdConsts,
+) {
+    let n = messages.len();
+    debug_assert!((4..=VAR_WINDOW).contains(&n));
+    let mut blocks = [0u32; VAR_WINDOW];
+    for (b, m) in blocks.iter_mut().zip(messages) {
+        // Saturates for messages of 128 GiB and more; only the order and the fill estimate use it.
+        *b = message_blocks(m).min(u32::MAX as usize) as u32;
+    }
+
+    // `order[k]`: index of the message in position `k`.
+    let mut order = [0u8; VAR_WINDOW];
+    let max_blocks = blocks[..n].iter().copied().max().unwrap_or(0) as usize;
+    if max_blocks <= COUNTING_SORT_MAX_BLOCKS {
+        let mut start = [0u16; COUNTING_SORT_MAX_BLOCKS + 2];
+        for &b in &blocks[..n] {
+            start[b as usize + 1] += 1;
+        }
+        for i in 1..start.len() {
+            start[i] += start[i - 1];
+        }
+        for (k, &b) in blocks[..n].iter().enumerate() {
+            let slot = &mut start[b as usize];
+            order[*slot as usize] = k as u8;
+            *slot += 1;
+        }
+    } else {
+        let mut keys = [0u64; VAR_WINDOW];
+        for (k, &b) in blocks[..n].iter().enumerate() {
+            keys[k] = (b as u64) << 8 | k as u64;
+        }
+        keys[..n].sort_unstable();
+        for (o, &key) in order.iter_mut().zip(&keys[..n]) {
+            *o = key as u8;
+        }
+    }
+
+    let groups = n / 4;
+    for ids in order[..4 * groups].chunks_exact(4) {
+        let ids = [
+            ids[0] as usize,
+            ids[1] as usize,
+            ids[2] as usize,
+            ids[3] as usize,
+        ];
+        let msgs = [
+            messages[ids[0]],
+            messages[ids[1]],
+            messages[ids[2]],
+            messages[ids[3]],
+        ];
+        let len = msgs[0].len();
+        let (s0, s1) = if msgs[1..].iter().all(|m| m.len() == len) {
+            let ptrs = [
+                msgs[0].as_ptr(),
+                msgs[1].as_ptr(),
+                msgs[2].as_ptr(),
+                msgs[3].as_ptr(),
+            ];
+            absorb_group_x4(&ptrs, len, domain, consts)
+        } else {
+            let sum: usize = ids.iter().map(|&i| blocks[i] as usize).sum();
+            let max = ids.iter().map(|&i| blocks[i] as usize).max().unwrap_or(0);
+            if 25 * sum < min_fill_pct * max {
+                for (m, &i) in msgs.iter().zip(&ids) {
+                    let (s0, s1) = crate::api::absorb_with_domain(m, domain);
+                    write_digest(&mut out[i], s0, s1);
+                }
+                continue;
+            }
+            absorb_group_var_x4(msgs, domain, consts)
+        };
+        let mut digests = [[0u8; N]; 4];
+        store_digests_x4(s0, s1, &mut digests);
+        for (&i, d) in ids.iter().zip(digests) {
+            out[i] = d;
+        }
+    }
+
+    for &i in &order[4 * groups..n] {
+        let (s0, s1) = crate::api::absorb_with_domain(messages[i as usize], domain);
+        write_digest(&mut out[i as usize], s0, s1);
+    }
+}
+
+// HASHES `out.len()` MESSAGES OF ANY LENGTHS, `window` MESSAGES AT A TIME (A MULTIPLE OF 4,
+// AT MOST `VAR_WINDOW`; 0 = ONE WINDOW IN THE GIVEN ORDER, NO REGROUPING).
+// A window whose first groups already have one block count each is hashed in the given order;
+// any other is regrouped by block count. See `hash_var_x4_in_order` for the groups.
+// `N` IS THE DIGEST LENGTH, 16 OR 32.
+// PRECONDITION: CPU supports AVX2 (caller checks at runtime).
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn hash_var_x4_window<const N: usize>(
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    min_fill_pct: usize,
+    window: usize,
+) {
+    const { assert!(N == 16 || N == 32) };
+    assert_eq!(messages.len(), out.len(), "hash_var_x4: length mismatch");
+    assert!(
+        window.is_multiple_of(4) && window <= VAR_WINDOW,
+        "hash_var_x4: bad window"
+    );
+
+    let consts = make_consts();
+    if window == 0 {
+        hash_var_x4_in_order::<N>(messages, domain, out, min_fill_pct, &consts);
+        return;
+    }
+    for (m, o) in messages.chunks(window).zip(out.chunks_mut(window)) {
+        if sample_uniform(m) {
+            hash_var_x4_in_order::<N>(m, domain, o, min_fill_pct, &consts);
+        } else {
+            hash_var_x4_regrouped::<N>(m, domain, o, min_fill_pct, &consts);
+        }
+    }
+}
+
+// `hash_var_x4_window` with the shipped window.
+// PRECONDITION: CPU supports AVX2 (caller checks at runtime).
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn hash_var_x4_with<const N: usize>(
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    min_fill_pct: usize,
+) {
+    hash_var_x4_window::<N>(messages, domain, out, min_fill_pct, VAR_WINDOW)
 }
 
 // `hash_var_x4_with` with the shipped group threshold.
