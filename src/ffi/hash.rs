@@ -96,7 +96,7 @@ pub unsafe extern "C" fn lustro_hash128(
 /// for `n * 32` writable bytes.
 /// The input and output regions must not overlap.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_hash256_many(
+pub unsafe extern "C" fn lustro_hash256_many_fixed(
     data_ptr: *const u8,
     n: usize,
     message_len: usize,
@@ -133,19 +133,14 @@ pub unsafe extern "C" fn lustro_hash256_many(
             return LustroError::InvalidPointer;
         }
 
-        let messages: Vec<&[u8]> = if message_len == 0 {
-            vec![&[][..]; n]
-        } else {
-            data.chunks_exact(message_len).collect()
-        };
-
         let out_blocks: &mut [[u8; 32]] = match slice_out(out_ptr as *mut [u8; 32], n) {
             Some(v) => v,
             None => return LustroError::InvalidPointer,
         };
 
-        crate::api::absorb_hash256_batch_into(
-            &messages,
+        crate::api::absorb_hash256_fixed_into(
+            data,
+            message_len,
             crate::constants::Domain::Hash as u128,
             out_blocks,
         );
@@ -162,7 +157,7 @@ pub unsafe extern "C" fn lustro_hash256_many(
 /// for `n * 16` writable bytes.
 /// The input and output regions must not overlap.
 #[no_mangle]
-pub unsafe extern "C" fn lustro_hash128_many(
+pub unsafe extern "C" fn lustro_hash128_many_fixed(
     data_ptr: *const u8,
     n: usize,
     message_len: usize,
@@ -199,19 +194,14 @@ pub unsafe extern "C" fn lustro_hash128_many(
             return LustroError::InvalidPointer;
         }
 
-        let messages: Vec<&[u8]> = if message_len == 0 {
-            vec![&[][..]; n]
-        } else {
-            data.chunks_exact(message_len).collect()
-        };
-
         let out_blocks: &mut [[u8; 16]] = match slice_out(out_ptr as *mut [u8; 16], n) {
             Some(v) => v,
             None => return LustroError::InvalidPointer,
         };
 
-        crate::api::absorb_hash128_batch_into(
-            &messages,
+        crate::api::absorb_hash128_fixed_into(
+            data,
+            message_len,
             crate::constants::Domain::Hash as u128,
             out_blocks,
         );
@@ -319,7 +309,7 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        crate::api::absorb_hash256_batch_into(
+        crate::api::absorb_hash256_var_into(
             &messages,
             crate::constants::Domain::Hash as u128,
             out_blocks,
@@ -427,7 +417,7 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        crate::api::absorb_hash128_batch_into(
+        crate::api::absorb_hash128_var_into(
             &messages,
             crate::constants::Domain::Hash as u128,
             out_blocks,

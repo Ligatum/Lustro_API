@@ -5,8 +5,10 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RuntimeInfo {
-    /// Backend for batch streams: `"scalar"` or `"avx2"`. AVX2 is used from 4 lanes
-    /// up; hashing and single streams are always scalar.
+    /// Backend selected for batches of streams and hashes (fixed and variable length):
+    /// `"scalar"` or `"avx2"`. AVX2 is used from 4 lanes (or messages) up. Smaller
+    /// batches, fixed-length hashes of empty messages, single hashes and single streams
+    /// run scalar.
     pub backend: &'static str,
     /// Threads for parallel batches. 0 = batches run on the calling thread
     /// (disabled by the settings or built without `parallel`).

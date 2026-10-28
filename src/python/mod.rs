@@ -21,10 +21,10 @@ pub fn lustro_api_version() -> u32 {
     crate::api::LUSTRO_API_VERSION
 }
 
-/// Execution settings of this process as a dict: `backend` ("scalar" or "avx2")
-/// and `threads` (configured pool size, 0 = calling thread only). The pool is not
-/// started by this call; see `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT`,
-/// `LUSTRO_DISABLE_SIMD`.
+/// Execution settings of this process as a dict: `backend` ("scalar" or "avx2", as
+/// selected for stream and hash batches) and `threads` (configured pool size, 0 = calling
+/// thread only). The pool is not started by this call; see `LUSTRO_NUM_THREADS`,
+/// `LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`.
 #[pyfunction]
 pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     let info = crate::api::runtime_info();

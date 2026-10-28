@@ -11,7 +11,8 @@ mod core_avx2;
 mod dispatch;
 pub use api::{configure, lustro_api_version, runtime_info};
 pub use hash::{
-    hash128, hash128_many, hash128_many_into, hash256, hash256_many, hash256_many_into,
+    hash128, hash128_many_fixed_into, hash128_many_var, hash128_many_var_into, hash256,
+    hash256_many_fixed_into, hash256_many_var, hash256_many_var_into,
 };
 pub use prng::{LustroPrng, LustroPrngBatch};
 #[cfg(feature = "entropy")]
@@ -46,10 +47,7 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash256_many_var_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_py, m)?)?;
-    m.add(
-        "SnapshotError",
-        m.py().get_type::<python::SnapshotError>(),
-    )?;
+    m.add("SnapshotError", m.py().get_type::<python::SnapshotError>())?;
     m.add_class::<python::prng::LustroPrngPy>()?;
     m.add_class::<python::prng::LustroPrngBatchPy>()?;
     m.add_class::<python::xof::LustroXofPy>()?;

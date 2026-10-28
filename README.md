@@ -536,22 +536,26 @@ every identifier in `path` is a `fork`, since the message already is the root.
 
 ## Batches
 
-Many independent streams in one object, for PRNG and XOF alike.
-
-A PRNG or XOF batch produces output in steps: `fill_blocks(out, steps)` writes `steps` blocks for every stream. `steps` only sets how much one call produces. The same total split over several calls gives every stream the same blocks. `suggested_steps()` returns a `steps` chosen for speed at the current number of streams and backend (`LUSTRO_DISABLE_SIMD` can change it). It is a hint only: any `steps` gives correct output. The output holds `len() * steps` blocks, so with many streams check its size before allocating.
-
 ### Batch Hash
 
-Hash many messages in one call.
+Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; `*_many_var` takes messages of any lengths. NOTE: The `*_many_var` is not tuned as far as `*_many_fixed` (kernel and FFI path); for messages of one length please use `*_many_fixed`.
 
 **Rust**
 
 ```rust
-use lustro::hash256_many;
+use lustro::{hash256_many_fixed_into, hash256_many_var, Hash256};
 
+// Messages of any length.
 let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
-let digests = hash256_many(&messages);
+let digests = hash256_many_var(&messages);
+
+// Messages of one length, stored back to back.
+let data = [0u8; 3 * 16];
+let mut out = vec![Hash256::default(); 3];
+hash256_many_fixed_into(&data, 16, &mut out);
 ```
+
+`hash256_many_var_into(&messages, &mut out)` writes into a slice you provide. `hash256_many_fixed_into` panics if `data.len() != out.len() * message_len`.
 
 **Python**
 
@@ -561,7 +565,7 @@ import lustro
 
 # Equal-length messages: one message per row of a 2D uint8 array.
 rows = np.zeros((3, 16), dtype=np.uint8)
-digests = lustro.hash256_many(rows)  # uint8 array, shape (3, 32)
+digests = lustro.hash256_many_fixed(rows)  # uint8 array, shape (3, 32)
 
 # Messages of any length: a sequence of bytes or byte buffers.
 digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
@@ -575,7 +579,7 @@ digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
 /* Equal-length messages, stored back to back. */
 uint8_t rows[3][16] = {{0}};
 uint8_t digests[3][LUSTRO_HASH256_LEN];
-lustro_hash256_many((const uint8_t *)rows, 3, 16, (uint8_t *)digests);
+lustro_hash256_many_fixed((const uint8_t *)rows, 3, 16, (uint8_t *)digests);
 
 /* Messages of any length. */
 const uint8_t *messages[] = {
@@ -588,11 +592,17 @@ uintptr_t lengths[] = {1, 2, 0};
 lustro_hash256_many_var(messages, 3, lengths, (uint8_t *)digests);
 ```
 
-Naming differs between the Rust API and the C/Python APIs. In Rust, `hash256_many` takes messages of any length. In C and Python, `*_many` expects messages of equal length, and the any-length variant is `*_many_var`. `hash128_many` and `hash128_many_var` work the same way and return 16-byte digests.
+The names mean the same in Rust, Python and C/C++. `hash128_*` and `lustro_hash128_*` work the same way and return 16-byte digests.
+
+Both variants use AVX2 for batches of 4 or more messages when the CPU supports it, and send large batches to the thread pool. The digests do not depend on the backend or on the number of threads.
 
 ---
 
 ### Batch PRNG and XOF
+
+Many independent streams in one object, for PRNG and XOF alike.
+
+A PRNG or XOF batch produces output in steps: `fill_blocks(out, steps)` writes `steps` blocks for every stream. `steps` only sets how much one call produces. The same total split over several calls gives every stream the same blocks. `suggested_steps()` returns a `steps` chosen for speed at the current number of streams and backend (`LUSTRO_DISABLE_SIMD` can change it). It is a hint only: any `steps` gives correct output. The output holds `len() * steps` blocks, so with many streams check its size before allocating.
 
 **Rust**
 
@@ -1387,7 +1397,7 @@ The snapshot size is `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSH
 
 ### Runtime Settings
 
-Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before the first batch call.
+Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before the first hash batch call or batch `fill_blocks`/`blocks`. They apply to hash batches as well as to PRNG and XOF batches.
 
 `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` are set by `1`, `true`, `on` or `yes` and are not set by `0`, `false`, `off`, `no` or an empty value (case is ignored). Any other value sets them.
 
@@ -1426,7 +1436,7 @@ if (err != LUSTRO_ERROR_OK) {
 
 Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you pass override it. `threads` is capped at the number of logical CPUs, and `1` disables the thread pool. `allow_simd=False` (`LUSTRO_SIMD_SCALAR` in C/C++) selects the scalar backend.
 
-The settings can be set only once. The first batch call, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` shows what ended up in effect.
+The settings can be set only once. The first hash batch call, batch `fill_blocks`/`blocks`, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` shows what ended up in effect.
 
 ---
 

@@ -108,8 +108,8 @@ uint32_t lustro_api_version(void);
 uintptr_t lustro_runtime_threads(void);
 
 /**
- * Returns the stream backend as a static NUL-terminated string ("scalar" or
- * "avx2"). Never NULL; do not free.
+ * Returns the backend for batches of streams and hashes as a static NUL-terminated
+ * string ("scalar" or "avx2"). Never NULL; do not free.
  */
 const char *lustro_runtime_backend(void);
 
@@ -163,10 +163,10 @@ LustroError lustro_hash128(const uint8_t *data, uintptr_t data_len, uint8_t *out
  * for `n * 32` writable bytes.
  * The input and output regions must not overlap.
  */
-LustroError lustro_hash256_many(const uint8_t *data_ptr,
-                                uintptr_t n,
-                                uintptr_t message_len,
-                                uint8_t *out_ptr);
+LustroError lustro_hash256_many_fixed(const uint8_t *data_ptr,
+                                      uintptr_t n,
+                                      uintptr_t message_len,
+                                      uint8_t *out_ptr);
 
 /**
  * Hashes `n` fixed-length messages into 128-bit digests.
@@ -178,10 +178,10 @@ LustroError lustro_hash256_many(const uint8_t *data_ptr,
  * for `n * 16` writable bytes.
  * The input and output regions must not overlap.
  */
-LustroError lustro_hash128_many(const uint8_t *data_ptr,
-                                uintptr_t n,
-                                uintptr_t message_len,
-                                uint8_t *out_ptr);
+LustroError lustro_hash128_many_fixed(const uint8_t *data_ptr,
+                                      uintptr_t n,
+                                      uintptr_t message_len,
+                                      uint8_t *out_ptr);
 
 /**
  * Hashes `n` variable-length messages.

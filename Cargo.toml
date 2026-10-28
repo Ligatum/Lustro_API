@@ -4,12 +4,15 @@ version      = "1.0.0"
 edition      = "2021"
 rust-version = "1.90"
 description  = "Lustro V1 is a 256-bit deterministic, single-pass diffusion engine with HASH/PRNG/XOF capabilities, providing live state-forking (stream tree branching)"
+readme       = "README.md"
 license-file = "LICENSE.md"
 repository   = "https://github.com/Ligatum/Lustro_API"
 homepage     = "https://github.com/Ligatum/Lustro"
-readme       = "README.md"
 keywords     = ["prng", "hash", "xof", "rng", "forking"]
 categories   = ["algorithms", "game-development", "simulation"]
+
+[package.metadata]
+FAQ          = "https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md"
 
 [lib]
 name       = "lustro"

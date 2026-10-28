@@ -10,11 +10,12 @@ profile  = "release"
 [project]
 name = "lustro"
 readme = "README.md"
+license-file = "LICENSE.md"
 requires-python = ">=3.9,<3.14"
 dependencies = ["numpy"]
 dynamic = ["version", "description"]
 
 [project.urls]
-Homepage   = "https://github.com/Ligatum/Lustro"
-Repository = "https://github.com/Ligatum/Lustro_API"
 FAQ        = "https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md"
+Repository = "https://github.com/Ligatum/Lustro_API"
+Homepage   = "https://github.com/Ligatum/Lustro"

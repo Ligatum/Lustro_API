@@ -6,6 +6,7 @@
 
 use std::arch::x86_64::*;
 
+use crate::constants::{IV_S0, IV_S1};
 use crate::core::{PHI_64, PHI_64_ROT_17, PHI_64_ROT_23};
 
 use crate::dispatch::StreamLane;
@@ -328,17 +329,15 @@ unsafe fn rotl_u128_var(x: U128x4, r: U64x4, consts: &SimdConsts) -> U128x4 {
 // MEMORY: AoS <-> SoA (VECTOR TRANSPOSE)
 // ======================================================
 
-// 4x4 TRANSPOSE: 4 lanes of [w0, w1, w2, w3] in memory -> 4 vectors (w0..w3),
-// vector j holds word j of every lane.
+// 4x4 TRANSPOSE OF 4 BLOCKS: row r is block r as [w0, w1, w2, w3]; vector j holds
+// word j of every block.
 #[inline(always)]
-unsafe fn load_soa(chunk: &[u64]) -> (U64x4, U64x4, U64x4, U64x4) {
-    let p = chunk.as_ptr() as *const __m256i;
-
-    let r0 = _mm256_loadu_si256(p.add(0));
-    let r1 = _mm256_loadu_si256(p.add(1));
-    let r2 = _mm256_loadu_si256(p.add(2));
-    let r3 = _mm256_loadu_si256(p.add(3));
-
+unsafe fn transpose_blocks(
+    r0: __m256i,
+    r1: __m256i,
+    r2: __m256i,
+    r3: __m256i,
+) -> (U64x4, U64x4, U64x4, U64x4) {
     let t0 = _mm256_unpacklo_epi64(r0, r1);
     let t1 = _mm256_unpackhi_epi64(r0, r1);
     let t2 = _mm256_unpacklo_epi64(r2, r3);
@@ -352,25 +351,30 @@ unsafe fn load_soa(chunk: &[u64]) -> (U64x4, U64x4, U64x4, U64x4) {
     (U64x4(a), U64x4(b), U64x4(c), U64x4(d))
 }
 
+// 4 lanes of [w0, w1, w2, w3] in memory -> 4 vectors (w0..w3).
+#[inline(always)]
+unsafe fn load_soa(chunk: &[u64]) -> (U64x4, U64x4, U64x4, U64x4) {
+    let p = chunk.as_ptr() as *const __m256i;
+    transpose_blocks(
+        _mm256_loadu_si256(p.add(0)),
+        _mm256_loadu_si256(p.add(1)),
+        _mm256_loadu_si256(p.add(2)),
+        _mm256_loadu_si256(p.add(3)),
+    )
+}
+
 // INVERSE OF load_soa: writes 4 lanes as [w0, w1, w2, w3] each
 // (16 u64 = 4 contiguous 32-byte blocks).
 #[inline(always)]
 unsafe fn store_soa_ptr(w0: U64x4, w1: U64x4, w2: U64x4, w3: U64x4, p: *mut u64) {
-    let t0 = _mm256_unpacklo_epi64(w0.0, w1.0);
-    let t1 = _mm256_unpackhi_epi64(w0.0, w1.0);
-    let t2 = _mm256_unpacklo_epi64(w2.0, w3.0);
-    let t3 = _mm256_unpackhi_epi64(w2.0, w3.0);
-
-    let r0 = _mm256_permute2x128_si256(t0, t2, 0x20);
-    let r1 = _mm256_permute2x128_si256(t1, t3, 0x20);
-    let r2 = _mm256_permute2x128_si256(t0, t2, 0x31);
-    let r3 = _mm256_permute2x128_si256(t1, t3, 0x31);
+    // The 4x4 transpose is its own inverse.
+    let (r0, r1, r2, r3) = transpose_blocks(w0.0, w1.0, w2.0, w3.0);
 
     let p = p as *mut __m256i;
-    _mm256_storeu_si256(p.add(0), r0);
-    _mm256_storeu_si256(p.add(1), r1);
-    _mm256_storeu_si256(p.add(2), r2);
-    _mm256_storeu_si256(p.add(3), r3);
+    _mm256_storeu_si256(p.add(0), r0.0);
+    _mm256_storeu_si256(p.add(1), r1.0);
+    _mm256_storeu_si256(p.add(2), r2.0);
+    _mm256_storeu_si256(p.add(3), r3.0);
 }
 
 // ======================================================
@@ -726,4 +730,330 @@ pub(crate) unsafe fn process_lanes_x4(
 
         store_lanes_x4(s0, s1, add(step, steps_v), group);
     }
+}
+
+// ======================================================
+// HASH X4 (COMMON)
+// ======================================================
+
+#[inline(always)]
+unsafe fn splat_u128(v: u128) -> U128x4 {
+    U128x4 {
+        hi: splat((v >> 64) as u64),
+        lo: splat(v as u64),
+    }
+}
+
+// 4 rows of 32 bytes (one per message) as (b0, b1), the two u128 halves.
+#[inline(always)]
+unsafe fn rows_to_blocks(r0: __m256i, r1: __m256i, r2: __m256i, r3: __m256i) -> (U128x4, U128x4) {
+    let (lo0, hi0, lo1, hi1) = transpose_blocks(r0, r1, r2, r3);
+    (U128x4 { hi: hi0, lo: lo0 }, U128x4 { hi: hi1, lo: lo1 })
+}
+
+// Digest of one message, first `N` bytes of s0 || s1 (little endian).
+#[inline(always)]
+fn write_digest<const N: usize>(out: &mut [u8; N], s0: u128, s1: u128) {
+    out[..16].copy_from_slice(&s0.to_le_bytes());
+    if let Some(hi) = out.get_mut(16..32) {
+        hi.copy_from_slice(&s1.to_le_bytes());
+    }
+}
+
+// Digests of the 4 lanes into `block` (4 digests).
+#[inline(always)]
+unsafe fn store_digests_x4<const N: usize>(s0: U128x4, s1: U128x4, block: &mut [[u8; N]]) {
+    debug_assert_eq!(block.len(), 4);
+    if N == 32 {
+        // 4 consecutive digests, [s0_lo, s0_hi, s1_lo, s1_hi] (LE)
+        store_soa_ptr(s0.lo, s0.hi, s1.lo, s1.hi, block.as_mut_ptr() as *mut u64);
+    } else {
+        let mut lo = [0u64; 4];
+        let mut hi = [0u64; 4];
+        _mm256_storeu_si256(lo.as_mut_ptr() as *mut __m256i, s0.lo.0);
+        _mm256_storeu_si256(hi.as_mut_ptr() as *mut __m256i, s0.hi.0);
+        for (i, d) in block.iter_mut().enumerate() {
+            d[..8].copy_from_slice(&lo[i].to_le_bytes());
+            d[8..16].copy_from_slice(&hi[i].to_le_bytes());
+        }
+    }
+}
+
+// ======================================================
+// HASH X4 (FIXED MESSAGE LENGTH)
+// ======================================================
+
+// Block at `off` of each of the 4 messages as (b0, b1), the two u128 halves.
+#[inline(always)]
+unsafe fn load_message_blocks(msgs: &[*const u8; 4], off: usize) -> (U128x4, U128x4) {
+    let r = |i: usize| _mm256_loadu_si256(msgs[i].add(off) as *const __m256i);
+    rows_to_blocks(r(0), r(1), r(2), r(3))
+}
+
+// Last partial block of each message (`rem` bytes, 0..=31) as (b0, b1), padded and
+// folded like `finalize_terminator`.
+#[inline(always)]
+unsafe fn load_message_tails(msgs: &[*const u8; 4], off: usize, rem: usize) -> (U128x4, U128x4) {
+    let mut buf = [0u8; 128];
+    for (i, m) in msgs.iter().enumerate() {
+        let blk = &mut buf[32 * i..32 * (i + 1)];
+        std::ptr::copy_nonoverlapping(m.add(off), blk.as_mut_ptr(), rem);
+        blk[rem] = 0x80;
+        if rem < 16 {
+            // The high half is still zero here.
+            let (lo, hi) = blk.split_at_mut(16);
+            hi.copy_from_slice(lo);
+        }
+    }
+    let p = buf.as_ptr() as *const __m256i;
+    rows_to_blocks(
+        _mm256_loadu_si256(p),
+        _mm256_loadu_si256(p.add(1)),
+        _mm256_loadu_si256(p.add(2)),
+        _mm256_loadu_si256(p.add(3)),
+    )
+}
+
+// `absorb_with_domain` for 4 messages of `message_len` bytes each, one per lane.
+#[inline(always)]
+unsafe fn absorb_group_x4(
+    msgs: &[*const u8; 4],
+    message_len: usize,
+    domain: u128,
+    consts: &SimdConsts,
+) -> (U128x4, U128x4) {
+    let len64 = (message_len as u64).wrapping_mul(8);
+    let init0 = IV_S0 ^ domain;
+    let init1 = IV_S1 ^ (((len64.rotate_left(17) as u128) << 64) | (len64 as u128));
+    let mut s0 = splat_u128(init0);
+    let mut s1 = splat_u128(init1);
+    // Step 0: the round constant of `evaluate_scalar`.
+    let rc = splat(PHI_64.wrapping_mul(2));
+
+    let full = message_len / 32;
+    for j in 0..full {
+        let (b0, b1) = load_message_blocks(msgs, 32 * j);
+        let mut x0 = xor_u128(s0, b0);
+        let mut x1 = xor_u128(s1, b1);
+        step_x4_rc(&mut x0, &mut x1, rc, consts);
+        s0 = xor_u128(x0, s0);
+        s1 = xor_u128(x1, s1);
+    }
+
+    let rem = message_len % 32;
+    if rem == 0 && message_len > 0 {
+        return (s0, s1);
+    }
+
+    let (b0, b1) = load_message_tails(msgs, 32 * full, rem);
+    let mut x0 = xor_u128(s0, b0);
+    let mut x1 = xor_u128(s1, b1);
+    step_x4_rc(&mut x0, &mut x1, rc, consts);
+    (xor_u128(x0, s0), xor_u128(x1, s1))
+}
+
+// HASHES `out.len()` MESSAGES OF `message_len` BYTES EACH, STORED BACK TO BACK IN `data`.
+// 4 MESSAGES PER GROUP; THE LAST 0..=3 MESSAGES RUN SCALAR.
+// `N` IS THE DIGEST LENGTH, 16 OR 32.
+// PRECONDITION: CPU supports AVX2 (caller checks at runtime).
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn hash_fixed_x4<const N: usize>(
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    const { assert!(N == 16 || N == 32) };
+    assert_eq!(
+        Some(data.len()),
+        out.len().checked_mul(message_len),
+        "hash_fixed_x4: data.len() must equal out.len() * message_len"
+    );
+
+    let consts = make_consts();
+    let base = data.as_ptr();
+    let groups = out.len() / 4;
+
+    for (g, block) in out.chunks_exact_mut(4).enumerate() {
+        let first = base.add(4 * g * message_len);
+        let msgs = [
+            first,
+            first.add(message_len),
+            first.add(2 * message_len),
+            first.add(3 * message_len),
+        ];
+        let (s0, s1) = absorb_group_x4(&msgs, message_len, domain, &consts);
+        store_digests_x4(s0, s1, block);
+    }
+
+    for (i, d) in out.iter_mut().enumerate().skip(4 * groups) {
+        let m = &data[i * message_len..(i + 1) * message_len];
+        let (s0, s1) = crate::api::absorb_with_domain(m, domain);
+        write_digest(d, s0, s1);
+    }
+}
+
+// ======================================================
+// HASH X4 (VARIABLE MESSAGE LENGTH)
+// ======================================================
+
+// A group of unequal lengths goes to the masked kernel when its blocks fill at least this
+// percentage of the lanes' steps (sum of blocks / (4 * longest)), else scalar.
+const MIN_GROUP_FILL_PCT: usize = 40;
+
+// Number of absorb steps of a message (the padded last block counts).
+#[inline(always)]
+fn message_blocks(m: &[u8]) -> usize {
+    m.len() / 32 + (!m.len().is_multiple_of(32) || m.is_empty()) as usize
+}
+
+// Block `j` of `m` as one 32-byte row: a full block, the padded last block (folded like
+// `finalize_terminator`), or zero once the message is finished.
+#[inline(always)]
+unsafe fn load_row_var(m: &[u8], j: usize, tail: &mut [u8; 32]) -> __m256i {
+    let full = m.len() / 32;
+    if j < full {
+        _mm256_loadu_si256(m.as_ptr().add(32 * j) as *const __m256i)
+    } else if j == full && (!m.len().is_multiple_of(32) || m.is_empty()) {
+        let rem = m.len() - 32 * full;
+        *tail = [0u8; 32];
+        std::ptr::copy_nonoverlapping(m.as_ptr().add(32 * full), tail.as_mut_ptr(), rem);
+        tail[rem] = 0x80;
+        if rem < 16 {
+            // The high half is still zero here.
+            let (lo, hi) = tail.split_at_mut(16);
+            hi.copy_from_slice(lo);
+        }
+        _mm256_loadu_si256(tail.as_ptr() as *const __m256i)
+    } else {
+        _mm256_setzero_si256()
+    }
+}
+
+// `absorb_with_domain` for 4 messages of any lengths, one per lane. Lanes whose message is
+// shorter keep their state once finished, so the cost follows the longest message.
+#[inline(always)]
+unsafe fn absorb_group_var_x4(
+    msgs: [&[u8]; 4],
+    domain: u128,
+    consts: &SimdConsts,
+) -> (U128x4, U128x4) {
+    let mut init_lo = [0u64; 4];
+    let mut init_hi = [0u64; 4];
+    let mut blocks = [0i64; 4];
+    let mut min_full = usize::MAX;
+    for (i, m) in msgs.iter().enumerate() {
+        let len64 = (m.len() as u64).wrapping_mul(8);
+        let v = IV_S1 ^ (((len64.rotate_left(17) as u128) << 64) | (len64 as u128));
+        init_lo[i] = v as u64;
+        init_hi[i] = (v >> 64) as u64;
+        blocks[i] = message_blocks(m) as i64;
+        min_full = min_full.min(m.len() / 32);
+    }
+    let max_blocks = blocks.iter().copied().max().unwrap_or(0) as usize;
+    let blocks_v = _mm256_loadu_si256(blocks.as_ptr() as *const __m256i);
+
+    let mut s0 = splat_u128(IV_S0 ^ domain);
+    let mut s1 = U128x4 {
+        hi: U64x4(_mm256_loadu_si256(init_hi.as_ptr() as *const __m256i)),
+        lo: U64x4(_mm256_loadu_si256(init_lo.as_ptr() as *const __m256i)),
+    };
+    let rc = splat(PHI_64.wrapping_mul(2));
+
+    // Blocks that exist in every message: no masking.
+    for j in 0..min_full {
+        let r = |i: usize| _mm256_loadu_si256(msgs[i].as_ptr().add(32 * j) as *const __m256i);
+        let (b0, b1) = rows_to_blocks(r(0), r(1), r(2), r(3));
+        let mut x0 = xor_u128(s0, b0);
+        let mut x1 = xor_u128(s1, b1);
+        step_x4_rc(&mut x0, &mut x1, rc, consts);
+        s0 = xor_u128(x0, s0);
+        s1 = xor_u128(x1, s1);
+    }
+
+    let mut tail = [0u8; 32];
+    for j in min_full..max_blocks {
+        let (b0, b1) = rows_to_blocks(
+            load_row_var(msgs[0], j, &mut tail),
+            load_row_var(msgs[1], j, &mut tail),
+            load_row_var(msgs[2], j, &mut tail),
+            load_row_var(msgs[3], j, &mut tail),
+        );
+        let active = _mm256_cmpgt_epi64(blocks_v, _mm256_set1_epi64x(j as i64));
+        let mut x0 = xor_u128(s0, b0);
+        let mut x1 = xor_u128(s1, b1);
+        step_x4_rc(&mut x0, &mut x1, rc, consts);
+        let (n0, n1) = (xor_u128(x0, s0), xor_u128(x1, s1));
+        let pick = |new: U64x4, old: U64x4| U64x4(_mm256_blendv_epi8(old.0, new.0, active));
+        s0 = U128x4 {
+            hi: pick(n0.hi, s0.hi),
+            lo: pick(n0.lo, s0.lo),
+        };
+        s1 = U128x4 {
+            hi: pick(n1.hi, s1.hi),
+            lo: pick(n1.lo, s1.lo),
+        };
+    }
+    (s0, s1)
+}
+
+// HASHES `out.len()` MESSAGES OF ANY LENGTHS, 4 PER GROUP; THE LAST 0..=3 RUN SCALAR.
+// A group of equal lengths takes the `absorb_group_x4` path; a group of unequal lengths
+// the masked kernel, or scalar when `25 * sum_of_blocks < min_fill_pct * longest_in_blocks`
+// (`min_fill_pct` = 0: never scalar).
+// `N` IS THE DIGEST LENGTH, 16 OR 32.
+// PRECONDITION: CPU supports AVX2 (caller checks at runtime).
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn hash_var_x4_with<const N: usize>(
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    min_fill_pct: usize,
+) {
+    const { assert!(N == 16 || N == 32) };
+    assert_eq!(messages.len(), out.len(), "hash_var_x4: length mismatch");
+
+    let consts = make_consts();
+    let groups = out.len() / 4;
+
+    for (msgs, block) in messages.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        let len = msgs[0].len();
+        let (s0, s1) = if msgs[1..].iter().all(|m| m.len() == len) {
+            let ptrs = [
+                msgs[0].as_ptr(),
+                msgs[1].as_ptr(),
+                msgs[2].as_ptr(),
+                msgs[3].as_ptr(),
+            ];
+            absorb_group_x4(&ptrs, len, domain, &consts)
+        } else {
+            let sum: usize = msgs.iter().map(|m| message_blocks(m)).sum();
+            let max = msgs.iter().map(|m| message_blocks(m)).max().unwrap_or(0);
+            if 25 * sum < min_fill_pct * max {
+                for (m, d) in msgs.iter().zip(block.iter_mut()) {
+                    let (s0, s1) = crate::api::absorb_with_domain(m, domain);
+                    write_digest(d, s0, s1);
+                }
+                continue;
+            }
+            absorb_group_var_x4([msgs[0], msgs[1], msgs[2], msgs[3]], domain, &consts)
+        };
+        store_digests_x4(s0, s1, block);
+    }
+
+    for (m, d) in messages.iter().zip(out.iter_mut()).skip(4 * groups) {
+        let (s0, s1) = crate::api::absorb_with_domain(m, domain);
+        write_digest(d, s0, s1);
+    }
+}
+
+// `hash_var_x4_with` with the shipped group threshold.
+// PRECONDITION: CPU supports AVX2 (caller checks at runtime).
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn hash_var_x4<const N: usize>(
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    hash_var_x4_with::<N>(messages, domain, out, MIN_GROUP_FILL_PCT)
 }

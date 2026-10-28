@@ -149,13 +149,32 @@ fn finalize_terminator(s0: u128, s1: u128, remainder: &[u8]) -> (u128, u128) {
     (y0 ^ s0, y1 ^ s1)
 }
 
-// Hashes independent messages using scalar or parallel dispatch.
-pub(crate) fn absorb_hash256_batch_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 32]]) {
-    crate::dispatch::dispatch_hash256_batch_into(messages, domain, out);
+// Hashes `out.len()` messages of `message_len` bytes each, stored back to back in `data`.
+pub(crate) fn absorb_hash256_fixed_into(
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) {
+    crate::dispatch::dispatch_hash256_fixed_into(data, message_len, domain, out);
 }
 
-pub(crate) fn absorb_hash128_batch_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
-    crate::dispatch::dispatch_hash128_batch_into(messages, domain, out);
+pub(crate) fn absorb_hash128_fixed_into(
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; 16]],
+) {
+    crate::dispatch::dispatch_hash128_fixed_into(data, message_len, domain, out);
+}
+
+// Hashes independent messages using scalar or parallel dispatch.
+pub(crate) fn absorb_hash256_var_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 32]]) {
+    crate::dispatch::dispatch_hash256_var_into(messages, domain, out);
+}
+
+pub(crate) fn absorb_hash128_var_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
+    crate::dispatch::dispatch_hash128_var_into(messages, domain, out);
 }
 
 // ==========================================

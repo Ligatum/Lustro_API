@@ -1,8 +1,8 @@
 """
 lustro.dll speed test (ctypes), normalized per engine round. lustro.dll must be in the same directory.
-Batch calls use the `steps` suggested by the library for the given N.
+Stream batch calls use the `steps` suggested by the library for the given N.
 Multi-stream sections run one single stream per process and report the aggregate.
-Optional arguments: section number (0-10) and variant (1-4, or auto, scalar, st, compare).
+Optional arguments: section number (0-10) and variant (1-5, or auto, scalar, st, compare, simd).
 """
 
 import array
@@ -11,6 +11,7 @@ import ctypes
 import multiprocessing
 import os
 import queue
+import random
 import sys
 import time
 
@@ -20,10 +21,11 @@ import time
 MIN_TIME = 1.0
 MIN_ITERS = 100
 
-# Output per call = N * steps * 32 B (Batch size column). The largest sizes are meant to
-# go past L3.
-HASH_BATCH_SIZES = [64, 256, 1024, 2048, 4096, 16384, 65536, 131072, 196608, 1 << 20]
-STREAM_BATCH_SIZES = [8, 16, 32, 64, 256, 1024, 4096, 16384, 65536, 131072, 196608, 1 << 20]
+# Batch size column: input bytes for HASH rows (N * msg_len), output bytes for stream rows
+# (N * steps * 32). The largest sizes are meant to go past L3.
+# HASH_BATCH_SIZES is N for msg_len 32: 64 KiB ... 32 MiB of input.
+HASH_BATCH_SIZES = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 196608, 1 << 20]
+STREAM_BATCH_SIZES = [8, 16, 32, 64, 128, 256, 1024, 4096, 16384, 65536, 131072, 196608, 1 << 20]
 
 # Exact multiple of 32 B: no terminator round (absorb_with_domain, api.rs).
 HASH_MSG_LEN_BASELINE = 32
@@ -32,16 +34,19 @@ HASH_MSG_LEN_BASELINE = 32
 # terminator cost from round count.
 HASH_MSG_LENGTHS = [16, 31, 32, 33, 64, 65, 128, 256, 512, 768, 1024, 2048, 4096]
 
-# N for the length sweep.
-HASH_SWEEP_N = 16384
+# Length sweep: constant total input, N = HASH_SWEEP_BYTES // msg_len, so only the
+# message length changes between rows.
+HASH_SWEEP_BYTES = 4 << 20
 
-# (N, msg_len): few messages with a large total input, 64 KiB against 128 KiB.
-HASH_BYTES_CELLS = [(256, 256), (256, 512), (1024, 64), (1024, 128)]
+# Var sections: lengths uniform in 0..2*mean, fixed seed, the same set on every run.
+# Rounds and Data rate follow the actual lengths.
+HASH_VAR_SEED = 12345
 
-# Single-instance calls: message lengths for lustro_hash256, buffer sizes for
-# lustro_prng_fill / lustro_xof_fill. One ctypes call is timed, so small sizes
-# are dominated by call overhead.
-SINGLE_HASH_LENGTHS = [32, 1024, 65536, 1 << 20]
+# Mean message length for the var sweep (constant total input, as for the fixed sweep).
+HASH_VAR_MEANS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+
+# Single-stream calls: buffer sizes for lustro_prng_fill / lustro_xof_fill. One ctypes
+# call is timed, so small sizes are dominated by call overhead.
 SINGLE_FILL_SIZES = [4096, 65536, 1 << 20, 16 << 20]
 
 # Multi-stream: one stream and one buffer per process. 64 KiB is cache-resident, 16 MiB is not.
@@ -71,23 +76,32 @@ DLL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lustro.dll"
 
 ENV_VARS = ("LUSTRO_DISABLE_MT", "LUSTRO_DISABLE_SIMD", "LUSTRO_NUM_THREADS")
 
-# Variants: environment of the worker process. "compare" times auto and st side by side.
+# Variants: environment of the worker process. "compare" times auto and st side by side,
+# "simd" auto and scalar.
 ST_ENV = {"LUSTRO_DISABLE_MT": "1"}
+SCALAR_ENV = {"LUSTRO_DISABLE_SIMD": "1"}
 MODE_ENV = {
     "auto": {},
-    "scalar": {"LUSTRO_DISABLE_SIMD": "1"},
+    "scalar": SCALAR_ENV,
     "st": ST_ENV,
     "compare": {},
+    "simd": {},
+}
+# Side-by-side variants: (column label, environment of the reference run).
+COMPARE = {
+    "compare": ("vs ST", ST_ENV),
+    "simd": ("vs scalar", SCALAR_ENV),
 }
 MODES = tuple(MODE_ENV)
 VARIANT_HELP = {
     "auto": "library defaults",
-    "scalar": "AVX2 off (stream batches only)",
+    "scalar": "AVX2 off (stream batches and hash batches)",
     "st": "Rayon off, calling thread only",
     "compare": "auto and st side by side, 'vs ST' column",
+    "simd": "auto and scalar side by side, 'vs scalar' column",
 }
 PLAIN_MODES = ("auto",)
-MT_MODES = ("auto", "st", "compare")
+HASH_MODES = MODES
 STREAM_MODES = MODES
 
 
@@ -109,8 +123,8 @@ def format_size(size_bytes):
     if size_bytes < 1024:
         return f"{size_bytes} B"
     if size_bytes < 1024 ** 2:
-        return f"{size_bytes // 1024} KiB"
-    return f"{size_bytes // (1024 ** 2)} MiB"
+        return f"{(size_bytes + 512) // 1024} KiB"
+    return f"{(size_bytes + 512 * 1024) // (1024 ** 2)} MiB"
 
 
 def percentile(sorted_vals, q):
@@ -183,7 +197,7 @@ COL = {
     "p95": 10,
     "tp": 12,
     "ns": 10,
-    "vs": 8,
+    "vs": 10,
 }
 WIDTH = sum(COL.values()) - COL["vs"] + 3 * (len(COL) - 2)
 WIDTH_CMP = WIDTH + 3 + COL["vs"]
@@ -202,26 +216,26 @@ COL_MULTI = {
 WIDTH_MULTI = sum(COL_MULTI.values()) + 3 * (len(COL_MULTI) - 1)
 
 
-def make_header(compare=False):
+def make_header(mode="auto"):
     head = (
         f"{'Pipeline':<{COL['pipeline']}} | {'Batch size':<{COL['size']}} | "
         f"{'N':<{COL['n']}} | {'Steps':>{COL['steps']}} | {'Rounds':>{COL['rounds']}} | "
         f"{'p50 (ms)':>{COL['p50']}} | {'p95 (ms)':>{COL['p95']}} | "
         f"{'Data rate':>{COL['tp']}} | {'ns/round':>{COL['ns']}}"
     )
-    if compare:
-        head += f" | {'vs ST':>{COL['vs']}}"
+    if mode in COMPARE:
+        head += f" | {COMPARE[mode][0]:>{COL['vs']}}"
     return head
 
 
 def table_width(mode):
-    return WIDTH_CMP if mode == "compare" else WIDTH
+    return WIDTH_CMP if mode in COMPARE else WIDTH
 
 
 def table_start(title, mode):
     width = table_width(mode)
     print(f"\n{title:^{width}}")
-    print(make_header(mode == "compare"))
+    print(make_header(mode))
     print("-" * width)
 
 
@@ -235,7 +249,7 @@ def make_multi_header():
     )
 
 
-def print_row(label, n, steps, size_bytes, data, vs_st=None):
+def print_row(label, n, steps, size_bytes, data, vs_ref=None):
     tp_str = f"{data['gib_s']:.2f} GiB/s"
     steps_str = "-" if steps is None else str(steps)
     line = (
@@ -244,8 +258,8 @@ def print_row(label, n, steps, size_bytes, data, vs_st=None):
         f"{data['p50_ms']:>{COL['p50']}.4f} | {data['p95_ms']:>{COL['p95']}.4f} | "
         f"{tp_str:>{COL['tp']}} | {data['ns_per_round']:>{COL['ns']}.2f}"
     )
-    if vs_st is not None:
-        line += f" | {f'{vs_st:.2f}x':>{COL['vs']}}"
+    if vs_ref is not None:
+        line += f" | {f'{vs_ref:.2f}x':>{COL['vs']}}"
     print(line)
 
 
@@ -292,11 +306,11 @@ def load_lib():
     lib.lustro_runtime_threads.restype = SizeT
     lib.lustro_runtime_threads.argtypes = []
 
-    lib.lustro_hash256.restype = ctypes.c_int32
-    lib.lustro_hash256.argtypes = [U8P, SizeT, U8P]
+    lib.lustro_hash256_many_fixed.restype = ctypes.c_int32
+    lib.lustro_hash256_many_fixed.argtypes = [U8P, SizeT, SizeT, U8P]
 
-    lib.lustro_hash256_many.restype = ctypes.c_int32
-    lib.lustro_hash256_many.argtypes = [U8P, SizeT, SizeT, U8P]
+    lib.lustro_hash256_many_var.restype = ctypes.c_int32
+    lib.lustro_hash256_many_var.argtypes = [ctypes.POINTER(U8P), SizeT, ctypes.POINTER(SizeT), U8P]
 
     # Single stream: new(..., &ctx) / fill(ctx, out, out_len) / free.
     lib.lustro_prng_new.restype = ctypes.c_int32
@@ -377,9 +391,9 @@ def hash_batch_worker(n, msg_len, q):
         out_ptr = ctypes.cast(out, U8P)
 
         def call():
-            err = lib.lustro_hash256_many(data_ptr, n, msg_len, out_ptr)
+            err = lib.lustro_hash256_many_fixed(data_ptr, n, msg_len, out_ptr)
             if err != 0:
-                raise RuntimeError(f"lustro_hash256_many returned error {err}")
+                raise RuntimeError(f"lustro_hash256_many_fixed returned error {err}")
 
         times = timed_loop(call)
         total_bytes = n * msg_len
@@ -389,23 +403,40 @@ def hash_batch_worker(n, msg_len, q):
         q.put({"error": repr(e)})
 
 
-def hash_single_worker(msg_len, q):
+def hash_var_worker(n, mean_len, q):
+    """
+    lustro_hash256_many_var on n messages with lengths uniform in 0..2*mean_len (fixed
+    seed). Rounds and data rate are counted from the actual lengths.
+    """
     try:
         lib = load_lib()
 
-        data = u8_buf(os.urandom(msg_len))
-        data_ptr = ctypes.cast(data, U8P)
-        out = (ctypes.c_uint8 * 32)()
+        rng = random.Random(HASH_VAR_SEED)
+        lens = [rng.randint(0, 2 * mean_len) for _ in range(n)]
+        total_bytes = sum(lens)
+
+        data = u8_buf(os.urandom(total_bytes))
+        pos = ctypes.addressof(data)
+        offsets = []
+        for length in lens:
+            offsets.append(pos)
+            pos += length
+        ptr_array = (SizeT * n)(*offsets)
+        len_array = (SizeT * n)(*lens)
+        ptrs = ctypes.cast(ptr_array, ctypes.POINTER(U8P))
+
+        out = (ctypes.c_uint8 * (n * 32))()
         out_ptr = ctypes.cast(out, U8P)
 
         def call():
-            err = lib.lustro_hash256(data_ptr, msg_len, out_ptr)
+            err = lib.lustro_hash256_many_var(ptrs, n, len_array, out_ptr)
             if err != 0:
-                raise RuntimeError(f"lustro_hash256 returned error {err}")
+                raise RuntimeError(f"lustro_hash256_many_var returned error {err}")
 
         times = timed_loop(call)
-        result = summarize(times, 1, hash_rounds_for_len(msg_len), msg_len)
-        q.put({"result": result, "steps": None, "size_bytes": msg_len})
+        rounds = sum(hash_rounds_for_len(length) for length in lens)
+        result = summarize(times, 1, rounds, total_bytes)
+        q.put({"result": result, "steps": None, "size_bytes": total_bytes})
     except Exception as e:
         q.put({"error": repr(e)})
 
@@ -616,16 +647,16 @@ def run_multi(kind, size, procs):
 # =========================================================
 def emit(label, n, func, args, mode):
     res = run_worker(func, args, MODE_ENV[mode])
-    vs_st = None
-    if mode == "compare":
-        st = run_worker(func, args, ST_ENV)
-        vs_st = st["result"]["p50_ms"] / res["result"]["p50_ms"]
-    print_row(label, n, res["steps"], res["size_bytes"], res["result"], vs_st)
+    vs_ref = None
+    if mode in COMPARE:
+        ref = run_worker(func, args, COMPARE[mode][1])
+        vs_ref = ref["result"]["p50_ms"] / res["result"]["p50_ms"]
+    print_row(label, n, res["steps"], res["size_bytes"], res["result"], vs_ref)
 
 
 def section_hash_baseline(mode):
     table_start(
-        f"HASH256_MANY  ({hash_rounds_for_len(HASH_MSG_LEN_BASELINE)} round / message, "
+        f"HASH256_MANY_FIXED  ({hash_rounds_for_len(HASH_MSG_LEN_BASELINE)} round / message, "
         f"msg_len={HASH_MSG_LEN_BASELINE})",
         mode,
     )
@@ -635,26 +666,32 @@ def section_hash_baseline(mode):
 
 def section_hash_sweep(mode):
     table_start(
-        f"HASH256_MANY -- MSG LENGTH SWEEP (N={HASH_SWEEP_N} fixed; N column below = msg_len)",
+        f"HASH256_MANY_FIXED -- MSG LENGTH SWEEP (input ~{format_size(HASH_SWEEP_BYTES)}; label = msg_len)",
         mode,
     )
     for msg_len in HASH_MSG_LENGTHS:
-        emit(f"HASH_L{msg_len}", msg_len, hash_batch_worker, (HASH_SWEEP_N, msg_len), mode)
-
-
-def section_hash_bytes(mode):
-    table_start("HASH256_MANY -- FEW LONG MESSAGES (label = msg_len)", mode)
-    for n, msg_len in HASH_BYTES_CELLS:
+        n = HASH_SWEEP_BYTES // msg_len
         emit(f"HASH_L{msg_len}", n, hash_batch_worker, (n, msg_len), mode)
 
 
-def section_hash_single(mode):
+def section_hash_var_baseline(mode):
     table_start(
-        "HASH256  (single message per call; N column = msg_len; includes ctypes call overhead)",
+        "HASH256_MANY_VAR  (lengths uniform in 0..64, mean 32; same N as the fixed baseline)",
         mode,
     )
-    for msg_len in SINGLE_HASH_LENGTHS:
-        emit(f"HASH_L{msg_len}", msg_len, hash_single_worker, (msg_len,), mode)
+    for n in HASH_BATCH_SIZES:
+        emit("HASH_VAR", n, hash_var_worker, (n, HASH_MSG_LEN_BASELINE), mode)
+
+
+def section_hash_var_sweep(mode):
+    table_start(
+        f"HASH256_MANY_VAR -- MEAN LENGTH SWEEP (input ~{format_size(HASH_SWEEP_BYTES)}; "
+        "label = mean msg_len, lengths 0..2*mean)",
+        mode,
+    )
+    for mean_len in HASH_VAR_MEANS:
+        n = HASH_SWEEP_BYTES // mean_len
+        emit(f"VAR_L{mean_len}", n, hash_var_worker, (n, mean_len), mode)
 
 
 def make_fill_single_section(kind):
@@ -695,10 +732,10 @@ def make_multi_section(kind):
 
 
 SECTIONS = {
-    1: ("HASH256_MANY (baseline, msg_len=32)", section_hash_baseline, MT_MODES),
-    2: ("HASH256_MANY message-length sweep", section_hash_sweep, MT_MODES),
-    3: ("HASH256_MANY few long messages", section_hash_bytes, MT_MODES),
-    4: ("HASH256 (single message)", section_hash_single, PLAIN_MODES),
+    1: ("HASH256_MANY_FIXED (baseline, msg_len=32)", section_hash_baseline, HASH_MODES),
+    2: ("HASH256_MANY_FIXED message-length sweep", section_hash_sweep, HASH_MODES),
+    3: ("HASH256_MANY_VAR (baseline, mean msg_len=32)", section_hash_var_baseline, HASH_MODES),
+    4: ("HASH256_MANY_VAR mean-length sweep", section_hash_var_sweep, HASH_MODES),
     5: ("PRNG_BATCH_FILL_BLOCKS", make_stream_section("PRNG"), STREAM_MODES),
     6: ("XOF_BATCH_FILL_BLOCKS", make_stream_section("XOF"), STREAM_MODES),
     7: ("PRNG_FILL (single stream)", make_fill_single_section("PRNG"), PLAIN_MODES),
@@ -769,7 +806,11 @@ def prompt_selection():
 
 
 def runtime_lines(mode):
-    runs = [("auto", {}), ("st", ST_ENV)] if mode == "compare" else [(mode, MODE_ENV[mode])]
+    if mode in COMPARE:
+        ref_name = "st" if mode == "compare" else "scalar"
+        runs = [("auto", {}), (ref_name, COMPARE[mode][1])]
+    else:
+        runs = [(mode, MODE_ENV[mode])]
     lines = []
     for name, env in runs:
         info = run_worker(info_worker, (), env)
@@ -823,11 +864,14 @@ def main():
         "ns/round is per engine round, comparable across tables.\n"
         "Data rate: input bytes for HASH rows, output bytes for stream rows.\n"
         "Steps: value suggested by the library for that N.\n"
-        "Small calls (N=64, small sizes) and single-instance rows (HASH256, *_FILL)\n"
-        "include ctypes call overhead.\n"
+        "Small calls and single-stream rows (*_FILL) include ctypes call overhead.\n"
         "Calls are timed back to back, so the thread pool stays active between them.\n"
-        "Variants: scalar = AVX2 off, st = Rayon off, vs ST = p50 with Rayon off / p50 of auto.\n"
-        "AVX2 is used for stream batches of 4 or more lanes; hashing and single streams are scalar.\n"
+        "Variants: scalar = AVX2 off, st = Rayon off. Side by side: vs ST = p50 with Rayon off /\n"
+        "p50 of auto (compare), vs scalar = p50 with AVX2 off / p50 of auto (simd).\n"
+        "AVX2 is used for stream batches of 4 or more lanes and for hash batches (fixed and var)\n"
+        "of 4 or more messages; single streams are scalar.\n"
+        "HASH_VAR / VAR_L rows: lengths uniform in 0..2*mean; Rounds and Data rate follow the actual\n"
+        "lengths, ns/round is per actual round.\n"
         "Multi-stream: ns/round agg = wall time per round over all procs, ns/round proc = mean\n"
         "per proc, Scaling = agg / (procs * agg at 1 proc), Min/Max = slowest / fastest proc.\n"
         "Procs are logical threads, SMT and clocks lower Scaling above the physical core count."

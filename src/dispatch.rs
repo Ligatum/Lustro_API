@@ -19,7 +19,10 @@ use crate::types::{ConfigError, RuntimeOptions};
 // ==========================================
 
 // HASH POLICY PARAMETERS
-// Hashing uses the scalar implementation on every CPU; batches can still run in Rayon.
+// Hash batches use the backend of their count (AVX2 from 4 messages); single messages use
+// the scalar implementation. Batches of either backend can run in Rayon. Batches of
+// messages with a common length and batches of messages of any lengths have their own
+// AVX2 parameters.
 
 // Tunable hash parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +42,52 @@ const HASH_PARAMS: HashParams = HashParams {
     tasks_per_thread: 4,
 };
 const _: () = assert!(HASH_PARAMS.tasks_per_thread > 0);
+
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
+#[cfg(target_arch = "x86_64")]
+const HASH_AVX2_PARAMS: HashParams = HashParams {
+    mt_threshold_messages: 4 * 1024,
+    mt_threshold_bytes: 192 * 1024,
+    tasks_per_thread: 2,
+};
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(HASH_AVX2_PARAMS.tasks_per_thread > 0);
+
+// AVX2 parameters of batches of messages of any lengths.
+// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
+#[cfg(target_arch = "x86_64")]
+const HASH_AVX2_VAR_PARAMS: HashParams = HashParams {
+    mt_threshold_messages: 2048,
+    mt_threshold_bytes: 96 * 1024,
+    tasks_per_thread: 2,
+};
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(HASH_AVX2_VAR_PARAMS.tasks_per_thread > 0);
+
+// Fewest messages of a variable-length AVX2 batch that go to the pool: below it there are
+// fewer than 4 work items of one group, and the pool did not pay on the calling thread's
+// time (measured on 8 and 12 messages).
+#[cfg(target_arch = "x86_64")]
+const HASH_AVX2_VAR_MIN_MT_MESSAGES: usize = 16;
+
+// Messages per AVX2 group. A Rayon work item is a whole number of groups, so a batch of one
+// group stays on the calling thread.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+const HASH_AVX2_GROUP: usize = 4;
+
+impl HashParams {
+    // Rayon or the calling thread for `count` messages of `total_bytes` bytes.
+    fn parallel_for(self, count: usize, total_bytes: usize) -> HashParallel {
+        let big = count >= self.mt_threshold_messages || total_bytes >= self.mt_threshold_bytes;
+        // One message gives the pool nothing to parallelize.
+        if count < 2 || !big {
+            HashParallel::Single
+        } else {
+            HashParallel::Rayon
+        }
+    }
+}
 
 // STREAM POLICY PARAMETERS
 
@@ -220,7 +269,7 @@ fn env_flag(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> bool {
 // change it.
 //
 // - `LUSTRO_DISABLE_MT`: set (see `env_flag`) = never enter the pool.
-// - `LUSTRO_DISABLE_SIMD`: set = scalar backend for streams.
+// - `LUSTRO_DISABLE_SIMD`: set = scalar backend for stream and hash batches.
 // - `LUSTRO_NUM_THREADS=N`: pool size, capped at the logical CPU count.
 // - A pool of one worker (set, or one logical CPU) also disables MT.
 //
@@ -380,27 +429,80 @@ fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
 // INTERNAL STATE API
 // ==========================================
 
+// Dispatches 256-bit hashing of `out.len()` messages of `message_len` bytes each, stored
+// back to back in `data`.
+pub(crate) fn dispatch_hash256_fixed_into(
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) {
+    assert_eq!(
+        Some(data.len()),
+        out.len().checked_mul(message_len),
+        "dispatch_hash256_fixed_into: data.len() must equal out.len() * message_len"
+    );
+    let plan = plan_hash_fixed_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        out.len(),
+        message_len,
+    );
+    execute_hash_fixed(plan, data, message_len, domain, out, hash256_into);
+}
+
+// As `dispatch_hash256_fixed_into`, 128-bit digests.
+pub(crate) fn dispatch_hash128_fixed_into(
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; 16]],
+) {
+    assert_eq!(
+        Some(data.len()),
+        out.len().checked_mul(message_len),
+        "dispatch_hash128_fixed_into: data.len() must equal out.len() * message_len"
+    );
+    let plan = plan_hash_fixed_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        out.len(),
+        message_len,
+    );
+    execute_hash_fixed(plan, data, message_len, domain, out, hash128_into);
+}
+
 // Dispatches 256-bit hashing directly into `out`.
-pub(crate) fn dispatch_hash256_batch_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 32]]) {
+pub(crate) fn dispatch_hash256_var_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 32]]) {
     assert_eq!(
         messages.len(),
         out.len(),
-        "dispatch_hash256_batch_into: length mismatch"
+        "dispatch_hash256_var_into: length mismatch"
     );
-    let plan = plan_hash_messages(messages, runtime_config().overrides().parallel);
-    execute_hash(plan, messages, domain, out, hash256_into);
+    let plan = plan_hash_var_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        messages.len(),
+        total_len(messages),
+    );
+    execute_hash_var(plan, messages, domain, out, hash256_into);
 }
 
 // Dispatches 128-bit hashing directly into `out`.
 // Serializes only s0.
-pub(crate) fn dispatch_hash128_batch_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
+pub(crate) fn dispatch_hash128_var_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
     assert_eq!(
         messages.len(),
         out.len(),
-        "dispatch_hash128_batch_into: length mismatch"
+        "dispatch_hash128_var_into: length mismatch"
     );
-    let plan = plan_hash_messages(messages, runtime_config().overrides().parallel);
-    execute_hash(plan, messages, domain, out, hash128_into);
+    let plan = plan_hash_var_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        messages.len(),
+        total_len(messages),
+    );
+    execute_hash_var(plan, messages, domain, out, hash128_into);
 }
 
 #[inline(always)]
@@ -417,7 +519,7 @@ fn hash128_into(m: &[u8], domain: u128, out: &mut [u8; 16]) {
 }
 
 // ==========================================
-// HASH PLAN
+// HASH PLAN AND EXECUTION
 // ==========================================
 
 // How a hash batch is executed.
@@ -425,47 +527,80 @@ fn hash128_into(m: &[u8], domain: u128, out: &mut [u8; 16]) {
 pub(crate) enum HashParallel {
     // Calling thread only.
     Single,
-    // Rayon pool, `hash_min_len` messages or more per work item.
+    // Rayon pool; the work item size depends on the backend.
     Rayon,
 }
 
-// Execution mode chosen for hash batch.
+// Execution mode of a scalar hash batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HashPlan {
     pub(crate) parallel: HashParallel,
 }
 
-// Counts messages and sums their lengths before planning.
-fn plan_hash_messages(messages: &[&[u8]], parallel: ParallelPref) -> HashPlan {
-    let total_bytes = messages
+// Sum of the message lengths, saturating.
+fn total_len(messages: &[&[u8]]) -> usize {
+    messages
         .iter()
         .map(|m| m.len())
-        .fold(0, usize::saturating_add);
-    plan_hash_with(parallel, messages.len(), total_bytes)
+        .fold(0, usize::saturating_add)
 }
 
-// Chooses the execution mode for `count` messages of `total_bytes` bytes.
-// Pure: no pool access.
-pub(crate) fn plan_hash(count: usize, total_bytes: usize) -> HashPlan {
-    let p = HASH_PARAMS;
-    let big = count >= p.mt_threshold_messages || total_bytes >= p.mt_threshold_bytes;
-    // One message gives the pool nothing to parallelize.
-    let parallel = if count < 2 || !big {
-        HashParallel::Single
+// Backend and execution mode of a hash batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HashBatchPlan {
+    pub(crate) backend: Backend,
+    pub(crate) parallel: HashParallel,
+}
+
+// Chooses backend and execution mode for `count` messages of `message_len` bytes within
+// the caller's restrictions. Parallelism uses the hash parameters of the chosen backend.
+// Pure: no CPU detection, no pool access.
+pub(crate) fn plan_hash_fixed_with(
+    caps: Caps,
+    overrides: Overrides,
+    count: usize,
+    message_len: usize,
+) -> HashBatchPlan {
+    // Empty messages stay scalar.
+    let backend = if message_len == 0 {
+        Backend::Scalar
     } else {
-        HashParallel::Rayon
+        backend_for(caps, overrides, count)
     };
-    HashPlan { parallel }
+    let parallel = match overrides.parallel {
+        ParallelPref::Single => HashParallel::Single,
+        ParallelPref::Auto => backend
+            .hash_params()
+            .parallel_for(count, count.saturating_mul(message_len)),
+    };
+    HashBatchPlan { backend, parallel }
 }
 
-// As `plan_hash`, with the caller's restriction.
-pub(crate) fn plan_hash_with(parallel: ParallelPref, count: usize, total_bytes: usize) -> HashPlan {
-    match parallel {
-        ParallelPref::Auto => plan_hash(count, total_bytes),
-        ParallelPref::Single => HashPlan {
-            parallel: HashParallel::Single,
-        },
+// Chooses backend and execution mode for `count` messages of any lengths, `total_bytes`
+// bytes together, within the caller's restrictions. Parallelism uses the hash parameters
+// of the chosen backend.
+// Pure: no CPU detection, no pool access.
+pub(crate) fn plan_hash_var_with(
+    caps: Caps,
+    overrides: Overrides,
+    count: usize,
+    total_bytes: usize,
+) -> HashBatchPlan {
+    let backend = backend_for(caps, overrides, count);
+    let parallel = match overrides.parallel {
+        ParallelPref::Single => HashParallel::Single,
+        ParallelPref::Auto => hash_var_parallel(backend, count, total_bytes),
+    };
+    HashBatchPlan { backend, parallel }
+}
+
+// Rayon or the calling thread for a variable-length batch on `backend`.
+fn hash_var_parallel(backend: Backend, count: usize, total_bytes: usize) -> HashParallel {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(backend, Backend::Avx2(_)) && count < HASH_AVX2_VAR_MIN_MT_MESSAGES {
+        return HashParallel::Single;
     }
+    backend.hash_var_params().parallel_for(count, total_bytes)
 }
 
 // Fewest messages per Rayon work item for `count` messages on `threads` workers:
@@ -501,6 +636,181 @@ fn execute_hash<const N: usize>(
                 return;
             }
             hash_single(messages, domain, out, absorb_into);
+        }
+    }
+}
+
+// Messages per Rayon work item on the AVX2 path: whole x4 groups, `count` spread over
+// `threads * tasks_per_thread` items.
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+pub(crate) fn hash_chunk_len(count: usize, threads: usize, params: HashParams) -> usize {
+    let items = threads.max(1).saturating_mul(params.tasks_per_thread);
+    let per_item = count.div_ceil(items);
+    per_item
+        .checked_next_multiple_of(HASH_AVX2_GROUP)
+        .unwrap_or(per_item)
+        .max(HASH_AVX2_GROUP)
+}
+
+// Runs a hash batch of messages with a common length under `plan`.
+// `data.len()` must equal `out.len() * message_len`.
+fn execute_hash_fixed<const N: usize>(
+    plan: HashBatchPlan,
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) {
+    match plan.backend {
+        Backend::Scalar => {
+            execute_hash_scalar_fixed(plan.parallel, data, message_len, domain, out, absorb_into)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2(cap) => execute_hash_avx2(cap, plan.parallel, data, message_len, domain, out),
+    }
+}
+
+// Runs a hash batch of messages of any lengths under `plan`.
+fn execute_hash_var<const N: usize>(
+    plan: HashBatchPlan,
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) {
+    match plan.backend {
+        Backend::Scalar => {
+            let plan = HashPlan {
+                parallel: plan.parallel,
+            };
+            execute_hash(plan, messages, domain, out, absorb_into);
+        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2(cap) => execute_hash_var_avx2(cap, plan.parallel, messages, domain, out),
+    }
+}
+
+// AVX2 kernel for messages of any lengths on the calling thread; same contract as
+// `hash_var_x4`, minus the CPU check.
+#[cfg(target_arch = "x86_64")]
+fn hash_var_avx2<const N: usize>(
+    _cap: Avx2Cap,
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    // SAFETY: `Avx2Cap` exists only after AVX2 detection.
+    unsafe { crate::core_avx2::hash_var_x4::<N>(messages, domain, out) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_hash_var_avx2<const N: usize>(
+    cap: Avx2Cap,
+    parallel: HashParallel,
+    messages: &[&[u8]],
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    match parallel {
+        HashParallel::Single => hash_var_avx2(cap, messages, domain, out),
+        HashParallel::Rayon => {
+            #[cfg(feature = "parallel")]
+            if out.len() > HASH_AVX2_GROUP {
+                if let Some(pool) = get_or_init_pool() {
+                    let chunk =
+                        hash_chunk_len(out.len(), pool.current_num_threads(), HASH_AVX2_VAR_PARAMS);
+                    pool.install(|| {
+                        messages
+                            .par_chunks(chunk)
+                            .zip(out.par_chunks_mut(chunk))
+                            .for_each(|(m, o)| hash_var_avx2(cap, m, domain, o));
+                    });
+                    return;
+                }
+            }
+            hash_var_avx2(cap, messages, domain, out);
+        }
+    }
+}
+
+// Scalar hashing of messages with a common length; same split as `execute_hash`.
+// `data.len()` must equal `out.len() * message_len`.
+fn execute_hash_scalar_fixed<const N: usize>(
+    parallel: HashParallel,
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) {
+    let message = |i: usize| &data[i * message_len..(i + 1) * message_len];
+    match parallel {
+        HashParallel::Single => {
+            for (i, o) in out.iter_mut().enumerate() {
+                absorb_into(message(i), domain, o);
+            }
+        }
+        HashParallel::Rayon => {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = get_or_init_pool() {
+                let min_len = hash_min_len(out.len(), pool.current_num_threads());
+                pool.install(|| {
+                    out.par_iter_mut()
+                        .enumerate()
+                        .with_min_len(min_len)
+                        .for_each(|(i, o)| absorb_into(message(i), domain, o));
+                });
+                return;
+            }
+            for (i, o) in out.iter_mut().enumerate() {
+                absorb_into(message(i), domain, o);
+            }
+        }
+    }
+}
+
+// AVX2 kernel on the calling thread; same contract as `hash_fixed_x4`, minus the CPU check.
+#[cfg(target_arch = "x86_64")]
+fn hash_fixed_avx2<const N: usize>(
+    _cap: Avx2Cap,
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    // SAFETY: `Avx2Cap` exists only after AVX2 detection.
+    unsafe { crate::core_avx2::hash_fixed_x4::<N>(data, message_len, domain, out) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn execute_hash_avx2<const N: usize>(
+    cap: Avx2Cap,
+    parallel: HashParallel,
+    data: &[u8],
+    message_len: usize,
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    let run = |d: &[u8], o: &mut [[u8; N]]| hash_fixed_avx2(cap, d, message_len, domain, o);
+    match parallel {
+        HashParallel::Single => run(data, out),
+        HashParallel::Rayon => {
+            // A work item has at least 4 messages, so up to 4 make a single item.
+            #[cfg(feature = "parallel")]
+            if message_len > 0 && out.len() > HASH_AVX2_GROUP {
+                if let Some(pool) = get_or_init_pool() {
+                    let chunk =
+                        hash_chunk_len(out.len(), pool.current_num_threads(), HASH_AVX2_PARAMS);
+                    pool.install(|| {
+                        data.par_chunks(chunk.saturating_mul(message_len))
+                            .zip(out.par_chunks_mut(chunk))
+                            .for_each(|(d, o)| run(d, o));
+                    });
+                    return;
+                }
+            }
+            run(data, out);
         }
     }
 }
@@ -649,6 +959,24 @@ impl Backend {
             Backend::Scalar => SCALAR_STREAM,
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2(_) => AVX2_STREAM,
+        }
+    }
+
+    // Hash policy parameters of this backend.
+    fn hash_params(self) -> HashParams {
+        match self {
+            Backend::Scalar => HASH_PARAMS,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2(_) => HASH_AVX2_PARAMS,
+        }
+    }
+
+    // As `hash_params`, for batches of messages of any lengths.
+    fn hash_var_params(self) -> HashParams {
+        match self {
+            Backend::Scalar => HASH_PARAMS,
+            #[cfg(target_arch = "x86_64")]
+            Backend::Avx2(_) => HASH_AVX2_VAR_PARAMS,
         }
     }
 

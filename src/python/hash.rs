@@ -7,9 +7,11 @@ use pyo3::types::PyBytes;
 use std::borrow::Cow;
 
 use crate::hash::hash128 as hash128_impl;
-use crate::hash::hash128_many_into;
+use crate::hash::hash128_many_fixed_into;
+use crate::hash::hash128_many_var_into;
 use crate::hash::hash256 as hash256_impl;
-use crate::hash::hash256_many_into;
+use crate::hash::hash256_many_fixed_into;
+use crate::hash::hash256_many_var_into;
 use crate::python::{bytes_arg, messages_arg, require_numpy, MessageSeq};
 use crate::types::{Hash128, Hash256};
 
@@ -17,21 +19,11 @@ use crate::types::{Hash128, Hash256};
 // INPUT HELPERS
 // ==========================================
 
-// Rows copied into one buffer; `rows()` gives per-message slices.
+// Rows copied into one buffer: `n` messages of `len` bytes, back to back.
 struct FlatRows {
     buf: Vec<u8>,
     n: usize,
     len: usize,
-}
-
-impl FlatRows {
-    fn rows(&self) -> Vec<&[u8]> {
-        // chunks_exact(0) panics
-        if self.len == 0 {
-            return vec![&[][..]; self.n];
-        }
-        self.buf.chunks_exact(self.len).collect()
-    }
 }
 
 // Own copy — can't hold a &[u8] into NumPy's buffer across detach().
@@ -68,8 +60,11 @@ fn rows_array<'a, 'py>(data: &'a Bound<'py, PyAny>) -> PyResult<&'a Bound<'py, P
         .map_err(|_| crate::python::array_type_error("data", "a 2D numpy.ndarray of dtype uint8"))
 }
 
-fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let n = rows.len();
+fn digests256<'py>(
+    py: Python<'py>,
+    n: usize,
+    run: impl FnOnce(&mut [Hash256]) + Send,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
     let out_arr = PyArray2::<u8>::zeros(py, [n, 32], false);
     {
         let mut out_rw = out_arr.readwrite();
@@ -82,14 +77,17 @@ fn digests256<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
         let out_blocks: &mut [Hash256] =
             unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash256, n) };
 
-        py.detach(|| hash256_many_into(rows, out_blocks));
+        py.detach(|| run(out_blocks));
     }
     Ok(out_arr)
 }
 
 // Digests go straight into the output array buffer.
-fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let n = rows.len();
+fn digests128<'py>(
+    py: Python<'py>,
+    n: usize,
+    run: impl FnOnce(&mut [Hash128]) + Send,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
     let out_arr = PyArray2::<u8>::zeros(py, [n, 16], false);
     {
         let mut out_rw = out_arr.readwrite();
@@ -102,7 +100,7 @@ fn digests128<'py>(py: Python<'py>, rows: &[&[u8]]) -> PyResult<Bound<'py, PyArr
         let out_blocks: &mut [Hash128] =
             unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut Hash128, n) };
 
-        py.detach(|| hash128_many_into(rows, out_blocks));
+        py.detach(|| run(out_blocks));
     }
     Ok(out_arr)
 }
@@ -149,7 +147,7 @@ pub fn hash128_py<'py>(
 /// before the GIL is released, so hashing reads from the copy rather than the
 /// original NumPy array.
 #[pyfunction]
-#[pyo3(name = "hash256_many")]
+#[pyo3(name = "hash256_many_fixed")]
 pub fn hash256_many_py<'py>(
     py: Python<'py>,
     data: &Bound<'_, PyAny>,
@@ -159,13 +157,15 @@ pub fn hash256_many_py<'py>(
     // Use the non-panicking borrow API so conflicting NumPy borrows become Python errors.
     let data = data.try_readonly()?;
     let flat = copy_rows(data.as_array()).ok_or_else(non_contiguous_error)?;
-    digests256(py, &flat.rows())
+    digests256(py, flat.n, |out| {
+        hash256_many_fixed_into(&flat.buf, flat.len, out)
+    })
 }
 
 /// 128-bit digests of the rows of a 2D uint8 array. Same input rules as
-/// `hash256_many`. Returns a uint8 array of shape `(n, 16)`.
+/// `hash256_many_fixed`. Returns a uint8 array of shape `(n, 16)`.
 #[pyfunction]
-#[pyo3(name = "hash128_many")]
+#[pyo3(name = "hash128_many_fixed")]
 pub fn hash128_many_py<'py>(
     py: Python<'py>,
     data: &Bound<'_, PyAny>,
@@ -174,7 +174,9 @@ pub fn hash128_many_py<'py>(
     let data = rows_array(data)?;
     let data = data.try_readonly()?;
     let flat = copy_rows(data.as_array()).ok_or_else(non_contiguous_error)?;
-    digests128(py, &flat.rows())
+    digests128(py, flat.n, |out| {
+        hash128_many_fixed_into(&flat.buf, flat.len, out)
+    })
 }
 
 // ==========================================
@@ -194,7 +196,7 @@ pub fn hash256_many_var_py<'py>(
     require_numpy(py)?;
     let messages = messages.load()?;
     let rows = messages.slices();
-    digests256(py, &rows)
+    digests256(py, rows.len(), |out| hash256_many_var_into(&rows, out))
 }
 
 /// 128-bit digests of a sequence of bytes-like objects of any lengths. Same input rules
@@ -208,5 +210,5 @@ pub fn hash128_many_var_py<'py>(
     require_numpy(py)?;
     let messages = messages.load()?;
     let rows = messages.slices();
-    digests128(py, &rows)
+    digests128(py, rows.len(), |out| hash128_many_var_into(&rows, out))
 }

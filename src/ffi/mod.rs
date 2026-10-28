@@ -70,8 +70,8 @@ pub extern "C" fn lustro_runtime_threads() -> usize {
     guarded(0, || crate::api::runtime_info().threads)
 }
 
-/// Returns the stream backend as a static NUL-terminated string ("scalar" or
-/// "avx2"). Never NULL; do not free.
+/// Returns the backend for batches of streams and hashes as a static NUL-terminated
+/// string ("scalar" or "avx2"). Never NULL; do not free.
 #[no_mangle]
 pub extern "C" fn lustro_runtime_backend() -> *const c_char {
     guarded(c"unknown".as_ptr(), || {
