@@ -37,7 +37,7 @@ pub(crate) struct HashParams {
 
 // Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 const HASH_PARAMS: HashParams = HashParams {
-    mt_threshold_messages: 2 * 1024,
+    mt_threshold_messages: 2048,
     mt_threshold_bytes: 80 * 1024,
     tasks_per_thread: 4,
 };
@@ -47,7 +47,7 @@ const _: () = assert!(HASH_PARAMS.tasks_per_thread > 0);
 // apart from it.
 // Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 const HASH_VAR_PARAMS: HashParams = HashParams {
-    mt_threshold_messages: 2 * 1024,
+    mt_threshold_messages: 2048,
     mt_threshold_bytes: 80 * 1024,
     tasks_per_thread: 4,
 };
@@ -67,7 +67,7 @@ const _: () = assert!(HASH_AVX2_PARAMS.tasks_per_thread > 0);
 // Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 const HASH_AVX2_VAR_PARAMS: HashParams = HashParams {
-    mt_threshold_messages: 3 * 1024,
+    mt_threshold_messages: 3072,
     mt_threshold_bytes: 192 * 1024,
     tasks_per_thread: 2,
 };
@@ -160,7 +160,7 @@ const SCALAR_STREAM: StreamParams = StreamParams {
         near_tasks: 8,
         rounds: 512,
     },
-    mt_threshold_work: 4 * 1024,
+    mt_threshold_work: 4096,
     min_tasks: 4,
 };
 const _: () = assert!(matches!(
@@ -175,7 +175,7 @@ const AVX2_STREAM: StreamParams = StreamParams {
         near_tasks: 8,
         rounds: 768,
     },
-    mt_threshold_work: 6 * 1024,
+    mt_threshold_work: 6144,
     min_tasks: 4,
 };
 #[cfg(target_arch = "x86_64")]
@@ -410,7 +410,8 @@ static RAYON_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 static POOL_OWNER: AtomicU32 = AtomicU32::new(0);
 
 // Initializes the dispatcher's Rayon pool once.
-// A process that inherited the pool through `fork` uses the single-threaded fallback.
+// A process whose parent already claimed the pool (`POOL_OWNER` holds the parent's PID) uses
+// the single-threaded fallback. A child forked before any claim may build its own pool.
 #[cfg(feature = "parallel")]
 fn init_pool() {
     let pid = std::process::id();
@@ -424,8 +425,8 @@ fn init_pool() {
     });
 }
 
-// None if the pool could not be built or this process inherited it through `fork`.
-// Callers then use the calling thread.
+// None if the pool could not be built or `POOL_OWNER` holds another process's PID (the
+// parent claimed the pool before `fork`). Callers then use the calling thread.
 #[cfg(feature = "parallel")]
 fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
     init_pool();
@@ -433,6 +434,36 @@ fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
         return None;
     }
     RAYON_POOL.get().and_then(|opt| opt.as_ref())
+}
+
+// Runs `f(start, chunk)` over `items` in chunks on the Rayon pool when `items` has at least
+// `min_total` elements and the process settings allow threads; otherwise once on the calling
+// thread over the whole slice. `f` must not call into Python.
+#[cfg(feature = "python")]
+pub(crate) fn for_chunks_mut<T: Send>(
+    items: &mut [T],
+    min_total: usize,
+    f: impl Fn(usize, &mut [T]) + Sync,
+) {
+    #[cfg(feature = "parallel")]
+    if items.len() >= min_total && runtime_config().overrides().parallel != ParallelPref::Single {
+        if let Some(pool) = get_or_init_pool() {
+            let chunk = items
+                .len()
+                .div_ceil(pool.current_num_threads().max(1) * 4)
+                .max(1);
+            pool.install(|| {
+                items
+                    .par_chunks_mut(chunk)
+                    .enumerate()
+                    .for_each(|(i, c)| f(i * chunk, c));
+            });
+            return;
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = min_total;
+    f(0, items);
 }
 
 // ==========================================
@@ -535,7 +566,26 @@ pub(crate) fn dispatch_hash256_var_raw_into(
         messages.len(),
         total_bytes,
     );
-    execute_hash_var_raw(plan, messages, domain, out, hash256_into);
+    execute_hash_var_blocks(plan, messages, domain, out, hash256_into);
+}
+
+// 256-bit / 128-bit digests of block-wise messages; see `dispatch_hash_blocks_parallel`.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash256_blocks_parallel<M: MessageBlocks>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) -> bool {
+    dispatch_hash_blocks_parallel(messages, domain, out, hash256_into)
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash128_blocks_parallel<M: MessageBlocks>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; 16]],
+) -> bool {
+    dispatch_hash_blocks_parallel(messages, domain, out, hash128_into)
 }
 
 // 128-bit digests; see `dispatch_hash256_var_raw_into`.
@@ -557,7 +607,7 @@ pub(crate) fn dispatch_hash128_var_raw_into(
         messages.len(),
         total_bytes,
     );
-    execute_hash_var_raw(plan, messages, domain, out, hash128_into);
+    execute_hash_var_blocks(plan, messages, domain, out, hash128_into);
 }
 
 #[inline(always)]
@@ -592,12 +642,26 @@ pub(crate) struct HashPlan {
     pub(crate) parallel: HashParallel,
 }
 
-// Sum of the message lengths, saturating.
+// The plan only compares the total with a `mt_threshold_bytes`, so counting stops there.
+const TOTAL_LEN_CAP: usize = 256 * 1024;
+const _: () = assert!(HASH_PARAMS.mt_threshold_bytes <= TOTAL_LEN_CAP);
+const _: () = assert!(HASH_VAR_PARAMS.mt_threshold_bytes <= TOTAL_LEN_CAP);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(HASH_AVX2_PARAMS.mt_threshold_bytes <= TOTAL_LEN_CAP);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(HASH_AVX2_VAR_PARAMS.mt_threshold_bytes <= TOTAL_LEN_CAP);
+
+// Sum of the message lengths, saturating, or any value at least `TOTAL_LEN_CAP` once the
+// sum gets there.
 fn total_len(messages: &[&[u8]]) -> usize {
-    messages
-        .iter()
-        .map(|m| m.len())
-        .fold(0, usize::saturating_add)
+    let mut sum = 0usize;
+    for m in messages {
+        sum = sum.saturating_add(m.len());
+        if sum >= TOTAL_LEN_CAP {
+            break;
+        }
+    }
+    sum
 }
 
 // Backend and execution mode of a hash batch.
@@ -666,7 +730,7 @@ pub(crate) fn hash_min_len(count: usize, threads: usize) -> usize {
 }
 
 // As `hash_min_len`, for scalar batches of messages of any lengths.
-#[cfg(all(feature = "ffi", feature = "parallel"))]
+#[cfg(all(any(feature = "ffi", feature = "python"), feature = "parallel"))]
 pub(crate) fn hash_var_min_len(count: usize, threads: usize) -> usize {
     min_len_for(count, threads, HASH_VAR_PARAMS)
 }
@@ -803,6 +867,221 @@ fn execute_hash_var_avx2<const N: usize>(
     }
 }
 
+// Messages per block rebuilt from a message table; the block is a stack array.
+#[cfg(any(feature = "ffi", feature = "python"))]
+pub(crate) const BLOCK: usize = 256;
+
+// Messages that are turned into slices block by block on the thread that hashes them, so
+// no table of slices is allocated.
+#[cfg(any(feature = "ffi", feature = "python"))]
+pub(crate) trait MessageBlocks: Copy + Sync {
+    fn len(&self) -> usize;
+
+    // Messages `start..end`.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    fn range(&self, start: usize, end: usize) -> Self;
+
+    // Calls `f(offset, block)` over consecutive blocks of at most `BLOCK` messages.
+    fn for_each_block(&self, f: impl FnMut(usize, &[&[u8]]));
+}
+
+// Table of message pointers and lengths from the C API.
+#[cfg(feature = "ffi")]
+#[derive(Clone, Copy)]
+pub(crate) struct RawMessages<'a> {
+    ptrs: &'a [*const u8],
+    lens: &'a [usize],
+}
+
+// SAFETY: the table is only read, and `RawMessages::new` requires the tables and every
+// message to stay readable and unmodified for `'a`.
+#[cfg(feature = "ffi")]
+unsafe impl Sync for RawMessages<'_> {}
+
+#[cfg(feature = "ffi")]
+impl<'a> RawMessages<'a> {
+    // SAFETY: `ptrs` and `lens` have equal length. Every `ptrs[i]` is valid for `lens[i]`
+    // readable bytes for all of `'a` (any pointer when the length is 0). Neither the tables
+    // nor the message bytes are written by any thread during `'a`, and no message overlaps
+    // memory that is written while it is read.
+    pub(crate) unsafe fn new(ptrs: &'a [*const u8], lens: &'a [usize]) -> Self {
+        debug_assert_eq!(ptrs.len(), lens.len());
+        Self { ptrs, lens }
+    }
+}
+
+#[cfg(feature = "ffi")]
+impl MessageBlocks for RawMessages<'_> {
+    fn len(&self) -> usize {
+        self.ptrs.len()
+    }
+
+    fn range(&self, start: usize, end: usize) -> Self {
+        Self {
+            ptrs: &self.ptrs[start..end],
+            lens: &self.lens[start..end],
+        }
+    }
+
+    fn for_each_block(&self, mut f: impl FnMut(usize, &[&[u8]])) {
+        let mut block: [&[u8]; BLOCK] = [&[]; BLOCK];
+        let mut at = 0;
+        for (ps, ls) in self.ptrs.chunks(BLOCK).zip(self.lens.chunks(BLOCK)) {
+            for ((slot, &p), &l) in block.iter_mut().zip(ps).zip(ls) {
+                // SAFETY: guaranteed by `new`; a null pointer only comes with length 0.
+                *slot = if l == 0 {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(p, l) }
+                };
+            }
+            f(at, &block[..ps.len()]);
+            at += ps.len();
+        }
+    }
+}
+
+// As `execute_hash_var`, from messages turned into slices per block; both backends rebuild
+// the slices per block.
+#[cfg(any(feature = "ffi", feature = "python"))]
+fn execute_hash_var_blocks<M: MessageBlocks, const N: usize>(
+    plan: HashBatchPlan,
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) {
+    match plan.backend {
+        Backend::Scalar => {
+            execute_hash_scalar_blocks(plan.parallel, messages, domain, out, absorb_into)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2(cap) => {
+            execute_hash_var_avx2_blocks(cap, plan.parallel, messages, domain, out)
+        }
+    }
+}
+
+// Scalar kernel over block-wise messages on the calling thread.
+#[cfg(any(feature = "ffi", feature = "python"))]
+fn hash_scalar_blocks<M: MessageBlocks, const N: usize>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: &impl Fn(&[u8], u128, &mut [u8; N]),
+) {
+    messages.for_each_block(|at, block| {
+        hash_single(block, domain, &mut out[at..at + block.len()], absorb_into)
+    });
+}
+
+// Scalar hashing of block-wise messages. A work item has `hash_var_min_len` messages, as
+// the per-message split of `execute_hash` with `HASH_VAR_PARAMS`.
+#[cfg(any(feature = "ffi", feature = "python"))]
+fn execute_hash_scalar_blocks<M: MessageBlocks, const N: usize>(
+    parallel: HashParallel,
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) {
+    match parallel {
+        HashParallel::Single => hash_scalar_blocks(messages, domain, out, &absorb_into),
+        HashParallel::Rayon => {
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = get_or_init_pool() {
+                let min_len = hash_var_min_len(out.len(), pool.current_num_threads());
+                pool.install(|| {
+                    out.par_chunks_mut(min_len).enumerate().for_each(|(i, o)| {
+                        let start = i * min_len;
+                        hash_scalar_blocks(
+                            messages.range(start, start + o.len()),
+                            domain,
+                            o,
+                            &absorb_into,
+                        );
+                    });
+                });
+                return;
+            }
+            hash_scalar_blocks(messages, domain, out, &absorb_into);
+        }
+    }
+}
+
+// AVX2 kernel over block-wise messages on the calling thread.
+#[cfg(all(any(feature = "ffi", feature = "python"), target_arch = "x86_64"))]
+fn hash_var_avx2_blocks<M: MessageBlocks, const N: usize>(
+    cap: Avx2Cap,
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    messages.for_each_block(|at, block| {
+        hash_var_avx2(cap, block, domain, &mut out[at..at + block.len()])
+    });
+}
+
+#[cfg(all(any(feature = "ffi", feature = "python"), target_arch = "x86_64"))]
+fn execute_hash_var_avx2_blocks<M: MessageBlocks, const N: usize>(
+    cap: Avx2Cap,
+    parallel: HashParallel,
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; N]],
+) {
+    let run = |m: M, o: &mut [[u8; N]]| hash_var_avx2_blocks(cap, m, domain, o);
+    match parallel {
+        HashParallel::Single => run(messages, out),
+        HashParallel::Rayon => {
+            #[cfg(feature = "parallel")]
+            if out.len() > HASH_AVX2_GROUP {
+                if let Some(pool) = get_or_init_pool() {
+                    let chunk =
+                        hash_chunk_len(out.len(), pool.current_num_threads(), HASH_AVX2_VAR_PARAMS);
+                    pool.install(|| {
+                        out.par_chunks_mut(chunk).enumerate().for_each(|(i, o)| {
+                            let start = i * chunk;
+                            run(messages.range(start, start + o.len()), o);
+                        });
+                    });
+                    return;
+                }
+            }
+            run(messages, out);
+        }
+    }
+}
+
+// Hashes block-wise messages in parallel when the plan for this many messages says so.
+// Returns false without touching `out` when it does not. Meant for batches of at least
+// `HASH_AVX2_PARAMS.mt_threshold_messages` messages, where the total length does not matter
+// to the plan.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash_blocks_parallel<M: MessageBlocks, const N: usize>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; N]],
+    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
+) -> bool {
+    assert_eq!(
+        messages.len(),
+        out.len(),
+        "dispatch_hash_blocks_parallel: length mismatch"
+    );
+    let plan = plan_hash_var_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        messages.len(),
+        TOTAL_LEN_CAP,
+    );
+    if plan.parallel != HashParallel::Rayon {
+        return false;
+    }
+    execute_hash_var_blocks(plan, messages, domain, out, absorb_into);
+    true
+}
+
 // Scalar hashing of messages with a common length; same split as `execute_hash`.
 // `data.len()` must equal `out.len() * message_len`.
 fn execute_hash_scalar_fixed<const N: usize>(
@@ -880,177 +1159,6 @@ fn execute_hash_avx2<const N: usize>(
                 }
             }
             run(data, out);
-        }
-    }
-}
-
-// Messages per block rebuilt from a `RawMessages` table; the block is a stack array.
-#[cfg(feature = "ffi")]
-const RAW_BLOCK: usize = 256;
-
-// Table of message pointers and lengths from the C API. Slices are rebuilt in blocks on the
-// thread that hashes them, so no table of slices is allocated.
-#[cfg(feature = "ffi")]
-#[derive(Clone, Copy)]
-pub(crate) struct RawMessages<'a> {
-    ptrs: &'a [*const u8],
-    lens: &'a [usize],
-}
-
-// SAFETY: the table is only read, and `RawMessages::new` requires the tables and every
-// message to stay readable and unmodified for `'a`.
-#[cfg(feature = "ffi")]
-unsafe impl Sync for RawMessages<'_> {}
-
-#[cfg(feature = "ffi")]
-impl<'a> RawMessages<'a> {
-    // SAFETY: `ptrs` and `lens` have equal length. Every `ptrs[i]` is valid for `lens[i]`
-    // readable bytes for all of `'a` (any pointer when the length is 0). Neither the tables
-    // nor the message bytes are written by any thread during `'a`, and no message overlaps
-    // memory that is written while it is read.
-    pub(crate) unsafe fn new(ptrs: &'a [*const u8], lens: &'a [usize]) -> Self {
-        debug_assert_eq!(ptrs.len(), lens.len());
-        Self { ptrs, lens }
-    }
-
-    #[cfg(feature = "ffi")]
-    fn len(&self) -> usize {
-        self.ptrs.len()
-    }
-
-    #[cfg(feature = "parallel")]
-    fn range(&self, start: usize, end: usize) -> Self {
-        Self {
-            ptrs: &self.ptrs[start..end],
-            lens: &self.lens[start..end],
-        }
-    }
-
-    // Calls `f(offset, block)` over consecutive blocks of at most `RAW_BLOCK` messages.
-    fn for_each_block(&self, mut f: impl FnMut(usize, &[&[u8]])) {
-        let mut block: [&[u8]; RAW_BLOCK] = [&[]; RAW_BLOCK];
-        let mut at = 0;
-        for (ps, ls) in self.ptrs.chunks(RAW_BLOCK).zip(self.lens.chunks(RAW_BLOCK)) {
-            for ((slot, &p), &l) in block.iter_mut().zip(ps).zip(ls) {
-                // SAFETY: guaranteed by `new`; a null pointer only comes with length 0.
-                *slot = if l == 0 {
-                    &[]
-                } else {
-                    unsafe { std::slice::from_raw_parts(p, l) }
-                };
-            }
-            f(at, &block[..ps.len()]);
-            at += ps.len();
-        }
-    }
-}
-
-// As `execute_hash_var`, from a `RawMessages` table; both backends rebuild the slices per
-// block.
-#[cfg(feature = "ffi")]
-fn execute_hash_var_raw<const N: usize>(
-    plan: HashBatchPlan,
-    messages: RawMessages<'_>,
-    domain: u128,
-    out: &mut [[u8; N]],
-    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
-) {
-    match plan.backend {
-        Backend::Scalar => {
-            execute_hash_scalar_raw(plan.parallel, messages, domain, out, absorb_into)
-        }
-        #[cfg(target_arch = "x86_64")]
-        Backend::Avx2(cap) => execute_hash_var_avx2_raw(cap, plan.parallel, messages, domain, out),
-    }
-}
-
-// Scalar kernel over a `RawMessages` table on the calling thread, block by block.
-#[cfg(feature = "ffi")]
-fn hash_scalar_raw<const N: usize>(
-    messages: RawMessages<'_>,
-    domain: u128,
-    out: &mut [[u8; N]],
-    absorb_into: &impl Fn(&[u8], u128, &mut [u8; N]),
-) {
-    messages.for_each_block(|at, block| {
-        hash_single(block, domain, &mut out[at..at + block.len()], absorb_into)
-    });
-}
-
-// Scalar hashing from a `RawMessages` table. A work item has `hash_var_min_len` messages, as
-// the per-message split of `execute_hash` with `HASH_VAR_PARAMS`.
-#[cfg(feature = "ffi")]
-fn execute_hash_scalar_raw<const N: usize>(
-    parallel: HashParallel,
-    messages: RawMessages<'_>,
-    domain: u128,
-    out: &mut [[u8; N]],
-    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
-) {
-    match parallel {
-        HashParallel::Single => hash_scalar_raw(messages, domain, out, &absorb_into),
-        HashParallel::Rayon => {
-            #[cfg(feature = "parallel")]
-            if let Some(pool) = get_or_init_pool() {
-                let min_len = hash_var_min_len(out.len(), pool.current_num_threads());
-                pool.install(|| {
-                    out.par_chunks_mut(min_len).enumerate().for_each(|(i, o)| {
-                        let start = i * min_len;
-                        hash_scalar_raw(
-                            messages.range(start, start + o.len()),
-                            domain,
-                            o,
-                            &absorb_into,
-                        );
-                    });
-                });
-                return;
-            }
-            hash_scalar_raw(messages, domain, out, &absorb_into);
-        }
-    }
-}
-
-// AVX2 kernel over a `RawMessages` table on the calling thread, block by block.
-#[cfg(all(feature = "ffi", target_arch = "x86_64"))]
-fn hash_var_avx2_raw<const N: usize>(
-    cap: Avx2Cap,
-    messages: RawMessages<'_>,
-    domain: u128,
-    out: &mut [[u8; N]],
-) {
-    messages.for_each_block(|at, block| {
-        hash_var_avx2(cap, block, domain, &mut out[at..at + block.len()])
-    });
-}
-
-#[cfg(all(feature = "ffi", target_arch = "x86_64"))]
-fn execute_hash_var_avx2_raw<const N: usize>(
-    cap: Avx2Cap,
-    parallel: HashParallel,
-    messages: RawMessages<'_>,
-    domain: u128,
-    out: &mut [[u8; N]],
-) {
-    let run = |m: RawMessages<'_>, o: &mut [[u8; N]]| hash_var_avx2_raw(cap, m, domain, o);
-    match parallel {
-        HashParallel::Single => run(messages, out),
-        HashParallel::Rayon => {
-            #[cfg(feature = "parallel")]
-            if out.len() > HASH_AVX2_GROUP {
-                if let Some(pool) = get_or_init_pool() {
-                    let chunk =
-                        hash_chunk_len(out.len(), pool.current_num_threads(), HASH_AVX2_VAR_PARAMS);
-                    pool.install(|| {
-                        out.par_chunks_mut(chunk).enumerate().for_each(|(i, o)| {
-                            let start = i * chunk;
-                            run(messages.range(start, start + o.len()), o);
-                        });
-                    });
-                    return;
-                }
-            }
-            run(messages, out);
         }
     }
 }
@@ -1384,9 +1492,10 @@ pub(crate) fn suggested_steps_with(caps: Caps, overrides: Overrides, n: usize) -
     backend_for(caps, overrides, n).steps_policy().steps_for(n)
 }
 
-// Backend and thread count for the given capabilities and config; no pool access.
-// `threads` is the configured pool size: if the pool cannot be built, or after `fork`,
-// batches still run on the calling thread.
+// Backend and configured pool size for the given capabilities and config; no pool access.
+// `threads` is not a count of active workers: if the pool cannot be built, or this process
+// is a child forked after its parent claimed the pool (`POOL_OWNER`), batches still run on
+// the calling thread.
 fn runtime_info_with(caps: Caps, config: RuntimeConfig) -> crate::types::RuntimeInfo {
     // Backend of the largest batch, within `LUSTRO_DISABLE_SIMD`.
     let backend = backend_for(caps, config.overrides(), usize::MAX);

@@ -101,3 +101,28 @@ pub fn hash128_many_var_into(messages: &[&[u8]], out: &mut [Hash128]) {
         unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 16], out.len()) };
     crate::api::absorb_hash128_var_into(messages, Domain::Hash as u128, out_blocks);
 }
+
+// Digests of block-wise messages in parallel; false, with `out` untouched, when the dispatcher
+// would not use the pool for this batch. Batches of at least a few thousand messages.
+#[cfg(feature = "python")]
+pub(crate) fn hash256_many_var_blocks<M: crate::dispatch::MessageBlocks>(
+    messages: M,
+    out: &mut [Hash256],
+) -> bool {
+    // SAFETY: Hash256 is #[repr(transparent)] over [u8; 32], so it has identical layout and alignment.
+    let out_blocks: &mut [[u8; 32]] =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], out.len()) };
+    crate::api::absorb_hash256_blocks_parallel(messages, Domain::Hash as u128, out_blocks)
+}
+
+// As `hash256_many_var_blocks`, 128-bit digests.
+#[cfg(feature = "python")]
+pub(crate) fn hash128_many_var_blocks<M: crate::dispatch::MessageBlocks>(
+    messages: M,
+    out: &mut [Hash128],
+) -> bool {
+    // SAFETY: Hash128 is #[repr(transparent)] over [u8; 16], so it has identical layout and alignment.
+    let out_blocks: &mut [[u8; 16]] =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 16], out.len()) };
+    crate::api::absorb_hash128_blocks_parallel(messages, Domain::Hash as u128, out_blocks)
+}

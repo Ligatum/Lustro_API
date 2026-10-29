@@ -31,7 +31,7 @@ cargo build --release --features rand
 # Python 3.9-3.13 (requires NumPy)
 
 pip install maturin numpy
-maturin develop --release
+maturin develop --release 
 
 # C/C++ FFI bindings
 
@@ -39,11 +39,18 @@ cargo build --release --features ffi
 
 ```
 
-All release builds catch internal panics and convert them to `LustroError::InternalPanic` (or the corresponding Python exception) at the boundary instead of just aborting the process.
+In the release profiles (`panic = "unwind"`) the C FFI boundary catches internal panics and returns `LustroError::InternalPanic`; the Python module raises them as `pyo3_runtime.PanicException` (a `BaseException`). Direct Rust calls panic as usual, for example on a length mismatch.
+
+The Python module declares that it needs the GIL (`gil_used = true`). Free-threaded CPython builds are not tested just yet.
 
 ## Speed Test
 
-This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. This script requires the C FFI library (`lustro.dll`) in the same folder.
+This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. It runs the same sections, with the same inputs and row labels, on three targets, so the results can be compared:
+
+`````bash
+# rust target (built on request only, no other build includes it)
+cargo build --release --example speed
+`````
 
 Please note that the core mechanism and the API implementation are considered non-cryptographic at this moment.
 
@@ -569,6 +576,11 @@ digests = lustro.hash256_many_fixed(rows)  # uint8 array, shape (3, 32)
 
 # Messages of any length: a sequence of bytes or byte buffers.
 digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
+
+# Into an array you provide, see "GIL and Throughput (Python)".
+out = np.empty((3, 32), dtype=np.uint8)
+lustro.hash256_many_fixed_into(rows, out)
+lustro.hash256_many_var_into([b"a", b"bc", b""], out)
 ```
 
 **C / C++**
@@ -594,7 +606,7 @@ lustro_hash256_many_var(messages, 3, lengths, (uint8_t *)digests);
 
 The names mean the same in Rust, Python and C/C++. `hash128_*` and `lustro_hash128_*` work the same way and return 16-byte digests.
 
-Both variants use AVX2 for batches of 4 or more messages when the CPU supports it, and send large batches to the thread pool. The digests do not depend on the backend or on the number of threads.
+Both variants can use AVX2 for batches of 4 or more messages and send large batches to the thread pool, as far as the CPU and the runtime settings (see Runtime Settings) allow. The digests do not depend on the backend or on the number of threads.
 
 ---
 
@@ -669,7 +681,7 @@ more = xof.blocks(steps)
 
 `fill_blocks(out, steps)` writes one 32-byte block per stream per step, step-major: stream `i` at step `s` is block `s * n + i` (`n` = number of streams). In Python that is `out[s, i]`, with `out` shaped `(steps, n_streams, 4)`; each block is four `uint64` values. `blocks(steps)` (Rust and Python) returns the same blocks in a newly allocated result: a `Vec<[u8; 32]>` in Rust, a new, writable array of that shape in Python.
 
-In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call; `release_buffer()` frees it earlier. `blocks()` does not use that buffer.
+In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call made with the default `release_gil=True`; `release_buffer()` frees it earlier. `fill_blocks(..., release_gil=False)` and `blocks()` do not use that buffer.
 
 **C / C++**
 
@@ -1436,7 +1448,7 @@ if (err != LUSTRO_ERROR_OK) {
 
 Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you pass override it. `threads` is capped at the number of logical CPUs, and `1` disables the thread pool. `allow_simd=False` (`LUSTRO_SIMD_SCALAR` in C/C++) selects the scalar backend.
 
-The settings can be set only once. The first hash batch call, batch `fill_blocks`/`blocks`, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` shows what ended up in effect.
+The settings can be set only once. The first hash batch call, batch `fill_blocks`/`blocks`, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` reports the selected backend and the configured pool size (0 = batches run on the calling thread). It does not report running workers: the pool starts later and may fail to start. A child forked after its parent first used the pool runs on the calling thread; one forked earlier may start its own pool.
 
 ---
 
@@ -1467,6 +1479,40 @@ n = rng.readinto(buf)         # n == 1000, any writable C-contiguous buffer
 Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, `hash128_many_var` and `LustroXofBatch` take any sequence of such objects, but not a single string or buffer.
 
 An instance must not be used by several threads at the same time (an overlapping call raises `RuntimeError`). Use `copy()`, `fork()` or separate instances instead. The installed version is available as `lustro.__version__`, and the package ships type stubs (`lustro.pyi`, `py.typed`).
+
+---
+
+### GIL and Throughput (Python)
+
+| Call | GIL |
+|---|---|
+| `hash256`, `hash128` | released while hashing |
+| `hash*_many_fixed` | released; the input is copied first |
+| `hash*_many_fixed_into`, `hash*_many_var`, `hash*_many_var_into` | released by default, held with `release_gil=False` |
+| `fill_blocks` (`LustroPrngBatch`, `LustroXofBatch`) | released by default, held with `release_gil=False` |
+| `fill`, `fill_u64`, `blocks` | released while generating |
+| `fill_into`, `readinto` | held |
+
+By default (`release_gil=True`) other Python threads run during the call. Input is copied before the GIL is released and results are copied into `out` after it is taken back, which costs time on large batches.
+
+`release_gil=False` is the maximum-throughput mode: the GIL stays held, input is read in place and output is written straight into your array, with no copies. Other Python threads wait. The thread pool and AVX2 are used in both modes.
+
+```python
+out = np.empty((n, 32), dtype=np.uint8)
+lustro.hash256_many_fixed_into(rows, out, release_gil=False)
+lustro.hash256_many_var_into(messages, out, release_gil=False)
+
+steps = prng.suggested_steps()
+blocks = np.empty((steps, len(prng), 4), dtype=np.uint64)
+prng.fill_blocks(blocks, steps, release_gil=False)
+```
+
+In this mode:
+
+- `hash*_many_var` and `hash*_many_var_into` read an exact `list` or `tuple` of exact `bytes` (no subclasses) without taking a reference on each item, which is faster for many small messages.
+- `out` must not share memory with the input. The same array, or views of one array, as `data` and `out` raise `TypeError`; other overlap (for example a `memoryview` of `out` used as a message) raises `ValueError`. By default the input is copied first and such calls are allowed.
+- A `list` or `tuple` of 16384 or more items given to `hash*_many_var_into` is hashed while it is read, so `out` may be partly written if the call then fails. By default nothing is written before all items are read.
+- `fill_blocks` writes in place on little-endian targets; elsewhere the flag has no effect.
 
 ---
 

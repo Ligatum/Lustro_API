@@ -63,8 +63,10 @@ pub extern "C" fn lustro_api_version() -> u32 {
     crate::api::LUSTRO_API_VERSION
 }
 
-/// Returns the configured number of threads for parallel batches, 0 if batches
-/// run on the calling thread. The pool is not started by this call.
+/// Returns the configured pool size for parallel batches, not the number of active workers.
+/// `0` means parallelism is disabled by settings or the crate was built without `parallel`.
+/// This call does not start the pool. If initialization fails, or this process inherited
+/// a pool-owner PID from its parent through `fork`, batches fall back to the calling thread.
 #[no_mangle]
 pub extern "C" fn lustro_runtime_threads() -> usize {
     guarded(0, || crate::api::runtime_info().threads)

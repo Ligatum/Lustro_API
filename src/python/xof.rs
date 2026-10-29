@@ -305,17 +305,28 @@ impl LustroXofBatchPy {
     /// `out` must be a writable uint64 array of shape `(steps, len(self), 4)`.
     /// Non-empty output must also be C-contiguous and aligned. Output is step-major:
     /// `out[s, i]` is block `s` of lane `i` (32 bytes as 4 little-endian uint64).
-    /// The bytes do not depend on how steps are split across calls. The GIL is
-    /// released while generating.
+    /// The bytes do not depend on how steps are split across calls.
+    ///
+    /// By default the GIL is released while generating: the blocks go to an internal
+    /// buffer and are copied into `out` once the GIL is held again. With
+    /// `release_gil=False` the GIL stays held and the blocks are written into `out`
+    /// directly (no copy), so other Python threads wait for the call. Little-endian
+    /// targets only; elsewhere the flag has no effect.
     ///
     /// Raises ValueError for a wrong shape, or for non-contiguous or misaligned
     /// non-empty output. TypeError is raised for a wrong type, dtype or ndim.
     /// Read-only or conflicting borrows raise the corresponding Python error.
+    ///
+    /// Validation errors leave the stream unchanged. If `out` is reshaped by another
+    /// thread while the GIL is released, ValueError is raised after the blocks were
+    /// generated, so the stream has already advanced.
+    #[pyo3(signature = (out, steps, *, release_gil=true))]
     pub fn fill_blocks(
         &mut self,
         py: Python<'_>,
         out: &Bound<'_, PyAny>,
         steps: usize,
+        release_gil: bool,
     ) -> PyResult<()> {
         crate::python::require_numpy(py)?;
         let out = out.cast::<PyArray3<u64>>().map_err(|_| {
@@ -360,6 +371,22 @@ impl LustroXofBatchPy {
             }
         }
 
+        #[cfg(target_endian = "little")]
+        if !release_gil {
+            let mut out_arr = out.as_array_mut();
+            let flat = out_arr.as_slice_mut().ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "out must be a C-contiguous array (got a non-contiguous view, \
+                     e.g. from slicing or transposing — call np.ascontiguousarray() first)",
+                )
+            })?;
+            self.inner
+                .fill_blocks(crate::python::words_as_blocks(flat), steps);
+            return Ok(());
+        }
+        #[cfg(not(target_endian = "little"))]
+        let _ = release_gil;
+
         if self.blocks_buf.len() < needed {
             let additional = needed - self.blocks_buf.len();
             self.blocks_buf
@@ -372,7 +399,13 @@ impl LustroXofBatchPy {
         py.detach(|| self.inner.fill_blocks(buf, steps));
 
         // Step-major blocks map 1:1 onto the C-contiguous (steps, n, 4) output.
-        // Re-borrow the output after the GIL is reacquired.
+        // Re-borrow the output after the GIL is reacquired. The shape is read again:
+        // a resize with refcheck=False from another thread may have changed it.
+        if out.shape() != [steps, n, 4] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "out changed shape while it was being written",
+            ));
+        }
         let mut out_arr = out.as_array_mut();
         let flat = out_arr.as_slice_mut().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(

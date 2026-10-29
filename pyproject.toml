@@ -10,9 +10,9 @@ profile  = "release"
 [project]
 name = "lustro"
 readme = "README.md"
-license-file = "LICENSE.md"
+license-files = ["LICENSE.md"]
 requires-python = ">=3.9,<3.14"
-dependencies = ["numpy"]
+dependencies = ["numpy", "typing-extensions>=4.6"]
 dynamic = ["version", "description"]
 
 [project.urls]

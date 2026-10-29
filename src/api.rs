@@ -17,8 +17,9 @@ pub fn lustro_api_version() -> u32 {
 /// The values follow the environment (`LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`,
 /// `LUSTRO_NUM_THREADS`), which is read once at the first use of the dispatcher;
 /// this call counts as a use. `threads` is the configured pool size, not a count of
-/// running workers: the pool is not started here and may fail to start. A forked
-/// child process runs single-threaded whatever is reported.
+/// running workers: the pool is not started here and may fail to start, and batches then
+/// run on the calling thread. A child forked after its parent first used the pool also
+/// runs on the calling thread; one forked before that may start its own pool.
 pub fn runtime_info() -> crate::types::RuntimeInfo {
     crate::dispatch::runtime_info()
 }
@@ -199,6 +200,24 @@ pub(crate) fn absorb_hash256_var_into(messages: &[&[u8]], domain: u128, out: &mu
 
 pub(crate) fn absorb_hash128_var_into(messages: &[&[u8]], domain: u128, out: &mut [[u8; 16]]) {
     crate::dispatch::dispatch_hash128_var_into(messages, domain, out);
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn absorb_hash256_blocks_parallel<M: crate::dispatch::MessageBlocks>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) -> bool {
+    crate::dispatch::dispatch_hash256_blocks_parallel(messages, domain, out)
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn absorb_hash128_blocks_parallel<M: crate::dispatch::MessageBlocks>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; 16]],
+) -> bool {
+    crate::dispatch::dispatch_hash128_blocks_parallel(messages, domain, out)
 }
 
 #[cfg(feature = "ffi")]

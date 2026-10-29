@@ -10,8 +10,9 @@ pub struct RuntimeInfo {
     /// batches, fixed-length hashes of empty messages, single hashes and single streams
     /// run scalar.
     pub backend: &'static str,
-    /// Threads for parallel batches. 0 = batches run on the calling thread
-    /// (disabled by the settings or built without `parallel`).
+    /// Configured pool size, not a count of active workers. 0 = batches run on the calling
+    /// thread (disabled by the settings or built without `parallel`). A nonzero value does
+    /// not guarantee a running pool: if it cannot be built, batches run on the calling thread.
     pub threads: usize,
 }
 

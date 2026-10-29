@@ -1,8 +1,19 @@
 """
-lustro.dll speed test (ctypes), normalized per engine round. lustro.dll must be in the same directory.
+Lustro speed test, normalized per engine round. One script, three targets:
+  rust    the native API, examples/speed.rs run as a separate process per measurement
+  python  the `lustro` module (NumPy), GIL held for the whole call (release_gil=False),
+          input read in place, output written in place into a preallocated buffer
+  c       lustro.dll through ctypes
+Same sections, tables and row labels for all, so the outputs can be compared line by line.
+Same inputs too: HASH_VAR lengths are generated here and handed to every target.
 Stream batch calls use the `steps` suggested by the library for the given N.
 Multi-stream sections run one single stream per process and report the aggregate.
-Optional arguments: section number (0-10) and variant (1-5, or auto, scalar, st, compare, simd).
+Usage: [rust|python|c] [section 0-10] [variant 1-5, or auto, scalar, st, compare, simd]
+Without arguments the script asks. With arguments and no target, rust is used.
+lustro.dll is searched only in <script directory>/target/release and
+<script directory>/target/release-ffi (newest loadable build with the C API).
+The Rust worker is <script directory>/target/release/examples/speed;
+build it with `cargo build --release --example speed` from that project directory.
 """
 
 import array
@@ -12,6 +23,8 @@ import multiprocessing
 import os
 import queue
 import random
+import struct
+import subprocess
 import sys
 import time
 
@@ -72,7 +85,76 @@ def hash_rounds_for_len(msg_len: int) -> int:
 
 HW_THREADS = os.cpu_count() or 1
 
-DLL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lustro.dll")
+TARGETS = ("rust", "python", "c")
+TARGET_WORDS = {"rust": "rust", "python": "python", "py": "python", "c": "c"}
+TARGET_HELP = {
+    "rust": "native Rust API, examples/speed.rs in a separate process",
+    "python": "lustro module, GIL held during the calls (release_gil=False)",
+    "c": "lustro.dll through ctypes",
+}
+DEFAULT_TARGET = TARGETS[0]
+TARGET = DEFAULT_TARGET
+
+if sys.platform == "win32":
+    DLL_NAME = "lustro.dll"
+    EXE_NAME = "speed.exe"
+elif sys.platform == "darwin":
+    DLL_NAME = "liblustro.dylib"
+    EXE_NAME = "speed"
+else:
+    DLL_NAME = "liblustro.so"
+    EXE_NAME = "speed"
+
+
+PROFILES = ("release", "release-ffi")
+
+def dll_candidates():
+    """Only use target/<profile> next to this script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.join(here, "target", profile, DLL_NAME) for profile in PROFILES]
+
+
+def exe_candidates():
+    """Only use target/release/examples next to this script."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.join(here, "target", "release", "examples", EXE_NAME)]
+
+
+DLL_ERRORS = []
+
+
+def find_dll():
+    """Newest candidate that loads and exports the C API; why the others did not is kept in
+    DLL_ERRORS."""
+    best = None
+    for path in dll_candidates():
+        if not os.path.isfile(path):
+            continue
+        try:
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(os.path.dirname(path))
+            lib = ctypes.CDLL(path)
+            if not hasattr(lib, "lustro_api_version"):
+                DLL_ERRORS.append(f"{path}: no C API exports (built without --features ffi?)")
+                continue
+        except OSError as e:
+            DLL_ERRORS.append(f"{path}: {e}")
+            continue
+        if best is None or os.path.getmtime(path) > os.path.getmtime(best):
+            best = path
+    return best
+
+
+DLL_PATH = find_dll()
+
+
+def find_exe():
+    """Newest existing Rust worker."""
+    found = [p for p in exe_candidates() if os.path.isfile(p)]
+    return max(found, key=os.path.getmtime) if found else None
+
+
+EXE_PATH = find_exe()
 
 ENV_VARS = ("LUSTRO_DISABLE_MT", "LUSTRO_DISABLE_SIMD", "LUSTRO_NUM_THREADS")
 
@@ -155,8 +237,13 @@ def summarize(times, n_elements, rounds_per_elem, total_bytes):
     Everything is per engine round (n_elements * rounds_per_elem), so the
     numbers compare across pipelines.
     """
-    p50 = percentile(times, 50)
-    p95 = percentile(times, 95)
+    return summarize_pcts(
+        percentile(times, 50), percentile(times, 95), n_elements, rounds_per_elem, total_bytes
+    )
+
+
+def summarize_pcts(p50, p95, n_elements, rounds_per_elem, total_bytes):
+    """summarize() from percentiles in seconds."""
     rounds_total = n_elements * rounds_per_elem
 
     return {
@@ -294,8 +381,8 @@ def new_ctx(fn, *args):
 
 
 def load_lib():
-    if not os.path.exists(DLL_PATH):
-        raise FileNotFoundError(f"not found: {DLL_PATH}")
+    if not DLL_PATH:
+        raise FileNotFoundError(f"no loadable {DLL_NAME} found")
     lib = ctypes.CDLL(DLL_PATH)
 
     lib.lustro_api_version.restype = ctypes.c_uint32
@@ -367,26 +454,81 @@ def open_single(lib, kind):
 
 
 # =========================================================
-# WORKERS
+# PYTHON BINDING (target "python")
 # =========================================================
-def info_worker(q):
+def load_py():
+    """Imports lustro and NumPy inside the worker, after its environment is set."""
+    import numpy as np
+    import lustro
+
+    return lustro, np
+
+
+# =========================================================
+# RUST BINDING (target "rust"): examples/speed.rs, timing runs inside that process
+# =========================================================
+def rust_cmd(*args):
+    if not EXE_PATH:
+        raise FileNotFoundError(f"no {EXE_NAME} found")
+    return [EXE_PATH, *map(str, args)]
+
+
+def rust_call(*args, stdin=None):
+    """One run of the worker; its last stdout line is `key=value ...`."""
+    proc = subprocess.run(rust_cmd(*args), input=stdin, capture_output=True)
+    if proc.returncode != 0:
+        err = proc.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"{EXE_NAME} {args[0]} exited with code {proc.returncode}: {err}")
+    lines = proc.stdout.decode().split()
+    return dict(item.split("=", 1) for item in lines)
+
+
+def rust_summary(res, n_elements, rounds_per_elem, total_bytes):
+    return summarize_pcts(float(res["p50"]), float(res["p95"]), n_elements, rounds_per_elem, total_bytes)
+
+
+# =========================================================
+# WORKERS: each setup returns (call, free) for the chosen target; timing is shared.
+# =========================================================
+def info_worker(target, q):
     try:
-        lib = load_lib()
-        q.put({
-            "backend": lib.lustro_runtime_backend().decode(),
-            "threads": lib.lustro_runtime_threads(),
-        })
+        if target == "rust":
+            info = rust_call("info")
+            q.put({
+                "backend": info["backend"],
+                "threads": int(info["threads"]),
+                "lines": [
+                    f"lustro {info['version']}, {info['build']} build: {EXE_PATH}",
+                ],
+            })
+        elif target == "c":
+            lib = load_lib()
+            q.put({
+                "backend": lib.lustro_runtime_backend().decode(),
+                "threads": lib.lustro_runtime_threads(),
+                "lines": [f"DLL: {DLL_PATH}"],
+            })
+        else:
+            lustro, np = load_py()
+            info = lustro.runtime_info()
+            q.put({
+                "backend": info["backend"],
+                "threads": info["threads"],
+                "lines": [
+                    f"lustro {lustro.__version__}: {getattr(lustro, '__file__', '?')}",
+                    f"Python {sys.version.split()[0]}, NumPy {np.__version__}",
+                ],
+            })
     except Exception as e:
         q.put({"error": repr(e)})
 
 
-def hash_batch_worker(n, msg_len, q):
-    try:
+def setup_hash_fixed(target, n, msg_len):
+    raw = os.urandom(n * msg_len)
+    if target == "c":
         lib = load_lib()
-
-        data = u8_buf(os.urandom(n * msg_len))
+        data = u8_buf(raw)
         data_ptr = ctypes.cast(data, U8P)
-
         out = (ctypes.c_uint8 * (n * 32))()
         out_ptr = ctypes.cast(out, U8P)
 
@@ -395,27 +537,47 @@ def hash_batch_worker(n, msg_len, q):
             if err != 0:
                 raise RuntimeError(f"lustro_hash256_many_fixed returned error {err}")
 
-        times = timed_loop(call)
+        call.keep = (data, out)
+        return call, lambda: None
+
+    lustro, np = load_py()
+    data = np.frombuffer(raw, np.uint8).reshape(n, msg_len)
+    out = np.empty((n, 32), np.uint8)
+
+    def call():
+        lustro.hash256_many_fixed_into(data, out, release_gil=False)
+
+    call()
+    if bytes(out[0]) != lustro.hash256(raw[:msg_len]):
+        raise RuntimeError("hash256_many_fixed_into: row 0 differs from hash256")
+    return call, lambda: None
+
+
+def hash_batch_worker(target, n, msg_len, q):
+    try:
         total_bytes = n * msg_len
-        result = summarize(times, n, hash_rounds_for_len(msg_len), total_bytes)
+        rounds = hash_rounds_for_len(msg_len)
+        if target == "rust":
+            res = rust_call("hash_fixed", MIN_TIME, MIN_ITERS, n, msg_len)
+            result = rust_summary(res, n, rounds, total_bytes)
+        else:
+            call, free = setup_hash_fixed(target, n, msg_len)
+            try:
+                times = timed_loop(call)
+            finally:
+                free()
+            result = summarize(times, n, rounds, total_bytes)
         q.put({"result": result, "steps": None, "size_bytes": total_bytes})
     except Exception as e:
         q.put({"error": repr(e)})
 
 
-def hash_var_worker(n, mean_len, q):
-    """
-    lustro_hash256_many_var on n messages with lengths uniform in 0..2*mean_len (fixed
-    seed). Rounds and data rate are counted from the actual lengths.
-    """
-    try:
+def setup_hash_var(target, lens):
+    n = len(lens)
+    raw = os.urandom(sum(lens))
+    if target == "c":
         lib = load_lib()
-
-        rng = random.Random(HASH_VAR_SEED)
-        lens = [rng.randint(0, 2 * mean_len) for _ in range(n)]
-        total_bytes = sum(lens)
-
-        data = u8_buf(os.urandom(total_bytes))
+        data = u8_buf(raw)
         pos = ctypes.addressof(data)
         offsets = []
         for length in lens:
@@ -424,7 +586,6 @@ def hash_var_worker(n, mean_len, q):
         ptr_array = (SizeT * n)(*offsets)
         len_array = (SizeT * n)(*lens)
         ptrs = ctypes.cast(ptr_array, ctypes.POINTER(U8P))
-
         out = (ctypes.c_uint8 * (n * 32))()
         out_ptr = ctypes.cast(out, U8P)
 
@@ -433,59 +594,112 @@ def hash_var_worker(n, mean_len, q):
             if err != 0:
                 raise RuntimeError(f"lustro_hash256_many_var returned error {err}")
 
-        times = timed_loop(call)
+        call.keep = (data, ptr_array, len_array, out)
+        return call, lambda: None
+
+    lustro, np = load_py()
+    messages = []
+    pos = 0
+    for length in lens:
+        messages.append(raw[pos:pos + length])
+        pos += length
+    out = np.empty((n, 32), np.uint8)
+
+    def call():
+        lustro.hash256_many_var_into(messages, out, release_gil=False)
+
+    call()
+    for k in (0, n - 1):
+        if bytes(out[k]) != lustro.hash256(messages[k]):
+            raise RuntimeError(f"hash256_many_var_into: row {k} differs from hash256")
+    return call, lambda: None
+
+
+def hash_var_worker(target, n, mean_len, q):
+    """
+    hash256_many_var on n messages with lengths uniform in 0..2*mean_len (fixed seed).
+    Rounds and data rate are counted from the actual lengths.
+    """
+    try:
+        rng = random.Random(HASH_VAR_SEED)
+        lens = [rng.randint(0, 2 * mean_len) for _ in range(n)]
+        total_bytes = sum(lens)
         rounds = sum(hash_rounds_for_len(length) for length in lens)
-        result = summarize(times, 1, rounds, total_bytes)
+        if target == "rust":
+            res = rust_call(
+                "hash_var", MIN_TIME, MIN_ITERS, stdin=struct.pack(f"<{n}I", *lens)
+            )
+            result = rust_summary(res, 1, rounds, total_bytes)
+        else:
+            call, free = setup_hash_var(target, lens)
+            try:
+                times = timed_loop(call)
+            finally:
+                free()
+            result = summarize(times, 1, rounds, total_bytes)
         q.put({"result": result, "steps": None, "size_bytes": total_bytes})
     except Exception as e:
         q.put({"error": repr(e)})
 
 
-def fill_single_worker(kind, size, q):
+def setup_single(target, kind, size):
+    """One stream and one buffer of `size` bytes: the call fills the buffer."""
+    if target == "c":
+        lib = load_lib()
+        ctx, fill, free, fill_name = open_single(lib, kind)
+        out = (ctypes.c_uint8 * size)()
+        out_ptr = ctypes.cast(out, U8P)
+
+        def call():
+            err = fill(ctx, out_ptr, size)
+            if err != 0:
+                raise RuntimeError(f"{fill_name} returned error {err}")
+
+        call.keep = (out,)
+        return call, lambda: free(ctx)
+
+    lustro, np = load_py()
+    stream = lustro.LustroPrng(bytes(range(32))) if kind == "PRNG" else lustro.LustroXof(b"m0")
+    buf = bytearray(size)
+
+    def call():
+        stream.fill_into(buf)
+
+    return call, lambda: None
+
+
+def fill_single_worker(target, kind, size, q):
     """
-    One lustro_prng_fill / lustro_xof_fill call on a single stream.
+    One prng/xof fill call on a single stream.
     size is a multiple of 32, so rounds = size // 32 (one round per 32 B block).
     """
     try:
-        lib = load_lib()
-        ctx, fill, free, fill_name = open_single(lib, kind)
-
-        try:
-            out = (ctypes.c_uint8 * size)()
-            out_ptr = ctypes.cast(out, U8P)
-
-            def call():
-                err = fill(ctx, out_ptr, size)
-                if err != 0:
-                    raise RuntimeError(f"{fill_name} returned error {err}")
-
-            times = timed_loop(call)
+        if target == "rust":
+            res = rust_call("single", MIN_TIME, MIN_ITERS, kind.lower(), size)
+            result = rust_summary(res, 1, size // 32, size)
+        else:
+            call, free = setup_single(target, kind, size)
+            try:
+                times = timed_loop(call)
+            finally:
+                free()
             result = summarize(times, 1, size // 32, size)
-            q.put({"result": result, "steps": None, "size_bytes": size})
-        finally:
-            free(ctx)
+        q.put({"result": result, "steps": None, "size_bytes": size})
     except Exception as e:
         q.put({"error": repr(e)})
 
 
-def multi_fill_worker(kind, size, barrier, q):
+def multi_fill_worker(target, kind, size, barrier, q):
     """
     One process of the multi-stream test: own stream, own buffer. All processes
     start the timed window together (barrier) and fill for MULTI_TIME.
     """
     try:
-        lib = load_lib()
-        ctx, fill, free, fill_name = open_single(lib, kind)
+        if target == "rust":
+            raise RuntimeError("rust multi runs through run_multi_rust")
+        call, free = setup_single(target, kind, size)
 
         try:
-            out = (ctypes.c_uint8 * size)()
-            out_ptr = ctypes.cast(out, U8P)
-
-            def call():
-                err = fill(ctx, out_ptr, size)
-                if err != 0:
-                    raise RuntimeError(f"{fill_name} returned error {err}")
-
             warm_end = time.perf_counter() + MULTI_WARMUP
             call()
             while time.perf_counter() < warm_end:
@@ -504,7 +718,7 @@ def multi_fill_worker(kind, size, barrier, q):
                     break
             q.put({"calls": calls, "elapsed": now - start})
         finally:
-            free(ctx)
+            free()
     except Exception as e:
         try:
             barrier.abort()
@@ -513,59 +727,86 @@ def multi_fill_worker(kind, size, barrier, q):
         q.put({"error": repr(e)})
 
 
-def _make_xof_batch(lib, n):
-    # One flat buffer of n fixed 8 B messages; pointers are offsets into it.
-    blob = u8_buf(array.array("Q", range(n)).tobytes())
-    base = ctypes.addressof(blob)
-    ptr_array = (SizeT * n)(*range(base, base + 8 * n, 8))
-    len_array = (SizeT * n)(*([8] * n))
-    return new_ctx(
-        lib.lustro_xof_batch_new, ctypes.cast(ptr_array, ctypes.POINTER(U8P)), len_array, n
-    )
+def setup_stream_batch(target, kind, n):
+    """n streams; returns (call, free, steps, out_len). The call advances every stream `steps` rounds."""
+    if target == "c":
+        lib = load_lib()
+        if kind == "PRNG":
+            seed = u8_buf(bytes(range(32)))
+            keep = (seed,)
+            ctx = new_ctx(lib.lustro_prng_batch_new_range, seed, 0, 0, n)
+            fill = lib.lustro_prng_batch_fill_blocks
+            free = lib.lustro_prng_batch_free
+            suggested = lib.lustro_prng_batch_suggested_steps
+            fill_name = "lustro_prng_batch_fill_blocks"
+        else:
+            # One flat buffer of n fixed 8 B messages; pointers are offsets into it.
+            blob = u8_buf(array.array("Q", range(n)).tobytes())
+            base = ctypes.addressof(blob)
+            ptr_array = (SizeT * n)(*range(base, base + 8 * n, 8))
+            len_array = (SizeT * n)(*([8] * n))
+            keep = (blob, ptr_array, len_array)
+            ctx = new_ctx(
+                lib.lustro_xof_batch_new, ctypes.cast(ptr_array, ctypes.POINTER(U8P)), len_array, n
+            )
+            fill = lib.lustro_xof_batch_fill_blocks
+            free = lib.lustro_xof_batch_free
+            suggested = lib.lustro_xof_batch_suggested_steps
+            fill_name = "lustro_xof_batch_fill_blocks"
+        try:
+            steps = suggested(ctx)
+            if steps == 0:
+                raise RuntimeError("suggested_steps returned 0")
+            out_len = n * steps * 32
+            out = (ctypes.c_uint8 * out_len)()
+            out_ptr = ctypes.cast(out, U8P)
+        except Exception:
+            free(ctx)
+            raise
+
+        def call():
+            err = fill(ctx, out_ptr, out_len, steps)
+            if err != 0:
+                raise RuntimeError(f"{fill_name} returned error {err}")
+
+        call.keep = (out, keep)
+        return call, (lambda: free(ctx)), steps, out_len
+
+    lustro, np = load_py()
+    if kind == "PRNG":
+        batch = lustro.LustroPrngBatch.new_range(bytes(range(32)), 0, n)
+    else:
+        batch = lustro.LustroXofBatch([i.to_bytes(8, "little") for i in range(n)])
+    steps = batch.suggested_steps()
+    if steps == 0:
+        raise RuntimeError("suggested_steps returned 0")
+    out = np.zeros((steps, n, 4), dtype=np.uint64)
+
+    def call():
+        batch.fill_blocks(out, steps, release_gil=False)
+
+    return call, (lambda: None), steps, out.nbytes
 
 
-def stream_batch_worker(kind, n, q):
+def stream_batch_worker(target, kind, n, q):
     """
     One fill_blocks() call: each of the n streams advances `steps` rounds,
     n * steps blocks out (step-major). `steps` comes from the library.
     kind is "PRNG" or "XOF".
     """
     try:
-        lib = load_lib()
-
-        if kind == "PRNG":
-            seed = u8_buf(bytes(range(32)))
-            batch_ctx = new_ctx(lib.lustro_prng_batch_new_range, seed, 0, 0, n)
-            fill = lib.lustro_prng_batch_fill_blocks
-            free = lib.lustro_prng_batch_free
-            suggested = lib.lustro_prng_batch_suggested_steps
-            fill_name = "lustro_prng_batch_fill_blocks"
+        if target == "rust":
+            res = rust_call("batch", MIN_TIME, MIN_ITERS, kind.lower(), n)
+            steps, out_len = int(res["steps"]), int(res["bytes"])
+            result = rust_summary(res, n, steps, out_len)
         else:
-            batch_ctx = _make_xof_batch(lib, n)
-            fill = lib.lustro_xof_batch_fill_blocks
-            free = lib.lustro_xof_batch_free
-            suggested = lib.lustro_xof_batch_suggested_steps
-            fill_name = "lustro_xof_batch_fill_blocks"
-
-        try:
-            steps = suggested(batch_ctx)
-            if steps == 0:
-                raise RuntimeError("suggested_steps returned 0")
-
-            out_len = n * steps * 32
-            out = (ctypes.c_uint8 * out_len)()
-            out_ptr = ctypes.cast(out, U8P)
-
-            def call():
-                err = fill(batch_ctx, out_ptr, out_len, steps)
-                if err != 0:
-                    raise RuntimeError(f"{fill_name} returned error {err}")
-
-            times = timed_loop(call)
+            call, free, steps, out_len = setup_stream_batch(target, kind, n)
+            try:
+                times = timed_loop(call)
+            finally:
+                free()
             result = summarize(times, n, steps, out_len)
-            q.put({"result": result, "steps": steps, "size_bytes": out_len})
-        finally:
-            free(batch_ctx)
+        q.put({"result": result, "steps": steps, "size_bytes": out_len})
     except Exception as e:
         q.put({"error": repr(e)})
 
@@ -608,12 +849,60 @@ def run_worker(func, args, env=None):
     return res
 
 
+def run_multi_rust(kind, size, procs):
+    """Native twin of run_multi: `procs` worker processes, each with its own stream and buffer.
+    A worker prints `ready` after its warmup and starts the timed window on a line from stdin,
+    so all windows open together."""
+    cmd = rust_cmd("multi", kind.lower(), size, MULTI_WARMUP, MULTI_TIME)
+    kids = [
+        subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        for _ in range(procs)
+    ]
+
+    def stderr_of(kid):
+        kid.kill()
+        kid.wait()
+        return kid.stderr.read().strip()
+
+    def expect(kid, key):
+        fields = kid.stdout.readline().split()
+        if not fields or fields[0].split("=")[0] != key:
+            raise RuntimeError(f"{EXE_NAME} multi: {stderr_of(kid) or 'no output'}")
+        return dict(item.split("=", 1) for item in fields if "=" in item)
+
+    try:
+        for kid in kids:
+            expect(kid, "ready")
+        for kid in kids:
+            kid.stdin.write("go\n")
+            kid.stdin.flush()
+        results = []
+        for kid in kids:
+            fields = expect(kid, "calls")
+            results.append({"calls": int(fields["calls"]), "elapsed": float(fields["elapsed"])})
+        return results
+    finally:
+        for kid in kids:
+            if kid.poll() is None:
+                kid.kill()
+            kid.wait()
+            for pipe in (kid.stdin, kid.stdout, kid.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+
 def run_multi(kind, size, procs):
     """Runs `procs` multi_fill_worker processes together, returns their results."""
+    if TARGET == "rust":
+        return run_multi_rust(kind, size, procs)
     barrier = multiprocessing.Barrier(procs)
     q = multiprocessing.Queue()
     workers = [
-        multiprocessing.Process(target=multi_fill_worker, args=(kind, size, barrier, q))
+        multiprocessing.Process(target=multi_fill_worker, args=(TARGET, kind, size, barrier, q))
         for _ in range(procs)
     ]
     for p in workers:
@@ -646,10 +935,10 @@ def run_multi(kind, size, procs):
 # PIPELINE SECTIONS: one per menu entry, each prints its own table.
 # =========================================================
 def emit(label, n, func, args, mode):
-    res = run_worker(func, args, MODE_ENV[mode])
+    res = run_worker(func, (TARGET, *args), MODE_ENV[mode])
     vs_ref = None
     if mode in COMPARE:
-        ref = run_worker(func, args, COMPARE[mode][1])
+        ref = run_worker(func, (TARGET, *args), COMPARE[mode][1])
         vs_ref = ref["result"]["p50_ms"] / res["result"]["p50_ms"]
     print_row(label, n, res["steps"], res["size_bytes"], res["result"], vs_ref)
 
@@ -696,7 +985,7 @@ def section_hash_var_sweep(mode):
 
 def make_fill_single_section(kind):
     def section(mode):
-        table_start(f"{kind}_FILL  (single stream, N=1; includes ctypes call overhead)", mode)
+        table_start(f"{kind}_FILL  (single stream, N=1; includes call overhead)", mode)
         for size in SINGLE_FILL_SIZES:
             emit(f"{kind}_FILL", 1, fill_single_worker, (kind, size), mode)
     return section
@@ -765,17 +1054,47 @@ def parse_variant(raw):
     return raw
 
 
+def parse_target(raw):
+    raw = raw.strip().lower()
+    if not raw:
+        return DEFAULT_TARGET
+    if raw.isdigit() and int(raw) in range(1, len(TARGETS) + 1):
+        return TARGETS[int(raw) - 1]
+    if raw in TARGET_WORDS:
+        return TARGET_WORDS[raw]
+    print(f"ERROR: invalid target '{raw}', expected 1-{len(TARGETS)}, {', '.join(TARGETS)}")
+    sys.exit(1)
+
+
 def prompt_selection():
+    words = [a for a in sys.argv[1:] if a.lower() in TARGET_WORDS]
+    args = [a for a in sys.argv[1:] if a.lower() not in TARGET_WORDS]
+    if len(words) > 1:
+        print("ERROR: more than one target given")
+        sys.exit(1)
+    interactive = not sys.argv[1:]
+
+    if words:
+        target = TARGET_WORDS[words[0].lower()]
+    elif interactive:
+        print("Select target:")
+        for i, name in enumerate(TARGETS, 1):
+            default = " (default)" if name == DEFAULT_TARGET else ""
+            print(f"  {i} - {name}: {TARGET_HELP[name]}{default}")
+        target = parse_target(input(f"Target [1-{len(TARGETS)}, Enter = 1]: "))
+    else:
+        target = DEFAULT_TARGET
+
     print("Select which test to run:")
     print("  0 - RUN ALL (default)")
     for i in range(1, LAST_SECTION + 1):
         print(f"  {i} - {SECTIONS[i][0]}")
 
-    interactive = len(sys.argv) <= 1
+    interactive = not args
     if interactive:
         raw = input(f"Choice [0-{LAST_SECTION}, Enter = 0]: ").strip() or "0"
     else:
-        raw = sys.argv[1]
+        raw = args[0] if args else "0"
 
     try:
         choice = int(raw)
@@ -789,20 +1108,20 @@ def prompt_selection():
 
     if interactive:
         if choice != 0 and SECTIONS[choice][2] == PLAIN_MODES:
-            return choice, "auto"
+            return target, choice, "auto"
         print("Select variant:")
         for i, name in enumerate(MODES, 1):
             default = " (default)" if name == "auto" else ""
             print(f"  {i} - {name}: {VARIANT_HELP[name]}{default}")
         mode = parse_variant(input(f"Variant [1-{len(MODES)}, Enter = 1]: "))
     else:
-        mode = parse_variant(sys.argv[2]) if len(sys.argv) > 2 else "auto"
+        mode = parse_variant(args[1]) if len(args) > 1 else "auto"
 
     if choice != 0 and mode not in SECTIONS[choice][2]:
         print(f"ERROR: section {choice} is not affected by variant '{mode}'")
         sys.exit(1)
 
-    return choice, mode
+    return target, choice, mode
 
 
 def runtime_lines(mode):
@@ -812,32 +1131,62 @@ def runtime_lines(mode):
     else:
         runs = [(mode, MODE_ENV[mode])]
     lines = []
+    details = []
     for name, env in runs:
-        info = run_worker(info_worker, (), env)
+        info = run_worker(info_worker, (TARGET,), env)
         lines.append(f"{name}: backend={info['backend']}, threads={info['threads']}")
-    return lines
+        if not details:
+            details = info["lines"]
+    return details + lines
 
 
 # =========================================================
 # MAIN
 # =========================================================
 def main():
-    if not os.path.exists(DLL_PATH):
-        print(f"ERROR: not found: {DLL_PATH}")
-        sys.exit(1)
+    global TARGET
+    TARGET, choice, mode = prompt_selection()
 
-    try:
-        load_lib()
-    except (OSError, AttributeError) as e:
-        print(f"ERROR: cannot use {DLL_PATH}: {e}")
-        sys.exit(1)
+    if TARGET == "rust":
+        if not EXE_PATH:
+            print(f"ERROR: no {EXE_NAME} found.")
+            print("Build it with: cargo build --release --example speed")
+            print("Searched:")
+            for path in exe_candidates():
+                print(f"  {path}")
+            sys.exit(1)
+    elif TARGET == "c":
+        if not DLL_PATH:
+            print(f"ERROR: no loadable {DLL_NAME} found.")
+            if DLL_ERRORS:
+                print("Found but not loadable:")
+                for line in DLL_ERRORS:
+                    print(f"  {line}")
+            print("Searched:")
+            for path in dll_candidates():
+                print(f"  {path}")
+            sys.exit(1)
+        try:
+            load_lib()
+        except (OSError, AttributeError) as e:
+            print(f"ERROR: cannot use {DLL_PATH}: {e}")
+            sys.exit(1)
+    else:
+        try:
+            load_py()
+        except ImportError as e:
+            print(f"ERROR: cannot import lustro or numpy: {e}")
+            sys.exit(1)
 
-    choice, mode = prompt_selection()
     width = max(WIDTH_CMP, WIDTH_MULTI)
+    title = {
+        "rust": "LUSTRO (RUST, native API) -- SPEED TEST (normalized per round)",
+        "python": "LUSTRO (PYTHON, GIL held) -- SPEED TEST (normalized per round)",
+        "c": "LUSTRO.DLL (C) -- SPEED TEST (normalized per round)",
+    }[TARGET]
 
     print("=" * width)
-    print(f"{'LUSTRO.DLL -- SPEED TEST (normalized per round)':^{width}}")
-    print(f"{'DLL: ' + DLL_PATH:^{width}}")
+    print(f"{title:^{width}}")
     print(f"{'HW logical threads: ' + str(HW_THREADS):^{width}}")
     env = [f"{k}={os.environ[k]}" for k in ENV_VARS if k in os.environ]
     if env:
@@ -859,12 +1208,31 @@ def main():
             continue
         fn(mode)
 
+    target_notes = {
+        "rust": "Target rust: the native API, called from examples/speed.rs; this script only starts it and\n"
+        "reads p50 / p95 back, the timing loop runs inside that process. Input and output are\n"
+        "preallocated: HASH_* hash256_many_fixed_into on contiguous bytes, HASH_VAR\n"
+        "hash256_many_var_into on a prebuilt slice table, *_BATCH fill_blocks into [[u8; 32]],\n"
+        "*_FILL fill_bytes into a Vec<u8>. Message bytes come from a fixed-seed generator; HASH_VAR\n"
+        "lengths are the ones the other targets use. The worker is a fresh process per row, as for\n"
+        "the other targets, and the *_MULTI rows start one worker per stream.\n"
+        "Small calls and single-stream rows (*_FILL) include only the call itself.\n",
+        "python": "Target python: every call runs with the GIL held (release_gil=False); other Python threads wait.\n"
+        "Input and output are preallocated and used in place: HASH_* hash256_many_fixed_into on an\n"
+        "(N, msg_len) uint8 array, HASH_VAR hash256_many_var_into on a list of bytes, *_BATCH\n"
+        "fill_blocks into a (steps, N, 4) uint64 array, *_FILL fill_into a bytearray.\n"
+        "Small calls and single-stream rows (*_FILL) include Python call overhead.\n",
+        "c": "Target c: ctypes calls into lustro.dll; input and output are preallocated ctypes buffers,\n"
+        "HASH_VAR uses a prebuilt pointer/length table.\n"
+        "Small calls and single-stream rows (*_FILL) include ctypes call overhead.\n",
+    }
+    target_note = target_notes[TARGET]
     print("\n" + "=" * width)
     print(
         "ns/round is per engine round, comparable across tables.\n"
         "Data rate: input bytes for HASH rows, output bytes for stream rows.\n"
         "Steps: value suggested by the library for that N.\n"
-        "Small calls and single-stream rows (*_FILL) include ctypes call overhead.\n"
+        + target_note +
         "Calls are timed back to back, so the thread pool stays active between them.\n"
         "Variants: scalar = AVX2 off, st = Rayon off. Side by side: vs ST = p50 with Rayon off /\n"
         "p50 of auto (compare), vs scalar = p50 with AVX2 off / p50 of auto (simd).\n"

@@ -38,15 +38,20 @@ use pyo3::wrap_pyfunction;
 
 /// Hash, PRNG and XOF engine.
 #[cfg(feature = "python")]
-#[pymodule]
+#[pymodule(gil_used = true)]
 #[pyo3(name = "lustro")]
 fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    python::init_gil_flag(m.py());
     m.add_function(wrap_pyfunction!(python::hash::hash256_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash128_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash256_many_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash256_many_into_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash128_many_into_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash256_many_var_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash256_many_var_into_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_into_py, m)?)?;
     m.add("SnapshotError", m.py().get_type::<python::SnapshotError>())?;
     m.add_class::<python::prng::LustroPrngPy>()?;
     m.add_class::<python::prng::LustroPrngBatchPy>()?;
