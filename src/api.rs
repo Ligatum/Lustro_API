@@ -1,3 +1,5 @@
+//! Lustro V1 — Base API interface.
+
 use crate::constants::STREAM_INIT_MASK;
 use crate::core::{erd_round_scalar_ref, idm_scalar_ref};
 use crate::types::{ConfigError, RuntimeOptions};

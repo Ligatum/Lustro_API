@@ -28,10 +28,10 @@ cargo build --release --features entropy
 
 cargo build --release --features rand
 
-# Python 3.9-3.13 (requires NumPy)
+# Python 3.11-3.14 (requires NumPy)
 
 pip install maturin numpy
-maturin develop --release 
+maturin develop --release
 
 # C/C++ FFI bindings
 
@@ -41,11 +41,14 @@ cargo build --release --features ffi
 
 In the release profiles (`panic = "unwind"`) the C FFI boundary catches internal panics and returns `LustroError::InternalPanic`; the Python module raises them as `pyo3_runtime.PanicException` (a `BaseException`). Direct Rust calls panic as usual, for example on a length mismatch.
 
-The Python module declares that it needs the GIL (`gil_used = true`). Free-threaded CPython builds are not tested just yet.
+The Python module declares that it requires the GIL (`gil_used = true`).
+On free-threaded CPython builds, importing the module enables the GIL
+unless this behavior is explicitly overridden (`PYTHON_GIL=0` or `-X gil=0`).
+Running Lustro with the GIL disabled is not supported.
 
 ## Speed Test
 
-This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. It runs the same sections, with the same inputs and row labels, on three targets, so the results can be compared:
+This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. It runs the equivalent sections on native Rust and FFI layers. The results can be compared.
 
 `````bash
 # rust target (built on request only, no other build includes it)
@@ -1487,15 +1490,16 @@ An instance must not be used by several threads at the same time (an overlapping
 | Call | GIL |
 |---|---|
 | `hash256`, `hash128` | released while hashing |
-| `hash*_many_fixed` | released; the input is copied first |
-| `hash*_many_fixed_into`, `hash*_many_var`, `hash*_many_var_into` | released by default, held with `release_gil=False` |
+| `hash256_many_fixed`, `hash128_many_fixed` | released; the input is copied first |
+| `hash*_many_fixed_into` | released by default, held with `release_gil=False` |
+| `hash*_many_var`, `hash*_many_var_into` | released by default, held with `release_gil=False` |
 | `fill_blocks` (`LustroPrngBatch`, `LustroXofBatch`) | released by default, held with `release_gil=False` |
 | `fill`, `fill_u64`, `blocks` | released while generating |
 | `fill_into`, `readinto` | held |
 
 By default (`release_gil=True`) other Python threads run during the call. Input is copied before the GIL is released and results are copied into `out` after it is taken back, which costs time on large batches.
 
-`release_gil=False` is the maximum-throughput mode: the GIL stays held, input is read in place and output is written straight into your array, with no copies. Other Python threads wait. The thread pool and AVX2 are used in both modes.
+`release_gil=False` is the maximum-throughput mode: the GIL stays held and, where the input allows, data is read in place and digests are written straight into `out`. Other Python threads wait. The thread pool and AVX2 are used in both modes.
 
 ```python
 out = np.empty((n, 32), dtype=np.uint8)
@@ -1509,9 +1513,10 @@ prng.fill_blocks(blocks, steps, release_gil=False)
 
 In this mode:
 
-- `hash*_many_var` and `hash*_many_var_into` read an exact `list` or `tuple` of exact `bytes` (no subclasses) without taking a reference on each item, which is faster for many small messages.
-- `out` must not share memory with the input. The same array, or views of one array, as `data` and `out` raise `TypeError`; other overlap (for example a `memoryview` of `out` used as a message) raises `ValueError`. By default the input is copied first and such calls are allowed.
-- A `list` or `tuple` of 16384 or more items given to `hash*_many_var_into` is hashed while it is read, so `out` may be partly written if the call then fails. By default nothing is written before all items are read.
+- Not every input is read in place. In `hash*_many_var` and `hash*_many_var_into` items that are not `bytes` are copied. In `hash*_many_fixed_into` a `data` view that is not C-contiguous (for example `a[:, :16]`) is copied and hashed with the GIL released.
+- An exact `list` or `tuple` of exact `bytes` (no subclasses) is read without taking a reference on each item, which is faster for many small messages.
+- `out` must not share memory with the input. The same array, or views of one array, as `data` and `out` raise `TypeError` in both modes. Memory shared through separate wrappers (for example a `memoryview` of `out` used as a message) raises `ValueError` here; by default the input is copied first and the call is allowed.
+- When a `list` or `tuple` of 16384 or more items is given to `hash*_many_var_into` and the batch runs on the thread pool, it is hashed while it is read, so `out` may be partly written if the call then fails. By default nothing is written before all items are read.
 - `fill_blocks` writes in place on little-endian targets; elsewhere the flag has no effect.
 
 ---

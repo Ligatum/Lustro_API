@@ -2,13 +2,66 @@
 
 use super::guarded;
 use super::types::{buf_in, buf_out, fits_slice, ranges_overlap, slice_in, slice_out};
-use crate::dispatch::RawMessages;
+use crate::dispatch::{map_ranges, RawMessages};
 use crate::errors::LustroError;
 use crate::hash::{hash128, hash256};
 
 // ==========================================
 // FFI HASH API
 // ==========================================
+
+// Pointer table shared with the checking threads; it is only read.
+struct PtrTable<'a>(&'a [*const u8]);
+
+// SAFETY: the table is only read.
+unsafe impl Sync for PtrTable<'_> {}
+
+impl PtrTable<'_> {
+    #[inline]
+    fn get(&self, i: usize) -> *const u8 {
+        self.0[i]
+    }
+}
+
+// From this many messages the table check runs on the thread pool.
+const CHECK_PAR_MIN: usize = 8192;
+
+// Checks every message: length limit, no overlap with the output range, pointer rules.
+// Returns the saturating sum of the lengths. The error is the one of the lowest index.
+// SAFETY: as `buf_in` for each `ptrs[i]`, `lens[i]`; `ptrs` and `lens` have equal length.
+unsafe fn check_var_table(
+    ptrs: &[*const u8],
+    lens: &[usize],
+    out: *const u8,
+    total_out: usize,
+) -> Result<usize, LustroError> {
+    let table = PtrTable(ptrs);
+    let out_addr = out as usize;
+    let parts = map_ranges(ptrs.len(), CHECK_PAR_MIN, |range| {
+        let mut sum = 0usize;
+        for i in range {
+            let (p, l) = (table.get(i), lens[i]);
+            if !fits_slice::<u8>(l) {
+                return Err(LustroError::InvalidLength);
+            }
+            match ranges_overlap(p, l, out_addr as *const u8, total_out) {
+                Some(true) => return Err(LustroError::InvalidPointer),
+                Some(false) => {}
+                None => return Err(LustroError::InvalidLength),
+            }
+            if buf_in(p, l).is_none() {
+                return Err(LustroError::InvalidPointer);
+            }
+            sum = sum.saturating_add(l);
+        }
+        Ok(sum)
+    });
+    let mut total = 0usize;
+    for part in parts {
+        total = total.saturating_add(part?);
+    }
+    Ok(total)
+}
 
 /// Computes a 256-bit hash into `out`.
 /// `out` must point to at least 32 bytes.
@@ -289,21 +342,11 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        let mut total_bytes = 0usize;
-        for i in 0..n {
-            if !fits_slice::<u8>(lens[i]) {
-                return LustroError::InvalidLength;
-            }
-            match ranges_overlap(ptrs[i], lens[i], out_ptr as *const u8, total_out) {
-                Some(true) => return LustroError::InvalidPointer,
-                Some(false) => {}
-                None => return LustroError::InvalidLength,
-            }
-            if buf_in(ptrs[i], lens[i]).is_none() {
-                return LustroError::InvalidPointer;
-            }
-            total_bytes = total_bytes.saturating_add(lens[i]);
-        }
+        let total_bytes =
+            match unsafe { check_var_table(ptrs, lens, out_ptr as *const u8, total_out) } {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
 
         let out_blocks: &mut [[u8; 32]] = match slice_out(out_ptr as *mut [u8; 32], n) {
             Some(v) => v,
@@ -400,21 +443,11 @@ pub unsafe extern "C" fn lustro_hash128_many_var(
             None => return LustroError::InvalidPointer,
         };
 
-        let mut total_bytes = 0usize;
-        for i in 0..n {
-            if !fits_slice::<u8>(lens[i]) {
-                return LustroError::InvalidLength;
-            }
-            match ranges_overlap(ptrs[i], lens[i], out_ptr as *const u8, total_out) {
-                Some(true) => return LustroError::InvalidPointer,
-                Some(false) => {}
-                None => return LustroError::InvalidLength,
-            }
-            if buf_in(ptrs[i], lens[i]).is_none() {
-                return LustroError::InvalidPointer;
-            }
-            total_bytes = total_bytes.saturating_add(lens[i]);
-        }
+        let total_bytes =
+            match unsafe { check_var_table(ptrs, lens, out_ptr as *const u8, total_out) } {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
 
         let out_blocks: &mut [[u8; 16]] = match slice_out(out_ptr as *mut [u8; 16], n) {
             Some(v) => v,

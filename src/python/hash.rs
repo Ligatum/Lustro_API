@@ -16,9 +16,7 @@ use crate::hash::hash256 as hash256_impl;
 use crate::hash::hash256_many_fixed_into;
 use crate::hash::hash256_many_var_into;
 use crate::hash::{hash128_many_var_blocks, hash256_many_var_blocks};
-use crate::python::{
-    bytes_arg, messages_arg, require_numpy, ListMessages, MessageSeq, Messages,
-};
+use crate::python::{bytes_arg, messages_arg, require_numpy, ListMessages, MessageSeq, Messages};
 use crate::types::{Hash128, Hash256};
 
 // ==========================================
@@ -401,7 +399,12 @@ fn fixed_into<T: Send, const W: usize>(
         if let Some(input) = view.as_slice() {
             let (n, len) = view.dim();
             // Separate NumPy wrappers over one buffer are not seen by the borrow check.
-            if overlaps(input.as_ptr() as usize, input.len(), out.data() as usize, n * W) {
+            if overlaps(
+                input.as_ptr() as usize,
+                input.len(),
+                out.data() as usize,
+                n * W,
+            ) {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "data and out must not share memory",
                 ));

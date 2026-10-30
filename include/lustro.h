@@ -102,10 +102,10 @@ typedef struct LustroXofBatch LustroXofBatch;
 uint32_t lustro_api_version(void);
 
 /**
- * Returns the configured pool size for parallel batches, not the number of active
- * workers; 0 if batches run on the calling thread. The pool is not started by this call
- * and may fail to start, in which case batches run on the calling thread. So do batches
- * in a child forked after its parent first used the pool.
+ * Returns the configured pool size for parallel batches, not the number of active workers.
+ * `0` means parallelism is disabled by settings or the crate was built without `parallel`.
+ * This call does not start the pool. If initialization fails, or this process inherited
+ * a pool-owner PID from its parent through `fork`, batches fall back to the calling thread.
  */
 uintptr_t lustro_runtime_threads(void);
 

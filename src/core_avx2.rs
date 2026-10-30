@@ -448,6 +448,7 @@ unsafe fn idm_core(
 // ======================================================
 
 // LANE PREPARE
+
 #[inline(always)]
 unsafe fn lane_prepare(s0_xor: U128x4, s1_xor: U128x4, consts: &SimdConsts) -> (U64x4, U64x4) {
     // Build the first working stream.

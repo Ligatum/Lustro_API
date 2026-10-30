@@ -12,6 +12,7 @@ use std::collections::TryReserveError;
 
 // rand_core (LustroPrng and LustroXof)
 #[cfg(feature = "rand")]
+#[path = "rand/rand_impl.rs"]
 mod rand_impl;
 
 // ==========================================
