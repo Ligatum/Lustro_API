@@ -94,17 +94,15 @@ Domain::Xof  = 0x03
 Hash, PRNG, and XOF each use a distinct domain. `fork()` reuses the parent's
 domain (`Domain::Prng` for PRNG and `Domain::Xof` for XOF).
 
-The stream identifier is XORed into the second half of the state before the
-mixing step, so for one input state different identifiers give different
-inputs to that step. This applies to every derivation: `new`, the batch
-constructors, the roots of `derive_path`, and `fork`. Across input states the
-mapping is not unique: two states of the same construction with the same first
-16 bytes, whose second halves differ by `a ^ b`, give the same stream for
-identifiers `a` and `b`. For example, `new(X, 1)` equals `new(Y, 0)` when `Y`
-is `X` with the lowest bit of byte 16 flipped (counting from 0). Seeds with a
-counter or another pattern in the second half can run into this; states
-produced by the engine are not expected to. One seed with different
-identifiers avoids it.
+PRNG and XOF-fork derivation hashes the 48-byte message `state || id`
+(`s0` and `s1` little-endian, then the 16-byte identifier) under the domain
+tag, with the same absorb step as hashing a message of that length. The state
+is the first 32-byte block and the identifier the final, terminated block, so
+the identifier goes through the mixing step together with the state instead of
+being XORed into it. Within one input state different identifiers give
+different inputs to that step. This applies to every derivation: `new`, the
+batch constructors, the roots of `derive_path`, and `fork`. Lustro makes no
+cryptographic claim.
 
 ---
 
@@ -179,8 +177,8 @@ This is the shared mechanism behind stream initialization (PRNG) and forking (PR
 
 | Function | Description |
 |---|---|
-| `prepare_base` | Stage 1: applies the domain tag and `STREAM_INIT_MASK` to `(s0, s1)`. Accepts either seed-derived state or live stream state and can be reused for sibling derivations. |
-| `derive_branch_stream` | Stage 2: XORs the identifier into `base_s1`, then calls `evaluate_scalar`. Returns `(s0, s1)` ready for `StreamState::new()`. |
+| `prepare_base` | Stage 1: absorbs `(s0, s1)` as the first block of the message `state || id` under the domain tag (midstate). Accepts either seed-derived state or live stream state and can be reused for sibling derivations. |
+| `derive_branch_stream` | Stage 2: absorbs the identifier as the final block of the message. Returns `(s0, s1)` ready for `StreamState::new()`. |
 | `fork_lane` | Per-lane fork helper: `prepare_base` + `derive_branch_stream` on raw `(s0, s1)` pairs. Used by `LustroPrngBatch`/`LustroXofBatch` `fork`/`fork_range`. |
 | `derive_path_lane` | Applies `fork_lane` once per identifier, in path order. Backs single-stream and batch `derive_path` (PRNG and XOF). |
 

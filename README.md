@@ -466,7 +466,7 @@ lustro_xof_free(xof);
 
 The same parent state and identifier always give the same child. Reading more bytes from the block the parent is already in does not change the child; moving the parent on to a later block changes the state it is derived from. The child starts at its own first block and does not inherit the parent's position.
 
-The output block holds the two state words `fork()` derives from, so once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` seeded with that block and the same identifier. Whoever knows the block can derive the children; Lustro makes no cryptographic claim. Two seeds (or parent states) with the same first half, whose second halves differ by the XOR of two identifiers, give the same stream for those identifiers; see [ARCHITECTURE.md](ARCHITECTURE.md), section 3.
+The output block holds the two state words `fork()` derives from, so once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` seeded with that block and the same identifier. Whoever knows the block can derive the children; Lustro makes no cryptographic claim. The identifier is hashed together with the state.
 
 ---
 

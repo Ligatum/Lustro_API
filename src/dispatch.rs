@@ -122,25 +122,6 @@ pub(crate) fn dispatch_hash256_var_raw_into(
     execute_hash_var_blocks(plan, messages, domain, out, hash256_into);
 }
 
-// 256-bit / 128-bit digests of block-wise messages; see `dispatch_hash_blocks_parallel`.
-#[cfg(feature = "python")]
-pub(crate) fn dispatch_hash256_blocks_parallel<M: MessageBlocks>(
-    messages: M,
-    domain: u128,
-    out: &mut [[u8; 32]],
-) -> bool {
-    dispatch_hash_blocks_parallel(messages, domain, out, hash256_into)
-}
-
-#[cfg(feature = "python")]
-pub(crate) fn dispatch_hash128_blocks_parallel<M: MessageBlocks>(
-    messages: M,
-    domain: u128,
-    out: &mut [[u8; 16]],
-) -> bool {
-    dispatch_hash_blocks_parallel(messages, domain, out, hash128_into)
-}
-
 // 128-bit digests; see `dispatch_hash256_var_raw_into`.
 #[cfg(feature = "ffi")]
 pub(crate) fn dispatch_hash128_var_raw_into(
@@ -161,6 +142,25 @@ pub(crate) fn dispatch_hash128_var_raw_into(
         total_bytes,
     );
     execute_hash_var_blocks(plan, messages, domain, out, hash128_into);
+}
+
+// 256-bit / 128-bit digests of block-wise messages; see `dispatch_hash_blocks_parallel`.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash256_blocks_parallel<M: MessageBlocks>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) -> bool {
+    dispatch_hash_blocks_parallel(messages, domain, out, hash256_into)
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash128_blocks_parallel<M: MessageBlocks>(
+    messages: M,
+    domain: u128,
+    out: &mut [[u8; 16]],
+) -> bool {
+    dispatch_hash_blocks_parallel(messages, domain, out, hash128_into)
 }
 
 #[inline(always)]

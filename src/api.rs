@@ -1,6 +1,5 @@
 //! Lustro V1 — Base API interface.
 
-use crate::constants::STREAM_INIT_MASK;
 use crate::core::{erd_round_scalar_ref, idm_scalar_ref};
 use crate::types::{ConfigError, RuntimeOptions};
 
@@ -63,17 +62,23 @@ pub(crate) fn evaluate_scalar(s0_in: u128, s1_in: u128) -> (u128, u128) {
 // Shared pipeline for stream and fork derivation:
 // prepare_base -> derive_branch_stream.
 
-// Stage 1: applies domain and stream initialization constants.
-// Result can be reused for sibling derivations.
+// Stage 1: absorbs the state as the first 32-byte block of the 48-byte message `state || id`.
+// Result is the midstate, reusable for sibling derivations.
 #[inline(always)]
 pub(crate) fn prepare_base(s0: u128, s1: u128, domain: u128) -> (u128, u128) {
-    (s0 ^ domain, s1 ^ STREAM_INIT_MASK)
+    use crate::constants::{IV_S0, IV_S1};
+    let len64 = 48u64 * 8;
+    let m0 = IV_S0 ^ domain;
+    let m1 = IV_S1 ^ (((len64.rotate_left(17) as u128) << 64) | (len64 as u128));
+    let (y0, y1) = evaluate_scalar(m0 ^ s0, m1 ^ s1);
+    (y0 ^ m0, y1 ^ m1)
 }
 
-// Stage 2: derives a branch state by mixing the branch identifier.
+// Stage 2: absorbs the identifier as the final 16-byte block, terminator included.
 #[inline(always)]
 pub(crate) fn derive_branch_stream(base_s0: u128, base_s1: u128, id: u128) -> (u128, u128) {
-    evaluate_scalar(base_s0, base_s1 ^ id)
+    let (y0, y1) = evaluate_scalar(base_s0 ^ id, base_s1 ^ 0x80);
+    (y0 ^ base_s0, y1 ^ base_s1)
 }
 
 // Derives a forked lane without requiring StreamState.

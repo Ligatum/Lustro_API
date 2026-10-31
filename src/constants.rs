@@ -14,7 +14,3 @@ pub(crate) enum Domain {
     /// XOF streams.
     Xof = 0x03,
 }
-
-// Stream-domain differentiation mask.
-// Uses the PRINCE (reflection) alpha constant, repeated across both 64-bit halves.
-pub(crate) const STREAM_INIT_MASK: u128 = 0xC0AC29B7C97C50DD_C0AC29B7C97C50DD_u128;
