@@ -6,6 +6,8 @@
 
 Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
 
+The core mechanism and the API implementation are considered non-cryptographic at this moment.
+
 ## Get the Code
 
 ```bash
@@ -54,8 +56,6 @@ This repo is the full API implementation and also contains **Lustro_Speed_Tester
 # rust target (built on request only, no other build includes it)
 cargo build --release --example speed
 `````
-
-Please note that the core mechanism and the API implementation are considered non-cryptographic at this moment.
 
 ---
 
@@ -213,9 +213,6 @@ rng = LustroPrng(os.urandom(32), 0)
 
 **C / C++** — fill the 32-byte seed from the system's entropy source
 (for example `getrandom(2)`, `arc4random_buf` or `BCryptGenRandom`).
-
-A seed from the operating system does not make the generator cryptographically
-secure: `LustroPrng` does not implement `CryptoRng`.
 
 ---
 
@@ -466,7 +463,7 @@ lustro_xof_free(xof);
 
 The same parent state and identifier always give the same child. Reading more bytes from the block the parent is already in does not change the child; moving the parent on to a later block changes the state it is derived from. The child starts at its own first block and does not inherit the parent's position.
 
-The output block holds the two state words `fork()` derives from, so once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` seeded with that block and the same identifier. Whoever knows the block can derive the children; Lustro makes no cryptographic claim. The identifier is hashed together with the state.
+The output block holds the two state words `fork()` derives from, so once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` seeded with that block and the same identifier. The identifier is hashed together with the state.
 
 ---
 
@@ -548,7 +545,7 @@ every identifier in `path` is a `fork`, since the message already is the root.
 
 ### Batch Hash
 
-Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; `*_many_var` takes messages of any lengths.
+Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; `*_many_var` takes messages of any length.
 
 **Rust**
 
@@ -565,7 +562,7 @@ let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
 let digests = hash256_many_var(&messages);
 ```
 
-`hash256_many_var_into(&messages, &mut out)` writes into a slice you provide. `hash256_many_fixed_into` panics if `data.len() != out.len() * message_len`.
+`hash256_many_var_into(&messages, &mut out)` writes into a slice you provide. `hash256_many_fixed_into` panics if `data.len() != out.len() * message_len`, and `hash256_many_var_into` if `messages.len() != out.len()`.
 
 **Python**
 
@@ -609,7 +606,7 @@ lustro_hash256_many_var(messages, 3, lengths, (uint8_t *)digests);
 
 The names mean the same in Rust, Python and C/C++. `hash128_*` and `lustro_hash128_*` work the same way and return 16-byte digests.
 
-Both variants can use AVX2 for batches of 4 or more messages and send large batches to the thread pool, as far as the CPU and the runtime settings (see Runtime Settings) allow. The digests do not depend on the backend or on the number of threads.
+Both variants can use AVX2 for batches of 4 or more messages and send large batches to the thread pool, as far as the CPU and the runtime settings allow. The digests do not depend on the backend or on the number of threads.
 
 ---
 
@@ -617,7 +614,7 @@ Both variants can use AVX2 for batches of 4 or more messages and send large batc
 
 Many independent streams in one object, for PRNG and XOF alike.
 
-A PRNG or XOF batch produces output in steps: `fill_blocks(out, steps)` writes `steps` blocks for every stream. `steps` only sets how much one call produces. The same total split over several calls gives every stream the same blocks. `suggested_steps()` returns a `steps` chosen for speed at the current number of streams and backend (`LUSTRO_DISABLE_SIMD` can change it). It is a hint only: any `steps` gives correct output. The output holds `len() * steps` blocks, so with many streams check its size before allocating.
+A PRNG or XOF batch produces output in steps: `fill_blocks(out, steps)` writes `steps` blocks for every stream. `steps` only sets how much one call produces. The same total split over several calls gives every stream the same blocks. `suggested_steps()` returns a `steps` chosen for speed at the current number of streams; it is only a hint, any `steps` gives correct output. The output holds `len() * steps` blocks, so with many streams check its size before allocating.
 
 **Rust**
 
@@ -685,6 +682,8 @@ more = xof.blocks(steps)
 `fill_blocks(out, steps)` writes one 32-byte block per stream per step, step-major: stream `i` at step `s` is block `s * n + i` (`n` = number of streams). In Python that is `out[s, i]`, with `out` shaped `(steps, n_streams, 4)`; each block is four `uint64` values. `blocks(steps)` (Rust and Python) returns the same blocks in a newly allocated result: a `Vec<[u8; 32]>` in Rust, a new, writable array of that shape in Python.
 
 In Python, a batch keeps an internal buffer the size of its largest `fill_blocks()` call made with the default `release_gil=True`; `release_buffer()` frees it earlier. `fill_blocks(..., release_gil=False)` and `blocks()` do not use that buffer.
+
+Creating a batch allocates its lanes. `LustroPrngBatch::new` and `LustroXofBatch::new` panic if that fails; `try_new` returns `Err(BatchError::Reserve)` instead. Python raises `MemoryError`, and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`.
 
 **C / C++**
 
@@ -847,7 +846,7 @@ lustro_xof_free(lane);  /* a single stream, not a batch */
 lustro_xof_batch_free(xof);
 ```
 
-The result is an ordinary single stream (`LustroPrng` or `LustroXof`), so it supports typed reads, `fork` and snapshots. `lane(i).fork(id)` equals child `i` of `fork` called with `id` at position `i`. An out-of-range index gives `None` (Rust), `IndexError` (Python) or `LUSTRO_ERROR_INVALID_ARGUMENT` (C/C++).
+The result is an ordinary single stream (`LustroPrng` or `LustroXof`), so it supports typed reads, `fork` and snapshots.
 
 ---
 
@@ -944,8 +943,6 @@ lustro_xof_batch_free(twin);
 lustro_xof_batch_free(xof);
 ```
 
-In Rust, `clone()` aborts the process if the lanes cannot be allocated; `try_clone()` reports it as an error.
-
 ---
 
 ### Batch Fork
@@ -965,6 +962,11 @@ let prng = LustroPrngBatch::new(&seed, &ids);
 let one_each = prng.fork(&[StreamId(10), StreamId(11), StreamId(12), StreamId(13)]);
 let children = prng.fork_range(StreamId(100));
 let many_children = prng.fork_many(&[StreamId(100), StreamId(200)]);
+
+// Return an error instead of panicking if the lanes cannot be allocated.
+let one_each = prng.try_fork(&[StreamId(10), StreamId(11), StreamId(12), StreamId(13)])?;
+let children = prng.try_fork_range(StreamId(100))?;
+let many_children = prng.try_fork_many(&[StreamId(100), StreamId(200)])?;
 ```
 
 ```rust
@@ -977,6 +979,11 @@ let xof = LustroXofBatch::new(&messages);
 let one_each = xof.fork(&[StreamId(10), StreamId(11), StreamId(12)]);
 let children = xof.fork_range(StreamId(100));
 let many_children = xof.fork_many(&[StreamId(100), StreamId(200)]);
+
+// Return an error instead of panicking if the lanes cannot be allocated.
+let one_each = xof.try_fork(&[StreamId(10), StreamId(11), StreamId(12)])?;
+let children = xof.try_fork_range(StreamId(100))?;
+let many_children = xof.try_fork_many(&[StreamId(100), StreamId(200)])?;
 ```
 
 **Python**
@@ -987,7 +994,7 @@ from lustro import LustroPrngBatch
 
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
 
-one_each = prng.fork([10, 11, 12, 13])
+one_each = prng.fork([10, 11, 12, 13])  # MemoryError if the lanes cannot be allocated
 children = prng.fork_range(100)
 many_children = prng.fork_many([100, 200])
 ```
@@ -1017,7 +1024,7 @@ uint64_t ids_hi[4] = {0, 0, 0, 0};
 uint64_t ids_lo[4] = {10, 11, 12, 13};
 
 LustroPrngBatch *one_each = NULL;
-lustro_prng_batch_fork(prng, ids_hi, ids_lo, 4, &one_each);
+LustroError err = lustro_prng_batch_fork(prng, ids_hi, ids_lo, 4, &one_each);  /* LUSTRO_ERROR_OUT_OF_MEMORY if the lanes cannot be allocated */
 
 LustroPrngBatch *children = NULL;
 lustro_prng_batch_fork_range(prng, 0, 100, &children);
@@ -1074,6 +1081,8 @@ lustro_xof_batch_free(xof);
 `fork_many(ids)` derives `ids.len()` children per lane instead, producing a
 batch of `batch.len() * ids.len()` lanes, ordered parent-major: child `j` of
 lane `i` is at index `i * ids.len() + j`. Each child starts at step 0.
+
+If the lanes cannot be allocated, `fork`, `fork_range` and `fork_many` panic in Rust; the `try_` variants return an error instead. Python raises `MemoryError`, and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`. `try_fork` still panics if `ids.len() != batch.len()`.
 
 ---
 
@@ -1412,7 +1421,7 @@ The snapshot size is `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSH
 
 ### Runtime Settings
 
-Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before the first hash batch call or batch `fill_blocks`/`blocks`. They apply to hash batches as well as to PRNG and XOF batches.
+Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before first use (see below). They apply to hash batches as well as to PRNG and XOF batches.
 
 `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` are set by `1`, `true`, `on` or `yes` and are not set by `0`, `false`, `off`, `no` or an empty value (case is ignored). Any other value sets them.
 
@@ -1451,7 +1460,7 @@ if (err != LUSTRO_ERROR_OK) {
 
 Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you pass override it. `threads` is capped at the number of logical CPUs, and `1` disables the thread pool. `allow_simd=False` (`LUSTRO_SIMD_SCALAR` in C/C++) selects the scalar backend.
 
-The settings can be set only once. The first hash batch call, batch `fill_blocks`/`blocks`, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` reports the selected backend and the configured pool size (0 = batches run on the calling thread). It does not report running workers: the pool starts later and may fail to start. A child forked after its parent first used the pool runs on the calling thread; one forked earlier may start its own pool.
+The settings can be set only once. The first hash batch call, batch `fill_blocks`/`blocks`, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` reports the selected backend and the configured pool size (0 = batches run on the calling thread), not the number of running workers.
 
 ---
 
@@ -1480,6 +1489,8 @@ n = rng.readinto(buf)         # n == 1000, any writable C-contiguous buffer
 `read(size)` is the same as `fill(size)`; there is no `read()` without a size, because the stream has no end. `readinto(buf)` accepts any writable, C-contiguous buffer, whatever its item type (for example `array('I')` or a NumPy `uint32` array). It writes the stream as raw bytes, without conversion, and returns the number of bytes written. `fill_into(buf)` takes byte buffers only.
 
 Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, `hash128_many_var` and `LustroXofBatch` take any sequence of such objects, but not a single string or buffer.
+
+All four classes can be pickled, for example to pass them to a worker process. A pickle holds the same data as `export_snapshot()`, so the restored object continues from the same position. It is a copy, like `copy()`, not a new stream: workers that need independent streams should use `fork()` or different stream IDs. Pickles contain generator state and, as always, must not be loaded from untrusted sources. They refer to the class as `lustro.LustroPrng` and so on; to store state long term, use `export_snapshot()`.
 
 An instance must not be used by several threads at the same time (an overlapping call raises `RuntimeError`). Use `copy()`, `fork()` or separate instances instead. The installed version is available as `lustro.__version__`, and the package ships type stubs (`lustro.pyi`, `py.typed`).
 
@@ -1513,8 +1524,7 @@ prng.fill_blocks(blocks, steps, release_gil=False)
 
 In this mode:
 
-- Not every input is read in place. In `hash*_many_var` and `hash*_many_var_into` items that are not `bytes` are copied. In `hash*_many_fixed_into` a `data` view that is not C-contiguous (for example `a[:, :16]`) is copied and hashed with the GIL released.
-- An exact `list` or `tuple` of exact `bytes` (no subclasses) is read without taking a reference on each item, which is faster for many small messages.
+- Not every input is read in place. In `hash*_many_var` and `hash*_many_var_into` items that are not `bytes` are copied; an exact `list` or `tuple` of exact `bytes` (no subclasses) is the fastest input, especially for many small messages. In `hash*_many_fixed_into` a `data` view that is not C-contiguous (for example `a[:, :16]`) is copied and hashed with the GIL released.
 - `out` must not share memory with the input. The same array, or views of one array, as `data` and `out` raise `TypeError` in both modes. Memory shared through separate wrappers (for example a `memoryview` of `out` used as a message) raises `ValueError` here; by default the input is copied first and the call is allowed.
 - When a `list` or `tuple` of 16384 or more items is given to `hash*_many_var_into` and the batch runs on the thread pool, it is hashed while it is read, so `out` may be partly written if the call then fails. By default nothing is written before all items are read.
 - `fill_blocks` writes in place on little-endian targets; elsewhere the flag has no effect.
@@ -1525,7 +1535,7 @@ In this mode:
 
 With `--features rand`, `LustroPrng` and `LustroXof` implement the `rand_core` 0.10
 traits `TryRng` and `Rng` (infallible, `Error = Infallible`). `LustroPrng` also
-implements `SeedableRng`. For `LustroXof` its input is a message of any
+implements `SeedableRng`. `LustroXof` does not: it is built from a message of any
 length.
 
 ```toml

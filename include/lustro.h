@@ -336,7 +336,8 @@ LustroError lustro_prng_fork(const struct LustroPrng *ctx,
  * IDs are passed as parallel `(hi, lo)` u64 arrays.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
- * its length is nonzero), `InvalidLength` for `n == 0` or an `n` too large to address.
+ * its length is nonzero), `InvalidLength` for `n == 0` or an `n` too large to address,
+ * `OutOfMemory` if the identifier array cannot be allocated.
  *
  * # Safety
  * `seed` must be valid for 32 bytes.
@@ -380,7 +381,8 @@ LustroError lustro_prng_import_snapshot(const uint8_t *bytes, struct LustroPrng 
  * IDs are passed as parallel `(hi, lo)` u64 arrays.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
- * its length is nonzero), `InvalidLength` for an `n` too large to address.
+ * its length is nonzero), `InvalidLength` for an `n` too large to address, `OutOfMemory` if the
+ * identifiers or the lane buffer cannot be allocated.
  *
  * # Safety
  * `seed` must be valid for 32 readable bytes.
@@ -496,7 +498,8 @@ LustroError lustro_prng_batch_fill_blocks(struct LustroPrngBatch *ctx,
  * `n` must equal the batch length.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
- * `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length.
+ * `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+ * identifiers or the lane buffer cannot be allocated.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -519,7 +522,7 @@ LustroError lustro_prng_batch_fork(const struct LustroPrngBatch *ctx,
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
  * `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
- * `OutOfMemory` if the lane buffer cannot be reserved.
+ * `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -543,7 +546,7 @@ LustroError lustro_prng_batch_fork_many(const struct LustroPrngBatch *ctx,
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
  * its length is nonzero), `InvalidLength` for `n_path == 0` or a count too large to address,
- * `OutOfMemory` if the lane buffer cannot be reserved.
+ * `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
  *
  * # Safety
  * `seed` must be valid for 32 bytes.
@@ -566,7 +569,8 @@ LustroError lustro_prng_batch_derive_path(const uint8_t *seed,
  * Derives one child PRNG per lane with sequential IDs starting at `first`.
  * IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
- * for a null or misaligned `out_ctx`, or for null `ctx`.
+ * for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+ * be reserved.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -733,7 +737,7 @@ LustroError lustro_xof_fork(const struct LustroXof *ctx,
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `message` when `message_len > 0` or a null or
  * misaligned ID array (when `n > 0`), `InvalidLength` for `n == 0` or a length too large to
- * address.
+ * address, `OutOfMemory` if the identifier array cannot be allocated.
  *
  * # Safety
  * `message` must be valid for `message_len` bytes when `message_len > 0`.
@@ -779,7 +783,7 @@ LustroError lustro_xof_import_snapshot(const uint8_t *bytes, struct LustroXof **
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null or misaligned pointer/length array (when
  * `n > 0`) or a null message pointer with a nonzero length, `InvalidLength` for a length too large
- * to address.
+ * to address, `OutOfMemory` if the message table or the lane buffer cannot be allocated.
  *
  * # Safety
  * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
@@ -877,7 +881,8 @@ LustroError lustro_xof_batch_fill_blocks(struct LustroXofBatch *ctx,
  * `n` must equal the batch length.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
- * `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length.
+ * `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+ * identifiers or the lane buffer cannot be allocated.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
@@ -900,7 +905,7 @@ LustroError lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
  * `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
- * `OutOfMemory` if the lane buffer cannot be reserved.
+ * `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
@@ -924,7 +929,8 @@ LustroError lustro_xof_batch_fork_many(const struct LustroXofBatch *ctx,
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null or misaligned argument array (when its length
  * is nonzero) or a null message pointer with a nonzero length, `InvalidLength` for `n_path == 0`
- * or a length too large to address, `OutOfMemory` if the lane buffer cannot be reserved.
+ * or a length too large to address, `OutOfMemory` if the input tables or the lane buffer cannot
+ * be reserved.
  *
  * # Safety
  * `message_ptrs` and `message_lens` must each be valid for `n_messages`
@@ -947,7 +953,8 @@ LustroError lustro_xof_batch_derive_path(const uint8_t *const *message_ptrs,
  * Derives one child XOF per lane with sequential IDs starting at `first`.
  * IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
- * for a null or misaligned `out_ctx`, or for null `ctx`.
+ * for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+ * be reserved.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context

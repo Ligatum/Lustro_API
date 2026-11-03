@@ -225,7 +225,7 @@ pub unsafe extern "C" fn lustro_xof_fork(
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `message` when `message_len > 0` or a null or
 /// misaligned ID array (when `n > 0`), `InvalidLength` for `n == 0` or a length too large to
-/// address.
+/// address, `OutOfMemory` if the identifier array cannot be allocated.
 ///
 /// # Safety
 /// `message` must be valid for `message_len` bytes when `message_len > 0`.
@@ -311,7 +311,7 @@ pub unsafe extern "C" fn lustro_xof_import_snapshot(
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null or misaligned pointer/length array (when
 /// `n > 0`) or a null message pointer with a nonzero length, `InvalidLength` for a length too large
-/// to address.
+/// to address, `OutOfMemory` if the message table or the lane buffer cannot be allocated.
 ///
 /// # Safety
 /// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
@@ -329,7 +329,7 @@ pub unsafe extern "C" fn lustro_xof_batch_new(
 ) -> LustroError {
     construct(out_ctx, || {
         let messages = messages_from_parts(message_ptrs, message_lens, n)?;
-        Ok(LustroXofBatch::new(&messages))
+        LustroXofBatch::try_new(&messages).map_err(batch_status)
     })
 }
 
@@ -483,7 +483,8 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
 /// `n` must equal the batch length.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
-/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length.
+/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+/// identifiers or the lane buffer cannot be allocated.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
@@ -509,7 +510,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
             return Err(LustroError::InvalidLength);
         }
         let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
-        Ok(batch.fork(&stream_ids))
+        batch.try_fork(&stream_ids).map_err(batch_status)
     })
 }
 
@@ -519,7 +520,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
 /// `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
-/// `OutOfMemory` if the lane buffer cannot be reserved.
+/// `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
@@ -556,7 +557,8 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null or misaligned argument array (when its length
 /// is nonzero) or a null message pointer with a nonzero length, `InvalidLength` for `n_path == 0`
-/// or a length too large to address, `OutOfMemory` if the lane buffer cannot be reserved.
+/// or a length too large to address, `OutOfMemory` if the input tables or the lane buffer cannot
+/// be reserved.
 ///
 /// # Safety
 /// `message_ptrs` and `message_lens` must each be valid for `n_messages`
@@ -589,7 +591,8 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
 /// Derives one child XOF per lane with sequential IDs starting at `first`.
 /// IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
-/// for a null or misaligned `out_ctx`, or for null `ctx`.
+/// for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+/// be reserved.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
@@ -608,7 +611,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_range(
             return Err(LustroError::InvalidPointer);
         }
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-        Ok((*ctx).fork_range(StreamId(first)))
+        (*ctx).try_fork_range(StreamId(first)).map_err(batch_status)
     })
 }
 

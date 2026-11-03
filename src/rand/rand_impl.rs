@@ -1,4 +1,4 @@
-// rand_core 0.10 integration (feature `rand`).
+//! rand_core 0.10 integration (feature `rand`).
 // LustroPrng implements TryRng (and so Rng) and SeedableRng.
 // LustroXof implements TryRng (and so Rng) only.
 // CryptoRng is not implemented.

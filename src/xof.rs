@@ -154,16 +154,27 @@ impl core::fmt::Debug for LustroXofBatch {
 
 impl LustroXofBatch {
     /// Creates a batch by independently absorbing each message.
+    /// Panics if the lane buffer cannot be allocated.
     pub fn new(messages: &[&[u8]]) -> Self {
-        let streams = messages
-            .iter()
-            .map(|&message| {
-                let (s0, s1) = absorb_with_domain(message, Domain::Xof as u128);
-                StreamLane { s0, s1, step: 0 }
-            })
-            .collect();
+        match Self::try_new(messages) {
+            Ok(batch) => batch,
+            Err(BatchError::Reserve(e)) => panic!("new: lane allocation failed: {e:?}"),
+            Err(e) => panic!("new: {e}"),
+        }
+    }
 
-        Self { streams }
+    /// As `new`, returning `Err(BatchError::Reserve)` if reserving the lane buffer fails.
+    pub fn try_new(messages: &[&[u8]]) -> Result<Self, BatchError> {
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(messages.len())
+            .map_err(BatchError::Reserve)?;
+        streams.extend(messages.iter().map(|&message| {
+            let (s0, s1) = absorb_with_domain(message, Domain::Xof as u128);
+            StreamLane { s0, s1, step: 0 }
+        }));
+
+        Ok(Self { streams })
     }
 
     /// Number of lanes.
@@ -238,26 +249,36 @@ impl LustroXofBatch {
     }
 
     /// Derives one child stream per lane using the corresponding identifier.
-    /// `ids.len()` must equal `len()`.
+    /// `ids.len()` must equal `len()`. Panics on a length mismatch or if the lane
+    /// buffer cannot be allocated.
     pub fn fork(&self, ids: &[StreamId]) -> Self {
+        match self.try_fork(ids) {
+            Ok(batch) => batch,
+            Err(BatchError::Reserve(e)) => panic!("fork: lane allocation failed: {e:?}"),
+            Err(e) => panic!("fork: {e}"),
+        }
+    }
+
+    /// As `fork`, returning `Err(BatchError::Reserve)` if reserving the lane buffer fails.
+    /// Still panics if `ids.len() != len()`.
+    pub fn try_fork(&self, ids: &[StreamId]) -> Result<Self, BatchError> {
         assert_eq!(
             ids.len(),
             self.streams.len(),
             "fork: ids length must match batch stream count"
         );
 
-        let streams = self
-            .streams
-            .iter()
-            .zip(ids.iter())
-            .map(|(lane, &id)| {
-                let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, id.get());
-                // Child stream starts at step 0.
-                StreamLane { s0, s1, step: 0 }
-            })
-            .collect();
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(self.streams.len())
+            .map_err(BatchError::Reserve)?;
+        streams.extend(self.streams.iter().zip(ids.iter()).map(|(lane, &id)| {
+            let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, id.get());
+            // Child stream starts at step 0.
+            StreamLane { s0, s1, step: 0 }
+        }));
 
-        Self { streams }
+        Ok(Self { streams })
     }
 
     /// Derives `ids.len()` children per lane. Output is parent-major:
@@ -333,22 +354,31 @@ impl LustroXofBatch {
     }
 
     /// Derives one child per lane with IDs `first`, `first + 1`, ... (wrapping modulo 2^128).
+    /// Panics if the lane buffer cannot be allocated.
     pub fn fork_range(&self, first: StreamId) -> Self {
+        match self.try_fork_range(first) {
+            Ok(batch) => batch,
+            Err(BatchError::Reserve(e)) => panic!("fork_range: lane allocation failed: {e:?}"),
+            Err(e) => panic!("fork_range: {e}"),
+        }
+    }
+
+    /// As `fork_range`, returning `Err(BatchError::Reserve)` if reserving the lane buffer fails.
+    pub fn try_fork_range(&self, first: StreamId) -> Result<Self, BatchError> {
         let first = first.get();
 
-        let streams = self
-            .streams
-            .iter()
-            .enumerate()
-            .map(|(i, lane)| {
-                let child_id = first.wrapping_add(i as u128);
-                let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, child_id);
-                // Child stream starts at step 0.
-                StreamLane { s0, s1, step: 0 }
-            })
-            .collect();
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(self.streams.len())
+            .map_err(BatchError::Reserve)?;
+        streams.extend(self.streams.iter().enumerate().map(|(i, lane)| {
+            let child_id = first.wrapping_add(i as u128);
+            let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, child_id);
+            // Child stream starts at step 0.
+            StreamLane { s0, s1, step: 0 }
+        }));
 
-        Self { streams }
+        Ok(Self { streams })
     }
 
     /// As `clone`, returning `Err(BatchError::Reserve)` if reserving the lane buffer

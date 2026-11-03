@@ -75,6 +75,7 @@ pub fn hash128_many_fixed_into(data: &[u8], message_len: usize, out: &mut [Hash1
 /// PERFORMANCE RUST API.
 /// Hashes N independent messages, writing 256-bit digests directly
 /// into `out` — avoids the intermediate Vec<(u128,u128)>.
+/// Panics if `messages.len() != out.len()`.
 pub fn hash256_many_var_into(messages: &[&[u8]], out: &mut [Hash256]) {
     assert_eq!(
         messages.len(),
@@ -90,6 +91,7 @@ pub fn hash256_many_var_into(messages: &[&[u8]], out: &mut [Hash256]) {
 /// PERFORMANCE RUST API.
 /// Hashes N independent messages, writing 128-bit digests directly
 /// into `out` — avoids the intermediate Vec<(u128,u128)>.
+/// Panics if `messages.len() != out.len()`.
 pub fn hash128_many_var_into(messages: &[&[u8]], out: &mut [Hash128]) {
     assert_eq!(
         messages.len(),

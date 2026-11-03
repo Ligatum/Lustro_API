@@ -223,7 +223,8 @@ pub unsafe extern "C" fn lustro_prng_fork(
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
-/// its length is nonzero), `InvalidLength` for `n == 0` or an `n` too large to address.
+/// its length is nonzero), `InvalidLength` for `n == 0` or an `n` too large to address,
+/// `OutOfMemory` if the identifier array cannot be allocated.
 ///
 /// # Safety
 /// `seed` must be valid for 32 bytes.
@@ -308,7 +309,8 @@ pub unsafe extern "C" fn lustro_prng_import_snapshot(
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
-/// its length is nonzero), `InvalidLength` for an `n` too large to address.
+/// its length is nonzero), `InvalidLength` for an `n` too large to address, `OutOfMemory` if the
+/// identifiers or the lane buffer cannot be allocated.
 ///
 /// # Safety
 /// `seed` must be valid for 32 readable bytes.
@@ -328,7 +330,7 @@ pub unsafe extern "C" fn lustro_prng_batch_new(
         let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
         let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        Ok(LustroPrngBatch::new(&seed256, &stream_ids))
+        LustroPrngBatch::try_new(&seed256, &stream_ids).map_err(batch_status)
     })
 }
 
@@ -508,7 +510,8 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
 /// `n` must equal the batch length.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
-/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length.
+/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+/// identifiers or the lane buffer cannot be allocated.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -534,7 +537,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
             return Err(LustroError::InvalidLength);
         }
         let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
-        Ok(batch.fork(&stream_ids))
+        batch.try_fork(&stream_ids).map_err(batch_status)
     })
 }
 
@@ -544,7 +547,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
 /// `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
-/// `OutOfMemory` if the lane buffer cannot be reserved.
+/// `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -581,7 +584,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `seed` or a null or misaligned ID array (when
 /// its length is nonzero), `InvalidLength` for `n_path == 0` or a count too large to address,
-/// `OutOfMemory` if the lane buffer cannot be reserved.
+/// `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
 ///
 /// # Safety
 /// `seed` must be valid for 32 bytes.
@@ -616,7 +619,8 @@ pub unsafe extern "C" fn lustro_prng_batch_derive_path(
 /// Derives one child PRNG per lane with sequential IDs starting at `first`.
 /// IDs wrap modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
-/// for a null or misaligned `out_ctx`, or for null `ctx`.
+/// for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+/// be reserved.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -635,7 +639,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_range(
             return Err(LustroError::InvalidPointer);
         }
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-        Ok((*ctx).fork_range(StreamId(first)))
+        (*ctx).try_fork_range(StreamId(first)).map_err(batch_status)
     })
 }
 

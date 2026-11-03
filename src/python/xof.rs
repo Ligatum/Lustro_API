@@ -19,7 +19,7 @@ use crate::xof::{LustroXof, LustroXofBatch};
 /// One instance is one stream. An instance must not be used by several threads
 /// at the same time: an overlapping call raises RuntimeError ("Already borrowed").
 /// Use `fork()` or separate instances for independent streams.
-#[pyclass(name = "LustroXof")]
+#[pyclass(name = "LustroXof", module = "lustro")]
 pub struct LustroXofPy {
     inner: LustroXof,
 }
@@ -132,6 +132,15 @@ impl LustroXofPy {
         self.copy()
     }
 
+    /// Pickle support: rebuilds the object through `import_snapshot`.
+    pub fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let restore = slf.get_type().getattr("import_snapshot")?;
+        let bytes = slf.try_borrow()?.export_snapshot(slf.py());
+        Ok((restore, (bytes,)))
+    }
+
     /// Derives a child XOF from the current state and `id`.
     /// The parent is not advanced.
     pub fn fork(&self, #[pyo3(from_py_with = u128_arg)] id: u128) -> Self {
@@ -199,7 +208,7 @@ impl LustroXofPy {
 /// size of its largest `fill_blocks()` call until it is dropped; `release_buffer()`
 /// frees it earlier. An instance must not be used by several threads at the same
 /// time: an overlapping call raises RuntimeError ("Already borrowed").
-#[pyclass(name = "LustroXofBatch")]
+#[pyclass(name = "LustroXofBatch", module = "lustro")]
 pub struct LustroXofBatchPy {
     inner: LustroXofBatch,
     blocks_buf: Vec<[u8; 32]>,
@@ -210,11 +219,12 @@ impl LustroXofBatchPy {
     /// Creates a batch with one lane per message. `messages` is a sequence of
     /// bytes-like objects (TypeError for a single string or buffer, a non-sequence or
     /// an item that is not a byte buffer). `bytes` items are not copied, other buffers are.
+    /// MemoryError if the lanes cannot be allocated.
     #[new]
     pub fn new(#[pyo3(from_py_with = messages_arg)] messages: MessageSeq<'_>) -> PyResult<Self> {
         let messages = messages.load()?;
         let refs = messages.slices();
-        let inner = LustroXofBatch::new(&refs);
+        let inner = LustroXofBatch::try_new(&refs).map_err(|_| crate::python::alloc_error())?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -259,6 +269,15 @@ impl LustroXofBatchPy {
 
     pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.copy()
+    }
+
+    /// Pickle support: rebuilds the object through `import_snapshot`.
+    pub fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let restore = slf.get_type().getattr("import_snapshot")?;
+        let bytes = slf.try_borrow()?.export_snapshot(slf.py());
+        Ok((restore, (bytes,)))
     }
 
     /// Returns lane `i` as an independent LustroXof, positioned at the lane's next block.
@@ -418,6 +437,7 @@ impl LustroXofBatchPy {
     }
 
     /// Derives one child per lane; `len(ids)` must equal `len(self)` (ValueError).
+    /// MemoryError if the lanes cannot be allocated.
     pub fn fork(&self, #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>) -> PyResult<Self> {
         if ids.len() != self.inner.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -425,7 +445,10 @@ impl LustroXofBatchPy {
             ));
         }
         let stream_ids: Vec<StreamId> = ids.into_iter().map(StreamId).collect();
-        let inner = self.inner.fork(&stream_ids);
+        let inner = self
+            .inner
+            .try_fork(&stream_ids)
+            .map_err(|_| crate::python::alloc_error())?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -476,12 +499,16 @@ impl LustroXofBatchPy {
     }
 
     /// Derives one child per lane with ids `first`, `first + 1`, ... (modulo 2**128).
-    pub fn fork_range(&self, #[pyo3(from_py_with = u128_arg)] first: u128) -> Self {
-        let inner = self.inner.fork_range(StreamId(first));
-        Self {
+    /// MemoryError if the lanes cannot be allocated.
+    pub fn fork_range(&self, #[pyo3(from_py_with = u128_arg)] first: u128) -> PyResult<Self> {
+        let inner = self
+            .inner
+            .try_fork_range(StreamId(first))
+            .map_err(|_| crate::python::alloc_error())?;
+        Ok(Self {
             inner,
             blocks_buf: Vec::new(),
-        }
+        })
     }
 
     /// Exports the current state as `16 + len(self) * 48` bytes.

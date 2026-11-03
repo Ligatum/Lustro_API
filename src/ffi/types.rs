@@ -72,7 +72,8 @@ pub(super) unsafe fn bytes_in<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8]
 }
 
 /// Joins parallel `(hi, lo)` arrays into stream IDs.
-/// `InvalidLength` if `n` is not addressable; `InvalidPointer` if a pointer is null (n > 0) or misaligned.
+/// `InvalidLength` if `n` is not addressable; `InvalidPointer` if a pointer is null (n > 0) or misaligned;
+/// `OutOfMemory` if the vector cannot be reserved.
 /// SAFETY: both pointers must be valid for `n` elements if n > 0.
 pub(super) unsafe fn ids_from_parts(
     hi: *const u64,
@@ -84,16 +85,21 @@ pub(super) unsafe fn ids_from_parts(
     }
     let his = slice_in(hi, n).ok_or(LustroError::InvalidPointer)?;
     let los = slice_in(lo, n).ok_or(LustroError::InvalidPointer)?;
-    Ok(his
-        .iter()
-        .zip(los)
-        .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128)))
-        .collect())
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(n)
+        .map_err(|_| LustroError::OutOfMemory)?;
+    ids.extend(
+        his.iter()
+            .zip(los)
+            .map(|(&hi, &lo)| StreamId(((hi as u128) << 64) | (lo as u128))),
+    );
+    Ok(ids)
 }
 
 /// Reconstructs `n` messages from parallel pointer/length arrays.
 /// `InvalidLength` if a length is not addressable; `InvalidPointer` on a null or misaligned
-/// array, or on a null message pointer with a nonzero length.
+/// array, or on a null message pointer with a nonzero length; `OutOfMemory` if the vector
+/// cannot be reserved.
 /// SAFETY: arrays must be valid for `n` elements if n > 0; each pointer for its length.
 pub(super) unsafe fn messages_from_parts<'a>(
     ptrs: *const *const u8,
@@ -105,7 +111,10 @@ pub(super) unsafe fn messages_from_parts<'a>(
     }
     let ptrs = slice_in(ptrs, n).ok_or(LustroError::InvalidPointer)?;
     let lens = slice_in(lens, n).ok_or(LustroError::InvalidPointer)?;
-    let mut messages = Vec::with_capacity(n);
+    let mut messages = Vec::new();
+    messages
+        .try_reserve_exact(n)
+        .map_err(|_| LustroError::OutOfMemory)?;
     for (&p, &len) in ptrs.iter().zip(lens) {
         messages.push(bytes_in(p, len)?);
     }

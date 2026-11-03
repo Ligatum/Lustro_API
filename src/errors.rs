@@ -27,7 +27,7 @@ pub enum LustroError {
     InvalidKind = 8,
     /// Snapshot cursor is outside `1..=32`.
     InvalidCursor = 9,
-    /// Reserving a batch lane buffer failed (allocator refusal or capacity overflow).
+    /// Allocation failed while reserving an internal buffer (allocator refusal or capacity overflow).
     OutOfMemory = 10,
     /// Runtime settings are already fixed (`lustro_configure`).
     AlreadyConfigured = 11,
