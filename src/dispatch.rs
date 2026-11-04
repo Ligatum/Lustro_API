@@ -16,6 +16,7 @@ pub(crate) use params::*;
 pub(crate) use pool::for_chunks_mut;
 #[cfg(feature = "ffi")]
 pub(crate) use pool::map_ranges;
+use pool::pool_usable;
 #[cfg(feature = "parallel")]
 use pool::*;
 
@@ -607,9 +608,10 @@ fn execute_hash_var_avx2_blocks<M: MessageBlocks, const N: usize>(
 }
 
 // Hashes block-wise messages in parallel when the plan for this many messages says so.
-// Returns false without touching `out` when it does not. Meant for batches of at least
-// `HASH_AVX2_PARAMS.mt_threshold_messages` messages, where the total length does not matter
-// to the plan.
+// Returns false without touching `out` when it does not. The plan is made with
+// `TOTAL_LEN_CAP` bytes, which reaches the byte threshold of every parameter set, so only
+// a message count below 2 (below `HASH_AVX2_VAR_MIN_MT_MESSAGES` on AVX2) keeps it on the
+// calling thread. The Python caller sets the real size floor (`PAR_LOAD_MIN`).
 #[cfg(feature = "python")]
 pub(crate) fn dispatch_hash_blocks_parallel<M: MessageBlocks, const N: usize>(
     messages: M,
@@ -913,11 +915,18 @@ pub(crate) fn suggested_steps_with(caps: Caps, overrides: Overrides, n: usize) -
     backend_for(caps, overrides, n).steps_policy().steps_for(n)
 }
 
-// Backend and configured pool size for the given capabilities and config; no pool access.
+// Settings for the given capabilities and config. `fixed`, `pool_usable` and `logical`
+// come from the caller; nothing is read from the process here.
 // `threads` is not a count of active workers: if the pool cannot be built, or this process
 // is a child forked after its parent claimed the pool (`POOL_OWNER`), batches still run on
 // the calling thread.
-fn runtime_info_with(caps: Caps, config: RuntimeConfig) -> crate::types::RuntimeInfo {
+fn runtime_info_with(
+    caps: Caps,
+    config: RuntimeConfig,
+    fixed: bool,
+    pool_usable: bool,
+    logical: usize,
+) -> crate::types::RuntimeInfo {
     // Backend of the largest batch, within `LUSTRO_DISABLE_SIMD`.
     let backend = backend_for(caps, config.overrides(), usize::MAX);
     #[cfg(feature = "parallel")]
@@ -927,17 +936,34 @@ fn runtime_info_with(caps: Caps, config: RuntimeConfig) -> crate::types::Runtime
     crate::types::RuntimeInfo {
         backend: backend.name(),
         threads,
+        fixed,
+        parallel_built: cfg!(feature = "parallel"),
+        simd_available: caps.has_simd(),
+        pool_usable,
+        logical_cpus: logical,
     }
 }
 
 // Settings of the current CPU and runtime config. Reads the config like any dispatch.
 pub(crate) fn runtime_info() -> crate::types::RuntimeInfo {
-    runtime_info_with(Caps::detect(), runtime_config())
+    runtime_info_with(
+        Caps::detect(),
+        runtime_config(),
+        true,
+        pool_usable(),
+        logical_cpus(),
+    )
 }
 
-// Suggested `steps` for the current CPU and runtime config.
+// As `runtime_info`, but fixes nothing: unfixed settings come from the environment now.
+pub(crate) fn runtime_preview() -> crate::types::RuntimeInfo {
+    let (config, fixed) = runtime_config_peek();
+    runtime_info_with(Caps::detect(), config, fixed, pool_usable(), logical_cpus())
+}
+
+// Suggested `steps` for the current CPU and runtime config. Fixes nothing.
 pub(crate) fn suggested_steps(n: usize) -> usize {
-    suggested_steps_with(Caps::detect(), runtime_config().overrides(), n)
+    suggested_steps_with(Caps::detect(), runtime_config_peek().0.overrides(), n)
 }
 
 // Advances every lane by `steps` stream steps, planned for the capabilities of CPU and the runtime config.

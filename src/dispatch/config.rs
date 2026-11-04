@@ -33,8 +33,9 @@ pub(super) fn env_flag(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> b
 }
 
 // Process-wide settings, fixed once: by `configure()`, or else read from the environment
-// at the first use of the dispatcher (batch calls, `suggested_steps()`, `runtime_info()`).
-// Later changes to the environment have no effect.
+// at the first use of the dispatcher (batch calls, `runtime_info()`). Later changes to the
+// environment have no effect. `suggested_steps()` and `runtime_preview()` only look
+// (`peek_in`) and fix nothing.
 // They select how batches run; for the same inputs and `steps` the output bytes do not
 // depend on them. `suggested_steps()` follows the backend, so `LUSTRO_DISABLE_SIMD` can
 // change it.
@@ -92,6 +93,18 @@ impl RuntimeConfig {
         }
     }
 
+    // True if batches run the same way under `self` and `other`. A pool size counts only
+    // where a pool can be used: not with MT off, and not at all without `parallel`.
+    pub(super) fn same_effect(self, other: Self) -> bool {
+        if self.disable_simd != other.disable_simd {
+            return false;
+        }
+        if !cfg!(feature = "parallel") {
+            return true;
+        }
+        self.disable_mt == other.disable_mt && (self.disable_mt || self.workers == other.workers)
+    }
+
     // Build plan restrictions from the runtime flags.
     pub(super) fn overrides(self) -> Overrides {
         Overrides {
@@ -126,16 +139,39 @@ pub(super) fn config_in(
     *cell.get_or_init(|| RuntimeConfig::parse(RuntimeOptions::new(), get, logical))
 }
 
-// Fixes the settings of `cell` from `options` unless they are already fixed.
-// `OnceLock` decides a race with `config_in`: the loser keeps the winner's value.
+// Settings of `cell` without fixing them: the fixed value (`true`), else the one the
+// environment gives now (`false`), which is not stored.
+pub(super) fn peek_in(
+    cell: &OnceLock<RuntimeConfig>,
+    get: impl Fn(&str) -> Option<OsString>,
+    logical: usize,
+) -> (RuntimeConfig, bool) {
+    match cell.get() {
+        Some(&cfg) => (cfg, true),
+        None => (
+            RuntimeConfig::parse(RuntimeOptions::new(), get, logical),
+            false,
+        ),
+    }
+}
+
+// Fixes the settings of `cell` from `options` unless they are already fixed. Fixed settings
+// of the same effect (`same_effect`) are not an error, whoever fixed them.
+// `OnceLock` decides a race with `config_in`: the loser keeps the winner's value and is
+// compared with it.
 pub(super) fn configure_in(
     cell: &OnceLock<RuntimeConfig>,
     options: RuntimeOptions,
     get: impl Fn(&str) -> Option<OsString>,
     logical: usize,
 ) -> Result<(), ConfigError> {
-    cell.set(RuntimeConfig::parse(options, get, logical))
-        .map_err(|_| ConfigError::AlreadyConfigured)
+    match cell.set(RuntimeConfig::parse(options, get, logical)) {
+        Ok(()) => Ok(()),
+        Err(wanted) => match cell.get() {
+            Some(&fixed) if fixed.same_effect(wanted) => Ok(()),
+            _ => Err(ConfigError::AlreadyConfigured),
+        },
+    }
 }
 
 // Process settings; the environment is read on first use only.
@@ -144,6 +180,18 @@ pub(super) fn runtime_config() -> RuntimeConfig {
         return cfg;
     }
     config_in(
+        &RUNTIME_CONFIG,
+        |name| std::env::var_os(name),
+        logical_cpus(),
+    )
+}
+
+// Process settings and whether they are fixed; fixes nothing.
+pub(super) fn runtime_config_peek() -> (RuntimeConfig, bool) {
+    if let Some(&cfg) = RUNTIME_CONFIG.get() {
+        return (cfg, true);
+    }
+    peek_in(
         &RUNTIME_CONFIG,
         |name| std::env::var_os(name),
         logical_cpus(),

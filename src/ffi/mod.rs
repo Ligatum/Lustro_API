@@ -42,7 +42,7 @@ pub(crate) unsafe fn construct<T>(
 
 pub(crate) fn batch_status(e: BatchError) -> LustroError {
     match e {
-        BatchError::SizeOverflow => LustroError::InvalidLength,
+        BatchError::SizeOverflow | BatchError::LengthMismatch { .. } => LustroError::InvalidLength,
         BatchError::Reserve(_) => LustroError::OutOfMemory,
     }
 }
@@ -85,6 +85,119 @@ pub extern "C" fn lustro_runtime_backend() -> *const c_char {
     })
 }
 
+/// Execution settings of this process, as returned by `lustro_runtime_info` and
+/// `lustro_runtime_preview`. Same fields as `RuntimeInfo` in Rust. Flags are 0 or 1.
+/// The caller passes `sizeof` of this struct to those functions, so that fields added
+/// later do not overflow a struct built from an older header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LustroRuntimeInfo {
+    /// Configured pool size, not a count of active workers. 0 = batches run on the
+    /// calling thread.
+    pub threads: usize,
+    /// Logical CPUs available to the process, detected at the call.
+    pub logical_cpus: usize,
+    /// Backend for batches: "scalar" or "avx2". Static NUL-terminated string, never NULL,
+    /// do not free.
+    pub backend: *const c_char,
+    /// 1 if the settings are fixed. Always 1 from `lustro_runtime_info`; 0 is possible
+    /// only from `lustro_runtime_preview`.
+    pub fixed: u8,
+    /// 1 if built with the `parallel` feature.
+    pub parallel_built: u8,
+    /// 1 if the CPU has the SIMD instructions the crate uses (AVX2 today).
+    pub simd_available: u8,
+    /// 1 if the pool is built and this process can use it.
+    pub pool_usable: u8,
+}
+
+// End of the last field of the first layout: the least `out_size` that is accepted.
+const RUNTIME_INFO_MIN_SIZE: usize = std::mem::offset_of!(LustroRuntimeInfo, pool_usable) + 1;
+
+fn info_to_c(info: crate::types::RuntimeInfo) -> LustroRuntimeInfo {
+    LustroRuntimeInfo {
+        threads: info.threads,
+        logical_cpus: info.logical_cpus,
+        backend: match info.backend {
+            "avx2" => c"avx2".as_ptr(),
+            "scalar" => c"scalar".as_ptr(),
+            _ => c"unknown".as_ptr(),
+        },
+        fixed: info.fixed as u8,
+        parallel_built: info.parallel_built as u8,
+        simd_available: info.simd_available as u8,
+        pool_usable: info.pool_usable as u8,
+    }
+}
+
+// Writes the fields that fit in `out_size` through a checked pointer; nothing is written on
+// error. Every field of the first layout fits once `out_size >= RUNTIME_INFO_MIN_SIZE`.
+unsafe fn write_info(
+    out: *mut LustroRuntimeInfo,
+    out_size: usize,
+    get: fn() -> crate::types::RuntimeInfo,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if out.is_null() || (out as usize) % std::mem::align_of::<LustroRuntimeInfo>() != 0 {
+            return LustroError::InvalidPointer;
+        }
+        if out_size < RUNTIME_INFO_MIN_SIZE {
+            return LustroError::InvalidLength;
+        }
+        let info = info_to_c(get());
+        macro_rules! put {
+            ($f:ident) => {
+                if std::mem::offset_of!(LustroRuntimeInfo, $f) + std::mem::size_of_val(&info.$f)
+                    <= out_size
+                {
+                    std::ptr::addr_of_mut!((*out).$f).write(info.$f);
+                }
+            };
+        }
+        put!(threads);
+        put!(logical_cpus);
+        put!(backend);
+        put!(fixed);
+        put!(parallel_built);
+        put!(simd_available);
+        put!(pool_usable);
+        LustroError::Ok
+    })
+}
+
+/// Stores the execution settings of this process in `*out`. Like `runtime_info()` in Rust,
+/// this fixes the settings if they are not fixed yet (see `lustro_configure`), so `fixed`
+/// is 1. Does not start the pool.
+///
+/// `out_size` is `sizeof(LustroRuntimeInfo)`. Only the fields that fit in it are written,
+/// so a library newer than the header leaves the extra fields alone. Returns
+/// `InvalidPointer` for a null or misaligned `out`, `InvalidLength` if `out_size` is
+/// smaller than the first layout of the struct.
+///
+/// # Safety
+/// If `out` is non-null, it must be valid for writing `out_size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_runtime_info(
+    out: *mut LustroRuntimeInfo,
+    out_size: usize,
+) -> LustroError {
+    write_info(out, out_size, crate::api::runtime_info)
+}
+
+/// As `lustro_runtime_info`, but fixes nothing. Settings not yet fixed come from the
+/// environment as it is now (`fixed` is 0) and may differ from the ones fixed later.
+/// A snapshot: it can be stale on return. Does not start the pool.
+///
+/// # Safety
+/// If `out` is non-null, it must be valid for writing `out_size` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_runtime_preview(
+    out: *mut LustroRuntimeInfo,
+    out_size: usize,
+) -> LustroError {
+    write_info(out, out_size, crate::api::runtime_preview)
+}
+
 /// `simd` for `lustro_configure`: follow `LUSTRO_DISABLE_SIMD`.
 pub const LUSTRO_SIMD_KEEP: i32 = 0;
 /// `simd` for `lustro_configure`: allow AVX2.
@@ -111,10 +224,9 @@ pub(crate) fn options_from_c(threads: usize, simd: i32) -> Result<RuntimeOptions
 /// 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
 /// `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
 ///
-/// Fixed once, by an earlier call, a batch call, `*_batch_suggested_steps` or
-/// `lustro_runtime_*`. Later calls
-/// return `ALREADY_CONFIGURED`, also with identical arguments. Unknown `simd` returns
-/// `INVALID_ARGUMENT` and changes nothing.
+/// Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. A later call returns
+/// `Ok` if the arguments give the same settings as the fixed ones, else
+/// `AlreadyConfigured`. Unknown `simd` returns `InvalidArgument` and changes nothing.
 #[no_mangle]
 pub extern "C" fn lustro_configure(threads: usize, simd: i32) -> LustroError {
     guarded(LustroError::InternalPanic, || {

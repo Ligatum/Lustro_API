@@ -1,6 +1,7 @@
 **Please note the API is currently in its beta stage. I'm still working on a list of functionality updates.**
 
 **Edit: 27.10.26. I will be uploading a breaking change patch in the coming week or two at most. It'll be the only one before going out of beta. Lustro 1.0.1 will be the initial post-beta release.**
+**Edit: 04.11.26. I am aiming for the upgrades to be finished by 13.11.26. A health issue delayed me slightly.**
 
 # Lustro API
 
@@ -22,7 +23,7 @@ cd Lustro_API
 
 cargo build --release
 
-# System entropy for Seed256::from_entropy() (Rust)
+# System entropy for Seed256::from_entropy() and LustroPrng::from_entropy() (Rust; also enabled by ffi and python)
 
 cargo build --release --features entropy
 
@@ -95,16 +96,21 @@ lustro_hash256((const uint8_t *)"hello world", 11, digest);
 `Hash128` and `Hash256` print as hex of the digest bytes, in the order returned by `as_bytes()`: 32 and 64 digits. Width, fill and alignment work as for strings (`{digest:>70}`, `{digest:*^70}`), and a precision shortens the output (`{digest:.8}`).
 
 ```rust
-use lustro::hash256;
+use lustro::{hash256, Hash256};
 
 let digest = hash256(b"hello world");
 
 println!("{digest}");     // lowercase hex, 64 digits
 println!("{digest:X}");   // uppercase
 println!("{digest:#x}");  // with a 0x prefix
+
+let parsed: Hash256 = format!("{digest:#x}").parse()?;
+assert_eq!(parsed, digest);
 ```
 
 Digests are `Hash` and `Ord`, so they work as keys in `HashMap` and `BTreeMap`. `Ord` compares the bytes lexicographically, not as a number. Conversion to and from `[u8; N]` is available through `From` / `Into`. In Python a digest is `bytes`, so use `digest.hex()`.
+
+`parse()` reads a digest back from hex: 64 digits for `Hash256`, 32 for `Hash128`, either case, with an optional `0x` or `0X` prefix. Spaces are not trimmed. `ParseHashError` says whether the length or a digit is wrong. `Hash256::first_128()` returns the first 16 bytes as a `Hash128`, the same value `hash128` returns for that message. In Python use `bytes.fromhex(s)`.
 
 ---
 
@@ -132,6 +138,8 @@ let mut xof = LustroXof::new(b"hello world");
 
 let value = xof.next_u64();
 ```
+
+`StreamId` wraps a `u128`, so `StreamId(5)` works. `StreamId::from` takes `u8`, `u16`, `u32`, `u64` and `u128` values; `StreamId::from(5)` does not compile, because an untyped literal is an `i32`.
 
 **Python**
 
@@ -192,27 +200,51 @@ The C examples below omit the status checks for brevity.
 
 ### Random Seed
 
-**Rust** (`--features entropy`, also enabled by `rand`)
+**Rust** (`--features entropy`, also enabled by `rand`, `python` and `ffi`)
 
 ```rust
-use lustro::{LustroPrng, Seed256, StreamId};
+use lustro::{LustroPrng, StreamId};
 
 // Err(EntropyError) if the operating system cannot provide entropy.
-let seed = Seed256::from_entropy()?;
-let mut rng = LustroPrng::new(&seed, StreamId(0));
+// Stream 0 of a fresh seed; the seed is not kept.
+let mut rng = LustroPrng::from_entropy()?;
+
+// Another stream of a fresh seed.
+let mut other = LustroPrng::from_entropy_with_id(StreamId(5))?;
 ```
+
+To keep the seed, take it first: `Seed256::from_entropy()?`, then `LustroPrng::new(&seed, StreamId(0))`.
 
 **Python**
 
 ```python
-import os
 from lustro import LustroPrng
 
-rng = LustroPrng(os.urandom(32), 0)
+rng = LustroPrng.from_entropy()  # OSError if the system source is unavailable
 ```
 
-**C / C++** — fill the 32-byte seed from the system's entropy source
-(for example `getrandom(2)`, `arc4random_buf` or `BCryptGenRandom`).
+The seed is not kept. To keep it, use `LustroPrng(os.urandom(32), 0)`.
+
+**C / C++** — `lustro_seed_from_entropy` fills a 32-byte seed from the system's entropy source;
+`lustro_prng_from_entropy` creates a PRNG directly (stream ID as `hi`, `lo`, the seed is not kept):
+
+```c
+LustroPrng *rng = NULL;
+LustroError err = lustro_prng_from_entropy(0, 0, &rng);
+if (err != LUSTRO_ERROR_OK) {
+    /* LUSTRO_ERROR_ENTROPY_UNAVAILABLE: the system entropy source is unavailable */
+}
+
+/* To keep the seed, take it first */
+uint8_t seed[LUSTRO_SEED_LEN];
+LustroPrng *kept = NULL;
+err = lustro_seed_from_entropy(seed);
+if (err == LUSTRO_ERROR_OK) {
+    err = lustro_prng_new(seed, 0, 0, &kept);
+}
+```
+
+Available with the `ffi` feature, which enables `entropy`.
 
 ---
 
@@ -278,6 +310,12 @@ lustro_prng_next_block(rng, block);
 uint8_t data[100];
 lustro_prng_fill(rng, data, sizeof(data));
 
+lustro_prng_advance_bytes(rng, 50);   /* skip 50 bytes */
+lustro_prng_advance_blocks(rng, 2);   /* skip 2 blocks */
+
+uint8_t position[16];                 /* u128, 16 bytes little-endian */
+lustro_prng_position(rng, position);
+
 lustro_prng_free(rng);
 ```
 
@@ -285,7 +323,9 @@ lustro_prng_free(rng);
 
 All values are little-endian and taken from the same byte stream: in the examples above `a` is bytes 0–3, `b` bytes 4–11 and `c` bytes 12–27. `next_block()` always advances to a full new 32-byte block and discards the unread rest of the current one.
 
-In Rust, `LustroPrng` and `LustroXof` also implement `std::io::Read`. `read` fills the whole buffer and returns its length, exactly like `fill_bytes`. The stream has no end, so do not use an unbounded `read_to_end`; bound the read, for example with `take`.
+`advance_bytes(n)` skips `n` bytes and `advance_blocks(n)` skips `n` blocks, leaving the stream where `fill` of `n` bytes or `n` calls of `next_block()` would. Both cost O(n); there is no jump-ahead. `position()` returns the bytes taken so far, and the discarded rest of a block counts as taken. They exist for `LustroPrng` and `LustroXof` in Rust, Python and C/C++ (`lustro_prng_advance_bytes`, `lustro_prng_advance_blocks`, `lustro_prng_position` and the same for `lustro_xof_*`). In C/C++ `n` is a `uint64_t`, and the position is written as 16 bytes, little-endian; `lustro_u128_to_parts` splits it into `(hi, lo)`.
+
+In Rust, `LustroPrng` and `LustroXof` also implement `std::io::Read`. `read` fills the whole buffer and returns its length, exactly like `fill_bytes`. The stream has no end, so `read_to_end` and `read_to_string` return an `InvalidInput` error and read nothing; bound the read, for example with `take`. `io::copy` and `bytes()` without a limit are not stopped, so bound those too.
 
 ---
 
@@ -461,9 +501,11 @@ lustro_xof_free(child);
 lustro_xof_free(xof);
 ```
 
+In C/C++ a 128-bit ID goes in as two `uint64_t`, `hi` first, and `next_u128` returns 16 bytes, little-endian. `lustro_u128_from_parts(hi, lo, out)` and `lustro_u128_to_parts(in, &hi, &lo)` from `lustro.h` convert between the two forms.
+
 The same parent state and identifier always give the same child. Reading more bytes from the block the parent is already in does not change the child; moving the parent on to a later block changes the state it is derived from. The child starts at its own first block and does not inherit the parent's position.
 
-The output block holds the two state words `fork()` derives from, so once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` seeded with that block and the same identifier. The identifier is hashed together with the state.
+A 32-byte output block is the stream's state at that point, and `fork()` derives from that state. So once a PRNG has generated a block, `fork(id)` equals `LustroPrng::new` with that block as the seed and the same identifier.
 
 ---
 
@@ -550,19 +592,27 @@ Hash many messages in one call. `*_many_fixed` takes messages of one length stor
 **Rust**
 
 ```rust
-use lustro::{hash256_many_fixed_into, hash256_many_var, Hash256};
+use lustro::{
+    hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into, Hash256,
+};
 
 // Messages of one length, stored back to back.
 let data = [0u8; 3 * 16];
+let fixed = hash256_many_fixed(&data, 16);
+
+// The same, written into a slice you provide.
 let mut out = vec![Hash256::default(); 3];
 hash256_many_fixed_into(&data, 16, &mut out);
 
 // Messages of any length.
 let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
 let digests = hash256_many_var(&messages);
+
+// The same, written into a slice you provide.
+hash256_many_var_into(&messages, &mut out);
 ```
 
-`hash256_many_var_into(&messages, &mut out)` writes into a slice you provide. `hash256_many_fixed_into` panics if `data.len() != out.len() * message_len`, and `hash256_many_var_into` if `messages.len() != out.len()`.
+`hash256_many_fixed` returns a `Vec` and panics if `message_len` is 0 or `data.len()` is not a multiple of `message_len`. `hash256_many_fixed_into` panics if `data.len() != out.len() * message_len`, and `hash256_many_var_into` if `messages.len() != out.len()`.
 
 **Python**
 
@@ -744,7 +794,7 @@ const uint8_t *block = out + lustro_batch_block_offset(0, 4, 2);
 
 ---
 
-### Batch Single Lane
+### Batch into Single Lane
 
 Take one lane out of a batch as a single stream. The stream continues the lane: its next block is the block the batch would write for that lane next. The batch is not changed, and the two evolve independently afterwards.
 
@@ -847,6 +897,8 @@ lustro_xof_batch_free(xof);
 ```
 
 The result is an ordinary single stream (`LustroPrng` or `LustroXof`), so it supports typed reads, `fork` and snapshots.
+
+In Python, `batch[i]` does what `batch.lane(i)` does, and a negative `i` counts from the end (`batch[-1]` is the last lane). `for lane in batch` goes through all lanes in order. Each lane is a copy, and the loop uses the lane states as they were when it started, so later calls on the batch do not change it. Slices are not supported, and `lane(i)` itself still rejects a negative `i`.
 
 ---
 
@@ -1076,13 +1128,13 @@ lustro_xof_batch_free(one_each);
 lustro_xof_batch_free(xof);
 ```
 
-`fork(ids)` derives one child per lane, using the identifier at the same position. `ids` must have exactly `batch.len()` elements (a panic in Rust, `ValueError` in Python, `LUSTRO_ERROR_INVALID_LENGTH` in C/C++).
+`fork(ids)` derives one child per lane, using the identifier at the same position. `ids` must have exactly `batch.len()` elements (`fork` panics and `try_fork` returns `BatchError::LengthMismatch` in Rust, `ValueError` in Python, `LUSTRO_ERROR_INVALID_LENGTH` in C/C++).
 `fork_range(first)` derives `batch.len()` children using sequential stream IDs.
 `fork_many(ids)` derives `ids.len()` children per lane instead, producing a
 batch of `batch.len() * ids.len()` lanes, ordered parent-major: child `j` of
 lane `i` is at index `i * ids.len() + j`. Each child starts at step 0.
 
-If the lanes cannot be allocated, `fork`, `fork_range` and `fork_many` panic in Rust; the `try_` variants return an error instead. Python raises `MemoryError`, and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`. `try_fork` still panics if `ids.len() != batch.len()`.
+If the lanes cannot be allocated, `fork`, `fork_range` and `fork_many` panic in Rust; the `try_` variants return an error instead. Python raises `MemoryError`, and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`.
 
 ---
 
@@ -1421,14 +1473,16 @@ The snapshot size is `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSH
 
 ### Runtime Settings
 
-Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code and must be called before first use (see below). They apply to hash batches as well as to PRNG and XOF batches.
+Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. `configure` sets them from code, best before first use (see below). They apply to hash batches as well as to PRNG and XOF batches.
 
 `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` are set by `1`, `true`, `on` or `yes` and are not set by `0`, `false`, `off`, `no` or an empty value (case is ignored). Any other value sets them.
+
+`LUSTRO_NUM_THREADS` takes a positive number, capped at the CPU count. A value that is not a positive number (`abc`, `0`, `-1`) is ignored and the pool gets the full CPU count.
 
 **Rust**
 
 ```rust
-use lustro::{configure, RuntimeOptions};
+use lustro::{configure, runtime_info, runtime_preview, RuntimeOptions};
 use std::num::NonZeroUsize;
 
 let options = RuntimeOptions::new()
@@ -1436,6 +1490,10 @@ let options = RuntimeOptions::new()
     .allow_simd(true);
 
 configure(options)?;
+
+// Read the settings: runtime_info() fixes them, runtime_preview() does not.
+let info = runtime_info();
+let preview = runtime_preview();
 ```
 
 **Python**
@@ -1444,6 +1502,10 @@ configure(options)?;
 import lustro
 
 lustro.configure(threads=4, allow_simd=True)
+
+info = lustro.runtime_info()        # fixes the settings
+preview = lustro.runtime_preview()  # does not
+print(info["backend"], info["threads"], info["fixed"])
 ```
 
 **C / C++**
@@ -1460,7 +1522,32 @@ if (err != LUSTRO_ERROR_OK) {
 
 Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you pass override it. `threads` is capped at the number of logical CPUs, and `1` disables the thread pool. `allow_simd=False` (`LUSTRO_SIMD_SCALAR` in C/C++) selects the scalar backend.
 
-The settings can be set only once. The first hash batch call, batch `fill_blocks`/`blocks`, `suggested_steps()` or `runtime_info()` fixes them too, so a later `configure` fails, even with the same arguments: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Bad arguments fail without changing anything: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++). `runtime_info()` reports the selected backend and the configured pool size (0 = batches run on the calling thread), not the number of running workers.
+The settings are fixed once, by whichever comes first: `configure`, the first hash batch call, batch `fill_blocks`/`blocks`, or `runtime_info()`. `suggested_steps()` and `runtime_preview()` do not fix them.
+
+A later `configure` succeeds if it asks for the same effect as the fixed settings, and fails otherwise: `ConfigError::AlreadyConfigured` (Rust), `RuntimeError` (Python), `LUSTRO_ERROR_ALREADY_CONFIGURED` (C/C++). Same effect means the same SIMD choice and, with the `parallel` feature, the same pool size. For the pool size, `threads` above the CPU count counts as the CPU count, and `threads=1` equals `LUSTRO_DISABLE_MT`. The SIMD choice is compared as given: on a CPU without AVX2, `allow_simd=True` and `False` still differ.
+
+When calls race, one wins and the rest are compared with it. Bad arguments change nothing: `ValueError` for `threads < 1` (Python), `LUSTRO_ERROR_INVALID_ARGUMENT` for an unknown `simd` (C/C++).
+
+`runtime_info()` and `runtime_preview()` (Rust, Python, and `lustro_runtime_info()` / `lustro_runtime_preview()` in C/C++) return the same report. The preview fixes nothing and starts no pool; before the settings are fixed it reads the environment as it is now (`fixed` is false). It may be out of date when it returns.
+
+| Field | Meaning |
+|---|---|
+| `backend` | `"scalar"` or `"avx2"`, as used for the largest batches |
+| `threads` | configured pool size, not running workers; 0 = batches run on the calling thread (also without `parallel`) |
+| `fixed` | the settings are fixed; false only in a preview taken before that |
+| `parallel_built` | built with the `parallel` feature |
+| `simd_available` | the CPU has AVX2; `backend` shows whether it is used |
+| `pool_usable` | the pool exists and this process can use it. False before the first parallel batch, after a failed pool build, and in a child forked after its parent started the pool |
+| `logical_cpus` | logical CPUs at the call; the cap for `threads` |
+
+In C/C++, `lustro_runtime_info(&info, sizeof info)` fills a `LustroRuntimeInfo` and fixes the settings like `runtime_info()`; `lustro_runtime_preview(&info, sizeof info)` fills it and fixes nothing. Both return `LUSTRO_ERROR_OK`, `LUSTRO_ERROR_INVALID_POINTER` for a NULL `info`, or `LUSTRO_ERROR_INVALID_LENGTH` if the size is too small. The struct has the fields above; the flags are 0 or 1 and `backend` is a static string (do not free it). `lustro_runtime_threads()` and `lustro_runtime_backend()` fix the settings like `runtime_info()`.
+
+```c
+LustroRuntimeInfo info;
+if (lustro_runtime_preview(&info, sizeof info) == LUSTRO_ERROR_OK) {
+    printf("%s, %zu threads, fixed=%d\n", info.backend, (size_t)info.threads, info.fixed);
+}
+```
 
 ---
 
@@ -1557,7 +1644,7 @@ let mut prng = LustroPrng::from_seed([7u8; 32]);
 let a = draw(&mut prng);
 
 // Random seed (needs the system entropy source).
-let mut random = LustroPrng::from(Seed256::from_entropy()?);
+let mut random = LustroPrng::from_entropy()?;
 let mut buf = [0u8; 100];
 random.fill_bytes(&mut buf);
 
@@ -1573,7 +1660,7 @@ let c = child.next_u64();
 - **Same stream:** `Rng` returns the same bytes, from the same position, as the
   inherent `next_u32`, `next_u64` and `fill_bytes`.
 - **Seeding:** `from_seed` starts at stream 0. `rand_core` 0.10 has no
-  `from_entropy`, so use `LustroPrng::from(Seed256::from_entropy()?)`.
+  `from_entropy`; use `LustroPrng::from_entropy()?`.
 - **`fork`:** `LustroPrng::fork(StreamId)` shadows `SeedableRng::fork()` on a
   concrete `LustroPrng`. Only code that is generic over `SeedableRng` calls the
   trait method.

@@ -1,7 +1,10 @@
 //! Lustro V1 — XOF API.
 //! Output stream is derived from an absorbed message.
 
-use crate::api::{absorb_with_domain, derive_path_lane, fork_lane, StreamState};
+use crate::api::{
+    absorb_with_domain, derive_branch_stream, derive_path_lane, fork_lane, prepare_base,
+    StreamState,
+};
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, suggested_steps, StreamLane};
 use crate::types::{
@@ -63,7 +66,30 @@ impl LustroXof {
         self.state.fill_bytes(out);
     }
 
+    /// Skips `n` bytes: the same state as `fill_bytes` of `n` bytes, without writing them.
+    /// Costs O(n); there is no jump-ahead, because each block is the input of the next.
+    pub fn advance_bytes(&mut self, n: u64) {
+        self.state.advance_bytes(n);
+    }
+
+    /// Skips `n` blocks: the same state as `n` calls of `next_block`. Unread bytes of the
+    /// current block are discarded first (for `n > 0`). Costs O(n).
+    pub fn advance_blocks(&mut self, n: u64) {
+        self.state.advance_blocks(n);
+    }
+
+    /// Bytes taken from the start of the stream. Bytes discarded by `next_block` and
+    /// `advance_blocks` count as taken. A fork and a fresh stream start at 0; an imported
+    /// snapshot continues from its own position. Meaningless after 2^64 blocks, when the
+    /// block counter wraps.
+    #[must_use]
+    pub fn position(&self) -> u128 {
+        self.state.position()
+    }
+
     /// Derives a child stream from the current state and identifier.
+    /// The read position inside the current block does not affect the child: forking after
+    /// 1 byte or after 31 bytes of the same block gives the same stream.
     pub fn fork(&self, id: StreamId) -> Self {
         Self {
             state: self.state.fork(Domain::Xof as u128, id.get()),
@@ -94,6 +120,8 @@ impl LustroXof {
     }
 
     /// Exports the current stream state.
+    /// The snapshot holds the full stream state: whoever has it can reproduce the rest of the
+    /// stream and its forks. Keep it as private as the seed.
     #[must_use]
     pub fn export_snapshot(&self) -> LustroXofSnapshot {
         let (s0, s1, step, cursor) = self.state.to_parts();
@@ -112,8 +140,8 @@ impl LustroXof {
 /// Reads stream bytes like `fill_bytes`: `read` fills the whole buffer and returns its
 /// length, an empty buffer gives `Ok(0)` and does not move the stream.
 ///
-/// The stream has no end. Do not use unbounded `read_to_end`; bound the read, for example
-/// with `take`:
+/// The stream has no end, so `read_to_end` and `read_to_string` return `InvalidInput` and
+/// read nothing. Bound the read, for example with `take`:
 ///
 /// ```
 /// use lustro::LustroXof;
@@ -129,6 +157,14 @@ impl std::io::Read for LustroXof {
         self.fill_bytes(buf);
         Ok(buf.len())
     }
+
+    fn read_to_end(&mut self, _buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        Err(crate::api::unbounded_read_error())
+    }
+
+    fn read_to_string(&mut self, _buf: &mut String) -> std::io::Result<usize> {
+        Err(crate::api::unbounded_read_error())
+    }
 }
 
 // ==========================================
@@ -142,7 +178,7 @@ pub struct LustroXofBatch {
     streams: Vec<StreamLane>,
 }
 
-// Lane states are secret-derived; only the lane count is shown.
+// Lane states are not printed; only the lane count is shown.
 impl core::fmt::Debug for LustroXofBatch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LustroXofBatch")
@@ -219,6 +255,7 @@ impl LustroXofBatch {
             Ok(out) => out,
             Err(BatchError::SizeOverflow) => panic!("blocks: len() * steps overflows usize"),
             Err(BatchError::Reserve(e)) => panic!("blocks: output allocation failed: {e:?}"),
+            Err(e) => panic!("blocks: {e}"),
         }
     }
 
@@ -259,14 +296,15 @@ impl LustroXofBatch {
         }
     }
 
-    /// As `fork`, returning `Err(BatchError::Reserve)` if reserving the lane buffer fails.
-    /// Still panics if `ids.len() != len()`.
+    /// As `fork`, returning `Err(BatchError::LengthMismatch)` if `ids.len() != len()` and
+    /// `Err(BatchError::Reserve)` if reserving the lane buffer fails.
     pub fn try_fork(&self, ids: &[StreamId]) -> Result<Self, BatchError> {
-        assert_eq!(
-            ids.len(),
-            self.streams.len(),
-            "fork: ids length must match batch stream count"
-        );
+        if ids.len() != self.streams.len() {
+            return Err(BatchError::LengthMismatch {
+                expected: self.streams.len(),
+                actual: ids.len(),
+            });
+        }
 
         let mut streams = Vec::new();
         streams
@@ -293,6 +331,7 @@ impl LustroXofBatch {
                 panic!("fork_many: len() * ids.len() overflows usize")
             }
             Err(BatchError::Reserve(e)) => panic!("fork_many: lane allocation failed: {e:?}"),
+            Err(e) => panic!("fork_many: {e}"),
         }
     }
 
@@ -307,8 +346,10 @@ impl LustroXofBatch {
             .try_reserve_exact(child_count)
             .map_err(BatchError::Reserve)?;
         for lane in &self.streams {
+            // The midstate depends on the parent lane only; its children share it.
+            let (base_s0, base_s1) = prepare_base(lane.s0, lane.s1, Domain::Xof as u128);
             for &id in ids {
-                let (s0, s1) = fork_lane(lane.s0, lane.s1, Domain::Xof as u128, id.get());
+                let (s0, s1) = derive_branch_stream(base_s0, base_s1, id.get());
                 // Child stream starts at step 0.
                 streams.push(StreamLane { s0, s1, step: 0 });
             }
@@ -394,6 +435,8 @@ impl LustroXofBatch {
 
     /// Exports the current state of every lane.
     /// Batch snapshots are block-aligned and have no cursor.
+    /// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
+    /// stream and its forks. Keep it as private as the seed.
     #[must_use]
     pub fn export_snapshot(&self) -> LustroXofBatchSnapshot {
         let lanes = self

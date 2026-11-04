@@ -33,6 +33,9 @@ pub enum LustroError {
     AlreadyConfigured = 11,
     /// An argument value is not allowed; nothing was changed.
     InvalidArgument = 12,
+    /// The system entropy source is unavailable (`lustro_seed_from_entropy`,
+    /// `lustro_prng_from_entropy`).
+    EntropyUnavailable = 13,
 }
 
 impl LustroError {
@@ -52,6 +55,7 @@ impl LustroError {
             10 => Some(LustroError::OutOfMemory),
             11 => Some(LustroError::AlreadyConfigured),
             12 => Some(LustroError::InvalidArgument),
+            13 => Some(LustroError::EntropyUnavailable),
             _ => None,
         }
     }
@@ -78,6 +82,7 @@ impl LustroError {
             LustroError::OutOfMemory => "allocation failed\0",
             LustroError::AlreadyConfigured => "runtime settings are already fixed\0",
             LustroError::InvalidArgument => "invalid argument value\0",
+            LustroError::EntropyUnavailable => "system entropy source unavailable\0",
         }
     }
 }

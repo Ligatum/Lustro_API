@@ -35,14 +35,33 @@ pub fn lustro_api_version() -> u32 {
 /// Execution settings of this process as a dict: `backend` ("scalar" or "avx2", as
 /// selected for stream and hash batches) and `threads` (configured pool size, not a count of
 /// active workers; 0 = calling thread only). The pool is not started by this call and may
-/// fail to start; batches then run on the calling thread. See `LUSTRO_NUM_THREADS`,
-/// `LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`.
+/// fail to start; batches then run on the calling thread. Also `fixed`, `parallel_built`,
+/// `simd_available`, `pool_usable` (the pool is built and this process can use it; False
+/// also before the first parallel batch and in a child forked after the parent started the
+/// pool) and `logical_cpus`. This call fixes the settings; `runtime_preview()` does not.
+/// See `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`.
 #[pyfunction]
 pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
-    let info = crate::api::runtime_info();
+    info_dict(py, crate::api::runtime_info())
+}
+
+/// As `runtime_info()`, but fixes nothing. If the settings are not fixed yet, `fixed` is
+/// False and the values come from the environment as it is now; they can differ from the
+/// ones fixed later. A snapshot: it can be stale on return.
+#[pyfunction]
+pub fn runtime_preview(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+    info_dict(py, crate::api::runtime_preview())
+}
+
+fn info_dict(py: Python<'_>, info: crate::RuntimeInfo) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     let d = pyo3::types::PyDict::new(py);
     d.set_item("backend", info.backend)?;
     d.set_item("threads", info.threads)?;
+    d.set_item("fixed", info.fixed)?;
+    d.set_item("parallel_built", info.parallel_built)?;
+    d.set_item("simd_available", info.simd_available)?;
+    d.set_item("pool_usable", info.pool_usable)?;
+    d.set_item("logical_cpus", info.logical_cpus)?;
     Ok(d)
 }
 
@@ -50,8 +69,9 @@ pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> 
 /// at the logical CPU count, 1 = no pool. `allow_simd=False` = scalar only. None
 /// follows the environment, a given value replaces it.
 ///
-/// Fixed once, by an earlier call, a batch call, `suggested_steps()` or
-/// `runtime_info()`. Later calls raise `RuntimeError`, also with identical arguments.
+/// Fixed once, by an earlier call, a batch call or `runtime_info()`. A later call returns
+/// None if the arguments give the same settings as the fixed ones, else raises
+/// `RuntimeError`.
 #[pyfunction]
 #[pyo3(signature = (threads=None, allow_simd=None))]
 pub fn configure(threads: Option<i64>, allow_simd: Option<bool>) -> PyResult<()> {
@@ -97,6 +117,29 @@ pub(crate) fn snapshot_error(err: crate::types::SnapshotError) -> pyo3::PyErr {
 // Maps an allocation failure to MemoryError.
 pub(crate) fn alloc_error() -> pyo3::PyErr {
     pyo3::exceptions::PyMemoryError::new_err("allocation failed")
+}
+
+// Index argument of `batch[i]`: anything with `__index__`. As for a list, an integer that
+// does not fit `isize` is out of range (IndexError), not an overflow; other types stay TypeError.
+pub(crate) fn item_index(index: &Bound<'_, PyAny>) -> PyResult<isize> {
+    index.extract::<isize>().map_err(|e| {
+        if e.is_instance_of::<pyo3::exceptions::PyOverflowError>(index.py()) {
+            pyo3::exceptions::PyIndexError::new_err("lane index out of range")
+        } else {
+            e
+        }
+    })
+}
+
+// Lane index as in a list: a negative value counts from the end.
+pub(crate) fn lane_index(index: isize, len: usize) -> pyo3::PyResult<usize> {
+    let i = if index < 0 {
+        len.checked_sub(index.unsigned_abs())
+    } else {
+        Some(index as usize)
+    };
+    i.filter(|&i| i < len)
+        .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("lane index out of range"))
 }
 
 // Error of a batch `try_derive_path`. The callers check `path` first, so `EmptyPath`

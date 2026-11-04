@@ -97,7 +97,7 @@ fn decode_single_snapshot(
 }
 
 /// Serialized PRNG stream state.
-/// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+/// Debug output is redacted; `s0`/`s1` are the stream state, which continues the stream and its forks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LustroPrngSnapshot {
     s0: u128,
@@ -163,7 +163,7 @@ impl LustroPrngSnapshot {
 }
 
 /// Serialized XOF stream state.
-/// Debug output is redacted; `s0`/`s1` are secret-derived state, same as `Seed256`.
+/// Debug output is redacted; `s0`/`s1` are the stream state, which continues the stream and its forks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LustroXofSnapshot {
     s0: u128,
@@ -299,7 +299,7 @@ fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64,
 }
 
 /// Serialized PRNG batch state.
-/// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+/// Debug output is redacted; each lane holds stream state, which continues that stream and its forks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LustroPrngBatchSnapshot {
     lanes: Vec<(u128, u128, u64)>,
@@ -361,7 +361,7 @@ impl LustroPrngBatchSnapshot {
 }
 
 /// Serialized XOF batch state.
-/// Debug output is redacted; lanes hold secret-derived state, same as `Seed256`.
+/// Debug output is redacted; each lane holds stream state, which continues that stream and its forks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LustroXofBatchSnapshot {
     lanes: Vec<(u128, u128, u64)>,

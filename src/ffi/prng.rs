@@ -14,7 +14,7 @@ use super::{batch_status, construct, derive_path_status, guarded};
 // ==========================================
 
 /// Creates a PRNG context from a 32-byte seed and 128-bit stream ID.
-/// `stream_id` is passed as `(hi, lo)` u64 values.
+/// `stream_id` is passed as `(hi, lo)` u64 values, `hi` being the upper 64 bits.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `seed`.
 ///
@@ -34,6 +34,47 @@ pub unsafe extern "C" fn lustro_prng_new(
         let stream_id = ((stream_id_hi as u128) << 64) | (stream_id_lo as u128);
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
         Ok(LustroPrng::new(&seed256, StreamId(stream_id)))
+    })
+}
+
+/// Fills `out_seed` with 32 bytes from the operating system's entropy source.
+/// Returns `InvalidPointer` for a null `out_seed`. If the source is unavailable it returns
+/// `EntropyUnavailable` and `out_seed` is not written.
+///
+/// # Safety
+/// If `out_seed` is non-null, it must be valid for 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_seed_from_entropy(out_seed: *mut u8) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        let Some(out) = buf_out(out_seed, 32) else {
+            return LustroError::InvalidPointer;
+        };
+        match Seed256::from_entropy() {
+            Ok(seed) => {
+                out.copy_from_slice(seed.as_ref());
+                LustroError::Ok
+            }
+            Err(_) => LustroError::EntropyUnavailable,
+        }
+    })
+}
+
+/// As `lustro_prng_new`, with the seed taken from the operating system's entropy source.
+/// Stores the new context in `*out_ctx` (null on failure). Returns `InvalidPointer` for a
+/// null or misaligned `out_ctx`, `EntropyUnavailable` if the entropy source is unavailable.
+///
+/// # Safety
+/// If `out_ctx` is non-null, it must be valid for writing one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_from_entropy(
+    stream_id_hi: u64,
+    stream_id_lo: u64,
+    out_ctx: *mut *mut LustroPrng,
+) -> LustroError {
+    construct(out_ctx, || {
+        let stream_id = ((stream_id_hi as u128) << 64) | (stream_id_lo as u128);
+        let seed = Seed256::from_entropy().map_err(|_| LustroError::EntropyUnavailable)?;
+        Ok(LustroPrng::new(&seed, StreamId(stream_id)))
     })
 }
 
@@ -94,7 +135,8 @@ pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u6
     })
 }
 
-/// Returns the next 128 random bits as 16 bytes (LE).
+/// Returns the next 128 random bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+/// into `(hi, lo)`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -171,6 +213,66 @@ pub unsafe extern "C" fn lustro_prng_fill(
     })
 }
 
+/// Skips `n` bytes: the same state as `lustro_prng_fill` of `n` bytes, without writing them.
+/// Costs O(n); there is no jump-ahead.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroPrng` context and
+/// be exclusively accessible for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_advance_bytes(ctx: *mut LustroPrng, n: u64) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        (*ctx).advance_bytes(n);
+        LustroError::Ok
+    })
+}
+
+/// Skips `n` blocks: the same state as `n` calls of `lustro_prng_next_block`. Unread bytes of
+/// the current block are discarded first (for `n > 0`); `n == 0` changes nothing.
+/// Costs O(n); there is no jump-ahead.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroPrng` context and
+/// be exclusively accessible for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_advance_blocks(ctx: *mut LustroPrng, n: u64) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        (*ctx).advance_blocks(n);
+        LustroError::Ok
+    })
+}
+
+/// Writes the bytes taken from the start of the stream as 16 bytes (LE); see
+/// `lustro_u128_to_parts`. Bytes discarded by `lustro_prng_next_block` and
+/// `lustro_prng_advance_blocks` count as taken. A fresh stream and a fork start at 0;
+/// an imported snapshot continues from its own position. The value is meaningless after
+/// 2^64 blocks, when the block counter wraps.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroPrng` context that
+/// is not mutably accessed or freed during the call.
+/// `out` must be valid for 16 writable bytes and must not overlap the context.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_prng_position(ctx: *const LustroPrng, out: *mut u8) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let output = match buf_out(out, 16) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        output.copy_from_slice(&(*ctx).position().to_le_bytes());
+        LustroError::Ok
+    })
+}
+
 /// Clones the PRNG context and returns a new independent instance.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -194,6 +296,7 @@ pub unsafe extern "C" fn lustro_prng_clone(
 }
 
 /// Derives a child PRNG from the current state and 128-bit identifier.
+/// The read position inside the current block does not affect the child.
 /// `id` is passed as `(hi, lo)` u64 values.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -252,6 +355,8 @@ pub unsafe extern "C" fn lustro_prng_derive_path(
 
 /// Exports the current PRNG snapshot into `out`.
 /// `out` must provide at least 56 writable bytes.
+/// The snapshot holds the full stream state: whoever has it can reproduce the rest of the
+/// stream and its forks. Keep it as private as the seed.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
@@ -510,7 +615,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
 /// `n` must equal the batch length.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
-/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+/// `n` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
 /// identifiers or the lane buffer cannot be allocated.
 ///
 /// # Safety
@@ -546,7 +651,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
 /// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
-/// `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
+/// `k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
 /// `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
 ///
 /// # Safety
@@ -660,6 +765,8 @@ pub unsafe extern "C" fn lustro_prng_batch_snapshot_size(ctx: *const LustroPrngB
 
 /// Exports the current batch snapshot.
 /// `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`.
+/// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
+/// stream and its forks. Keep it as private as the seed.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context

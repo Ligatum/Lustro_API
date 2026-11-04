@@ -90,6 +90,18 @@ impl Caps {
             avx2: Avx2Cap::detect(),
         }
     }
+
+    // True if a SIMD backend can run on this CPU.
+    pub(crate) fn has_simd(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.avx2.is_some()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
 }
 
 // Backend for a workload of `n` lanes.
@@ -103,7 +115,7 @@ pub(super) fn choose_backend(caps: Caps, n: usize) -> Backend {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn choose_backend(_caps: Caps, _n: usize) -> Backend {
+pub(super) fn choose_backend(_caps: Caps, _n: usize) -> Backend {
     Backend::Scalar
 }
 

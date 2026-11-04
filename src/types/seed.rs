@@ -1,6 +1,6 @@
 //! Lustro V1 — seed material.
 
-/// 256-bit seed or key material.
+/// 256-bit seed.
 /// Debug output is redacted; `Copy` is intentional.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Seed256(pub [u8; 32]);

@@ -48,6 +48,19 @@ pub(super) fn get_or_init_pool() -> Option<&'static rayon::ThreadPool> {
     RAYON_POOL.get().and_then(|opt| opt.as_ref())
 }
 
+// True if the pool is built and this process may use it. Does not start the pool.
+pub(super) fn pool_usable() -> bool {
+    #[cfg(feature = "parallel")]
+    {
+        POOL_OWNER.load(Ordering::Acquire) == std::process::id()
+            && matches!(RAYON_POOL.get(), Some(Some(_)))
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        false
+    }
+}
+
 // Runs `f(start, chunk)` over `items` in chunks on the Rayon pool when `items` has at least
 // `min_total` elements and the process settings allow threads; otherwise once on the calling
 // thread over the whole slice. `f` must not call into Python.

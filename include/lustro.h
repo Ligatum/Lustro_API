@@ -19,10 +19,40 @@ typedef enum {
 	LUSTRO_ERROR_INVALID_KIND         = 8,
 	LUSTRO_ERROR_INVALID_CURSOR       = 9,
 	LUSTRO_ERROR_OUT_OF_MEMORY        = 10,
-	/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane */
+	/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane;
+	 * 13: the entropy functions */
 	LUSTRO_ERROR_ALREADY_CONFIGURED   = 11,
-	LUSTRO_ERROR_INVALID_ARGUMENT     = 12
+	LUSTRO_ERROR_INVALID_ARGUMENT     = 12,
+	LUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13
 } LustroError;
+
+/*
+ * 128-bit values.
+ * Inputs (stream IDs) are passed as two uint64_t: `hi` (upper 64 bits) first, then `lo`.
+ * Arrays of IDs are parallel arrays `*_hi` and `*_lo` of the same length.
+ * Outputs (`lustro_*_next_u128`) are 16 bytes, little-endian: byte 0 is the lowest
+ * byte of `lo`, byte 15 the highest byte of `hi`.
+ * The two helpers below convert between the forms. They do not depend on the host
+ * byte order and do not check their pointers.
+ */
+static inline void lustro_u128_from_parts(uint64_t hi, uint64_t lo, uint8_t out[16])
+{
+	for (int i = 0; i < 8; i++) {
+		out[i] = (uint8_t)(lo >> (8 * i));
+		out[8 + i] = (uint8_t)(hi >> (8 * i));
+	}
+}
+
+static inline void lustro_u128_to_parts(const uint8_t in[16], uint64_t *hi, uint64_t *lo)
+{
+	uint64_t h = 0, l = 0;
+	for (int i = 7; i >= 0; i--) {
+		l = (l << 8) | in[i];
+		h = (h << 8) | in[8 + i];
+	}
+	*hi = h;
+	*lo = l;
+}
 
 /**
  * Seed length in bytes.
@@ -99,6 +129,46 @@ typedef struct LustroXof LustroXof;
  */
 typedef struct LustroXofBatch LustroXofBatch;
 
+/**
+ * Execution settings of this process, as returned by `lustro_runtime_info` and
+ * `lustro_runtime_preview`. Same fields as `RuntimeInfo` in Rust. Flags are 0 or 1.
+ * The caller passes `sizeof` of this struct to those functions, so that fields added
+ * later do not overflow a struct built from an older header.
+ */
+typedef struct LustroRuntimeInfo {
+  /**
+   * Configured pool size, not a count of active workers. 0 = batches run on the
+   * calling thread.
+   */
+  uintptr_t threads;
+  /**
+   * Logical CPUs available to the process, detected at the call.
+   */
+  uintptr_t logical_cpus;
+  /**
+   * Backend for batches: "scalar" or "avx2". Static NUL-terminated string, never NULL,
+   * do not free.
+   */
+  const char *backend;
+  /**
+   * 1 if the settings are fixed. Always 1 from `lustro_runtime_info`; 0 is possible
+   * only from `lustro_runtime_preview`.
+   */
+  uint8_t fixed;
+  /**
+   * 1 if built with the `parallel` feature.
+   */
+  uint8_t parallel_built;
+  /**
+   * 1 if the CPU has the SIMD instructions the crate uses (AVX2 today).
+   */
+  uint8_t simd_available;
+  /**
+   * 1 if the pool is built and this process can use it.
+   */
+  uint8_t pool_usable;
+} LustroRuntimeInfo;
+
 uint32_t lustro_api_version(void);
 
 /**
@@ -116,14 +186,38 @@ uintptr_t lustro_runtime_threads(void);
 const char *lustro_runtime_backend(void);
 
 /**
+ * Stores the execution settings of this process in `*out`. Like `runtime_info()` in Rust,
+ * this fixes the settings if they are not fixed yet (see `lustro_configure`), so `fixed`
+ * is 1. Does not start the pool.
+ *
+ * `out_size` is `sizeof(LustroRuntimeInfo)`. Only the fields that fit in it are written,
+ * so a library newer than the header leaves the extra fields alone. Returns
+ * `InvalidPointer` for a null or misaligned `out`, `InvalidLength` if `out_size` is
+ * smaller than the first layout of the struct.
+ *
+ * # Safety
+ * If `out` is non-null, it must be valid for writing `out_size` bytes.
+ */
+LustroError lustro_runtime_info(struct LustroRuntimeInfo *out, uintptr_t out_size);
+
+/**
+ * As `lustro_runtime_info`, but fixes nothing. Settings not yet fixed come from the
+ * environment as it is now (`fixed` is 0) and may differ from the ones fixed later.
+ * A snapshot: it can be stale on return. Does not start the pool.
+ *
+ * # Safety
+ * If `out` is non-null, it must be valid for writing `out_size` bytes.
+ */
+LustroError lustro_runtime_preview(struct LustroRuntimeInfo *out, uintptr_t out_size);
+
+/**
  * Sets threads and SIMD for this process, before first use. `threads`: 0 = not set,
  * 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
  * `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
  *
- * Fixed once, by an earlier call, a batch call, `*_batch_suggested_steps` or
- * `lustro_runtime_*`. Later calls
- * return `ALREADY_CONFIGURED`, also with identical arguments. Unknown `simd` returns
- * `INVALID_ARGUMENT` and changes nothing.
+ * Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. A later call returns
+ * `Ok` if the arguments give the same settings as the fixed ones, else
+ * `AlreadyConfigured`. Unknown `simd` returns `InvalidArgument` and changes nothing.
  */
 LustroError lustro_configure(uintptr_t threads, int32_t simd);
 
@@ -224,7 +318,7 @@ LustroError lustro_hash128_many_var(const uint8_t *const *message_ptrs,
 
 /**
  * Creates a PRNG context from a 32-byte seed and 128-bit stream ID.
- * `stream_id` is passed as `(hi, lo)` u64 values.
+ * `stream_id` is passed as `(hi, lo)` u64 values, `hi` being the upper 64 bits.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `seed`.
  *
@@ -237,6 +331,28 @@ LustroError lustro_prng_new(const uint8_t *seed,
                             uint64_t stream_id_hi,
                             uint64_t stream_id_lo,
                             struct LustroPrng **out_ctx);
+
+/**
+ * Fills `out_seed` with 32 bytes from the operating system's entropy source.
+ * Returns `InvalidPointer` for a null `out_seed`. If the source is unavailable it returns
+ * `EntropyUnavailable` and `out_seed` is not written.
+ *
+ * # Safety
+ * If `out_seed` is non-null, it must be valid for 32 writable bytes.
+ */
+LustroError lustro_seed_from_entropy(uint8_t *out_seed);
+
+/**
+ * As `lustro_prng_new`, with the seed taken from the operating system's entropy source.
+ * Stores the new context in `*out_ctx` (null on failure). Returns `InvalidPointer` for a
+ * null or misaligned `out_ctx`, `EntropyUnavailable` if the entropy source is unavailable.
+ *
+ * # Safety
+ * If `out_ctx` is non-null, it must be valid for writing one pointer.
+ */
+LustroError lustro_prng_from_entropy(uint64_t stream_id_hi,
+                                     uint64_t stream_id_lo,
+                                     struct LustroPrng **out_ctx);
 
 /**
  * Frees a PRNG context. Passing null is safe (no-op).
@@ -271,7 +387,8 @@ LustroError lustro_prng_next_u32(struct LustroPrng *ctx, uint32_t *out);
 LustroError lustro_prng_next_u64(struct LustroPrng *ctx, uint64_t *out);
 
 /**
- * Returns the next 128 random bits as 16 bytes (LE).
+ * Returns the next 128 random bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+ * into `(hi, lo)`.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -302,6 +419,41 @@ LustroError lustro_prng_next_block(struct LustroPrng *ctx, uint8_t *out);
 LustroError lustro_prng_fill(struct LustroPrng *ctx, uint8_t *out, uintptr_t out_len);
 
 /**
+ * Skips `n` bytes: the same state as `lustro_prng_fill` of `n` bytes, without writing them.
+ * Costs O(n); there is no jump-ahead.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ */
+LustroError lustro_prng_advance_bytes(struct LustroPrng *ctx, uint64_t n);
+
+/**
+ * Skips `n` blocks: the same state as `n` calls of `lustro_prng_next_block`. Unread bytes of
+ * the current block are discarded first (for `n > 0`); `n == 0` changes nothing.
+ * Costs O(n); there is no jump-ahead.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context and
+ * be exclusively accessible for the duration of the call.
+ */
+LustroError lustro_prng_advance_blocks(struct LustroPrng *ctx, uint64_t n);
+
+/**
+ * Writes the bytes taken from the start of the stream as 16 bytes (LE); see
+ * `lustro_u128_to_parts`. Bytes discarded by `lustro_prng_next_block` and
+ * `lustro_prng_advance_blocks` count as taken. A fresh stream and a fork start at 0;
+ * an imported snapshot continues from its own position. The value is meaningless after
+ * 2^64 blocks, when the block counter wraps.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
+ * `out` must be valid for 16 writable bytes and must not overlap the context.
+ */
+LustroError lustro_prng_position(const struct LustroPrng *ctx, uint8_t *out);
+
+/**
  * Clones the PRNG context and returns a new independent instance.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -316,6 +468,7 @@ LustroError lustro_prng_clone(const struct LustroPrng *ctx, struct LustroPrng **
 
 /**
  * Derives a child PRNG from the current state and 128-bit identifier.
+ * The read position inside the current block does not affect the child.
  * `id` is passed as `(hi, lo)` u64 values.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -354,6 +507,8 @@ LustroError lustro_prng_derive_path(const uint8_t *seed,
 /**
  * Exports the current PRNG snapshot into `out`.
  * `out` must provide at least 56 writable bytes.
+ * The snapshot holds the full stream state: whoever has it can reproduce the rest of the
+ * stream and its forks. Keep it as private as the seed.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrng` context that
@@ -498,7 +653,7 @@ LustroError lustro_prng_batch_fill_blocks(struct LustroPrngBatch *ctx,
  * `n` must equal the batch length.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
- * `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+ * `n` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
  * identifiers or the lane buffer cannot be allocated.
  *
  * # Safety
@@ -521,7 +676,7 @@ LustroError lustro_prng_batch_fork(const struct LustroPrngBatch *ctx,
  * IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
- * `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
+ * `k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
  * `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
  *
  * # Safety
@@ -596,6 +751,8 @@ uintptr_t lustro_prng_batch_snapshot_size(const struct LustroPrngBatch *ctx);
 /**
  * Exports the current batch snapshot.
  * `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`.
+ * The snapshot holds every lane's state: whoever has it can reproduce the rest of each
+ * stream and its forks. Keep it as private as the seed.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
@@ -671,7 +828,8 @@ LustroError lustro_xof_next_u32(struct LustroXof *ctx, uint32_t *out);
 LustroError lustro_xof_next_u64(struct LustroXof *ctx, uint64_t *out);
 
 /**
- * Returns the next 128 output bits as 16 bytes (LE).
+ * Returns the next 128 output bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+ * into `(hi, lo)`.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -702,6 +860,41 @@ LustroError lustro_xof_next_block(struct LustroXof *ctx, uint8_t *out);
 LustroError lustro_xof_fill(struct LustroXof *ctx, uint8_t *out, uintptr_t out_len);
 
 /**
+ * Skips `n` bytes: the same state as `lustro_xof_fill` of `n` bytes, without writing them.
+ * Costs O(n); there is no jump-ahead.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ */
+LustroError lustro_xof_advance_bytes(struct LustroXof *ctx, uint64_t n);
+
+/**
+ * Skips `n` blocks: the same state as `n` calls of `lustro_xof_next_block`. Unread bytes of
+ * the current block are discarded first (for `n > 0`); `n == 0` changes nothing.
+ * Costs O(n); there is no jump-ahead.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context and
+ * be exclusively accessible for the duration of the call.
+ */
+LustroError lustro_xof_advance_blocks(struct LustroXof *ctx, uint64_t n);
+
+/**
+ * Writes the bytes taken from the start of the stream as 16 bytes (LE); see
+ * `lustro_u128_to_parts`. Bytes discarded by `lustro_xof_next_block` and
+ * `lustro_xof_advance_blocks` count as taken. A fresh stream and a fork start at 0;
+ * an imported snapshot continues from its own position. The value is meaningless after
+ * 2^64 blocks, when the block counter wraps.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
+ * `out` must be valid for 16 writable bytes and must not overlap the context.
+ */
+LustroError lustro_xof_position(const struct LustroXof *ctx, uint8_t *out);
+
+/**
  * Clones the XOF context and returns a new independent instance.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -716,6 +909,7 @@ LustroError lustro_xof_clone(const struct LustroXof *ctx, struct LustroXof **out
 
 /**
  * Derives a child XOF from the current state and 128-bit identifier.
+ * The read position inside the current block does not affect the child.
  * `id` is passed as `(hi, lo)` u64 values.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -755,6 +949,8 @@ LustroError lustro_xof_derive_path(const uint8_t *message,
 /**
  * Exports the current XOF snapshot into `out`.
  * `out` must provide at least 56 writable bytes.
+ * The snapshot holds the full stream state: whoever has it can reproduce the rest of the
+ * stream and its forks. Keep it as private as the seed.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXof` context that
@@ -881,7 +1077,7 @@ LustroError lustro_xof_batch_fill_blocks(struct LustroXofBatch *ctx,
  * `n` must equal the batch length.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
- * `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+ * `n` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
  * identifiers or the lane buffer cannot be allocated.
  *
  * # Safety
@@ -904,7 +1100,7 @@ LustroError lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
  * IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
- * `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
+ * `k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
  * `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
  *
  * # Safety
@@ -980,6 +1176,8 @@ uintptr_t lustro_xof_batch_snapshot_size(const struct LustroXofBatch *ctx);
 /**
  * Exports the current batch snapshot.
  * `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`.
+ * The snapshot holds every lane's state: whoever has it can reproduce the rest of each
+ * stream and its forks. Keep it as private as the seed.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context

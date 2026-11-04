@@ -17,7 +17,7 @@ pub fn lustro_api_version() -> u32 {
 ///
 /// The values follow the environment (`LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`,
 /// `LUSTRO_NUM_THREADS`), which is read once at the first use of the dispatcher;
-/// this call counts as a use. `threads` is the configured pool size, not a count of
+/// this call counts as a use (see [`runtime_preview`] for a look that does not). `threads` is the configured pool size, not a count of
 /// running workers: the pool is not started here and may fail to start, and batches then
 /// run on the calling thread. A child forked after its parent first used the pool also
 /// runs on the calling thread; one forked before that may start its own pool.
@@ -25,12 +25,22 @@ pub fn runtime_info() -> crate::types::RuntimeInfo {
     crate::dispatch::runtime_info()
 }
 
+/// As [`runtime_info`], but fixes nothing. Settings not yet fixed come from the environment
+/// as it is now (`fixed` is `false`) and may differ from the ones fixed later; once fixed,
+/// the result is the same as from `runtime_info`. A snapshot: it can be stale on return.
+/// Does not start the pool.
+pub fn runtime_preview() -> crate::types::RuntimeInfo {
+    crate::dispatch::runtime_preview()
+}
+
 /// Sets the execution settings of this process before first use. A field that is set
 /// replaces the matching environment variables, an unset one follows them.
 ///
-/// Fixed once, by an earlier call, a batch call, `suggested_steps()` or `runtime_info()`.
-/// Later calls return [`ConfigError::AlreadyConfigured`], also with identical options.
-/// When calls race, one wins.
+/// Fixed once, by an earlier call, a batch call or `runtime_info()`. A later call returns
+/// `Ok` if the requested settings give the same result as the fixed ones (also when
+/// the first use fixed them, and for a `threads` above the CPU count), else
+/// [`ConfigError::AlreadyConfigured`]. When calls race, one wins and the others are
+/// compared with it.
 ///
 /// `threads` is a pool limit. Without `parallel` the options are accepted and
 /// `runtime_info().threads` stays 0.
@@ -251,6 +261,14 @@ pub(crate) fn absorb_hash128_var_raw_into(
 // INTERNAL PRNG API
 // ==========================================
 
+// Error of `read_to_end` / `read_to_string` on a stream: they would read until memory runs out.
+pub(crate) fn unbounded_read_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "the stream has no end; bound the read, for example with take",
+    )
+}
+
 // Shared PRNG stream state and buffer management.
 #[derive(Clone)]
 pub(crate) struct StreamState {
@@ -353,6 +371,50 @@ impl StreamState {
         out[..16].copy_from_slice(&self.s0.to_le_bytes());
         out[16..].copy_from_slice(&self.s1.to_le_bytes());
         out
+    }
+
+    // Same state as `fill_bytes` of `n` bytes, without writing them.
+    pub(crate) fn advance_bytes(&mut self, mut n: u64) {
+        if self.cursor < 32 {
+            let avail = u64::from(32 - self.cursor);
+            if n <= avail {
+                self.cursor += n as u8;
+                return;
+            }
+            n -= avail;
+            self.cursor = 32;
+        }
+        if n == 0 {
+            return;
+        }
+        for _ in 0..n / 32 {
+            self.refill();
+        }
+        let rem = (n % 32) as u8;
+        if rem > 0 {
+            self.refill();
+            self.cursor = rem;
+        } else {
+            self.cursor = 32;
+        }
+    }
+
+    // Same state as `n` calls of `read_full_block`.
+    pub(crate) fn advance_blocks(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        for _ in 0..n {
+            self.refill();
+        }
+        self.cursor = 32;
+    }
+
+    // Bytes taken from the start, with the discarded rest of a block counted as taken.
+    // `from_parts` accepts step 0 with cursor < 32: that gives 0, not underflow.
+    #[inline]
+    pub(crate) fn position(&self) -> u128 {
+        (u128::from(self.step) * 32 + u128::from(self.cursor)).saturating_sub(32)
     }
 
     // Derives a stream from the current state and identifier.

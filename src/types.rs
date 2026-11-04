@@ -7,7 +7,7 @@ mod seed;
 mod snapshot;
 
 pub use batch::{BatchError, DerivePathError};
-pub use digest::{Hash128, Hash256};
+pub use digest::{Hash128, Hash256, ParseHashError};
 pub use runtime::{ConfigError, RuntimeInfo, RuntimeOptions};
 #[cfg(feature = "entropy")]
 pub use seed::EntropyError;
@@ -37,6 +37,27 @@ impl StreamId {
     #[inline]
     pub fn get(self) -> u128 {
         self.0
+    }
+}
+
+impl From<u8> for StreamId {
+    #[inline]
+    fn from(id: u8) -> Self {
+        Self(id as u128)
+    }
+}
+
+impl From<u16> for StreamId {
+    #[inline]
+    fn from(id: u16) -> Self {
+        Self(id as u128)
+    }
+}
+
+impl From<u32> for StreamId {
+    #[inline]
+    fn from(id: u32) -> Self {
+        Self(id as u128)
     }
 }
 

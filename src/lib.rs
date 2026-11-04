@@ -9,15 +9,19 @@ mod core;
 #[cfg(target_arch = "x86_64")]
 mod core_avx2;
 mod dispatch;
-pub use api::{configure, lustro_api_version, runtime_info};
+pub use api::{configure, lustro_api_version, runtime_info, runtime_preview};
 pub use hash::{
-    hash128, hash128_many_fixed_into, hash128_many_var, hash128_many_var_into, hash256,
-    hash256_many_fixed_into, hash256_many_var, hash256_many_var_into,
+    hash128, hash128_many_fixed, hash128_many_fixed_into, hash128_many_var, hash128_many_var_into,
+    hash256, hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into,
 };
 pub use prng::{LustroPrng, LustroPrngBatch};
 #[cfg(feature = "entropy")]
 pub use types::EntropyError;
-pub use types::{ConfigError, Hash128, Hash256, RuntimeInfo, RuntimeOptions, Seed256, StreamId};
+pub use types::{
+    BatchError, ConfigError, DerivePathError, Hash128, Hash256, LustroPrngBatchSnapshot,
+    LustroPrngSnapshot, LustroXofBatchSnapshot, LustroXofSnapshot, ParseHashError, RuntimeInfo,
+    RuntimeOptions, Seed256, SnapshotError, SnapshotKind, StreamId,
+};
 pub use xof::{LustroXof, LustroXofBatch};
 
 pub mod hash;
@@ -59,6 +63,7 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::xof::LustroXofBatchPy>()?;
     m.add_function(wrap_pyfunction!(python::lustro_api_version, m)?)?;
     m.add_function(wrap_pyfunction!(python::runtime_info, m)?)?;
+    m.add_function(wrap_pyfunction!(python::runtime_preview, m)?)?;
     m.add_function(wrap_pyfunction!(python::configure, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SEED_LEN", types::LUSTRO_SEED_LEN)?;

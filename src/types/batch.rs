@@ -38,6 +38,8 @@ pub enum BatchError {
     SizeOverflow,
     /// Reserving a buffer failed (allocator refusal or capacity overflow).
     Reserve(std::collections::TryReserveError),
+    /// The number of identifiers given to `try_fork` differs from the batch length.
+    LengthMismatch { expected: usize, actual: usize },
 }
 
 impl core::fmt::Display for BatchError {
@@ -45,6 +47,9 @@ impl core::fmt::Display for BatchError {
         match self {
             BatchError::SizeOverflow => write!(f, "size overflows usize"),
             BatchError::Reserve(_) => write!(f, "buffer reservation failed"),
+            BatchError::LengthMismatch { expected, actual } => {
+                write!(f, "expected {expected} identifiers, got {actual}")
+            }
         }
     }
 }
@@ -52,7 +57,7 @@ impl core::fmt::Display for BatchError {
 impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            BatchError::SizeOverflow => None,
+            BatchError::SizeOverflow | BatchError::LengthMismatch { .. } => None,
             BatchError::Reserve(e) => Some(e),
         }
     }

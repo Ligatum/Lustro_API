@@ -93,7 +93,8 @@ pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64)
     })
 }
 
-/// Returns the next 128 output bits as 16 bytes (LE).
+/// Returns the next 128 output bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+/// into `(hi, lo)`.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -172,6 +173,66 @@ pub unsafe extern "C" fn lustro_xof_fill(
     })
 }
 
+/// Skips `n` bytes: the same state as `lustro_xof_fill` of `n` bytes, without writing them.
+/// Costs O(n); there is no jump-ahead.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_advance_bytes(ctx: *mut LustroXof, n: u64) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        (*ctx).advance_bytes(n);
+        LustroError::Ok
+    })
+}
+
+/// Skips `n` blocks: the same state as `n` calls of `lustro_xof_next_block`. Unread bytes of
+/// the current block are discarded first (for `n > 0`); `n == 0` changes nothing.
+/// Costs O(n); there is no jump-ahead.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context and
+/// be exclusively accessible for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_advance_blocks(ctx: *mut LustroXof, n: u64) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        (*ctx).advance_blocks(n);
+        LustroError::Ok
+    })
+}
+
+/// Writes the bytes taken from the start of the stream as 16 bytes (LE); see
+/// `lustro_u128_to_parts`. Bytes discarded by `lustro_xof_next_block` and
+/// `lustro_xof_advance_blocks` count as taken. A fresh stream and a fork start at 0;
+/// an imported snapshot continues from its own position. The value is meaningless after
+/// 2^64 blocks, when the block counter wraps.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
+/// `out` must be valid for 16 writable bytes and must not overlap the context.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_position(ctx: *const LustroXof, out: *mut u8) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let output = match buf_out(out, 16) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        output.copy_from_slice(&(*ctx).position().to_le_bytes());
+        LustroError::Ok
+    })
+}
+
 /// Clones the XOF context and returns a new independent instance.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -195,6 +256,7 @@ pub unsafe extern "C" fn lustro_xof_clone(
 }
 
 /// Derives a child XOF from the current state and 128-bit identifier.
+/// The read position inside the current block does not affect the child.
 /// `id` is passed as `(hi, lo)` u64 values.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx`.
@@ -253,6 +315,8 @@ pub unsafe extern "C" fn lustro_xof_derive_path(
 
 /// Exports the current XOF snapshot into `out`.
 /// `out` must provide at least 56 writable bytes.
+/// The snapshot holds the full stream state: whoever has it can reproduce the rest of the
+/// stream and its forks. Keep it as private as the seed.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
@@ -483,7 +547,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
 /// `n` must equal the batch length.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
-/// `n`/`k` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
+/// `n` is nonzero), `InvalidLength` if `n` differs from the batch length, `OutOfMemory` if the
 /// identifiers or the lane buffer cannot be allocated.
 ///
 /// # Safety
@@ -519,7 +583,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
 /// IDs are passed as parallel `(hi, lo)` u64 arrays, one per child (length `k`).
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
-/// `n`/`k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
+/// `k` is nonzero), `InvalidLength` if `len() * k` overflows or `k` is too large to address,
 /// `OutOfMemory` if the identifiers or the lane buffer cannot be reserved.
 ///
 /// # Safety
@@ -632,6 +696,8 @@ pub unsafe extern "C" fn lustro_xof_batch_snapshot_size(ctx: *const LustroXofBat
 
 /// Exports the current batch snapshot.
 /// `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`.
+/// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
+/// stream and its forks. Keep it as private as the seed.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context

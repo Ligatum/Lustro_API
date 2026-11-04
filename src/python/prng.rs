@@ -46,6 +46,19 @@ impl LustroPrngPy {
         })
     }
 
+    /// Stream `stream_id` (default 0) of a seed taken from the operating system's entropy
+    /// source. The seed is not kept, so the stream cannot be reproduced; take a seed from
+    /// `os.urandom(32)` to keep it. `OSError` if the source is unavailable.
+    #[staticmethod]
+    #[pyo3(signature = (stream_id=0))]
+    pub fn from_entropy(#[pyo3(from_py_with = u128_arg)] stream_id: u128) -> PyResult<Self> {
+        let seed = Seed256::from_entropy()
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner: LustroPrng::new(&seed, StreamId(stream_id)),
+        })
+    }
+
     /// Next 4 bytes of the stream as an unsigned integer.
     pub fn next_u32(&mut self) -> u32 {
         self.inner.next_u32()
@@ -64,6 +77,25 @@ impl LustroPrngPy {
     /// Next full 32-byte block. Unread bytes of the current block are discarded.
     pub fn next_block<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.inner.next_block())
+    }
+
+    /// Skips `n` bytes, as `fill(n)` would, without building them. Costs O(n); the GIL is
+    /// released. `n` must fit in 64 bits (OverflowError otherwise, also for negative).
+    pub fn advance_bytes(&mut self, py: Python<'_>, n: u64) {
+        py.detach(|| self.inner.advance_bytes(n));
+    }
+
+    /// Skips `n` blocks, as `n` calls of `next_block()` would. Costs O(n); the GIL is
+    /// released. `n` must fit in 64 bits (OverflowError otherwise, also for negative).
+    pub fn advance_blocks(&mut self, py: Python<'_>, n: u64) {
+        py.detach(|| self.inner.advance_blocks(n));
+    }
+
+    /// Bytes taken from the start of the stream. Bytes discarded by `next_block()` and
+    /// `advance_blocks()` count as taken. A fork starts at 0, an imported snapshot continues
+    /// from its own position.
+    pub fn position(&self) -> u128 {
+        self.inner.position()
     }
 
     /// Returns the next `size` bytes of the stream. The GIL is released while generating.
@@ -153,7 +185,8 @@ impl LustroPrngPy {
     }
 
     /// Derives a child generator from the current state and `id`.
-    /// The parent is not advanced.
+    /// The parent is not advanced. The read position inside the current block does not
+    /// affect the child.
     pub fn fork(&self, #[pyo3(from_py_with = u128_arg)] id: u128) -> Self {
         Self {
             inner: self.inner.fork(StreamId(id)),
@@ -190,7 +223,9 @@ impl LustroPrngPy {
         "LustroPrng(<redacted>)".to_string()
     }
 
-    /// Exports the current state as 56 bytes.
+    /// Exports the current state as 56 bytes. The snapshot holds the full stream state:
+    /// whoever has it can reproduce the rest of the stream and its forks. Keep it as private
+    /// as the seed.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
         PyBytes::new(py, &snapshot.to_le_bytes())
@@ -231,6 +266,26 @@ impl LustroPrngPy {
 pub struct LustroPrngBatchPy {
     inner: LustroPrngBatch,
     blocks_buf: Vec<[u8; 32]>,
+}
+
+/// Iterator returned by `iter(LustroPrngBatch)`.
+#[pyclass(name = "LustroPrngBatchIter", module = "lustro")]
+pub struct LustroPrngBatchIterPy {
+    inner: LustroPrngBatch,
+    next: usize,
+}
+
+#[pymethods]
+impl LustroPrngBatchIterPy {
+    pub fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    pub fn __next__(&mut self) -> Option<LustroPrngPy> {
+        let inner = self.inner.lane(self.next)?;
+        self.next += 1;
+        Some(LustroPrngPy { inner })
+    }
 }
 
 #[pymethods]
@@ -294,6 +349,24 @@ impl LustroPrngBatchPy {
         self.inner.len()
     }
 
+    /// `self[i]` is `self.lane(i)`; a negative `i` counts from the end, as in a list.
+    /// Raises IndexError if `i` is out of range, TypeError for a slice.
+    pub fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<LustroPrngPy> {
+        let index = crate::python::item_index(index)?;
+        self.lane(crate::python::lane_index(index, self.inner.len())?)
+    }
+
+    /// Iterates over the lanes in order, each as `lane(i)` would return it. The iterator
+    /// works on a copy of the lane states taken here: later calls on the batch do not
+    /// affect it. Raises MemoryError if the lanes cannot be allocated.
+    pub fn __iter__(&self) -> PyResult<LustroPrngBatchIterPy> {
+        let inner = self
+            .inner
+            .try_clone()
+            .map_err(|_| crate::python::alloc_error())?;
+        Ok(LustroPrngBatchIterPy { inner, next: 0 })
+    }
+
     // Length only; stream state is not printed.
     pub fn __repr__(&self) -> String {
         format!("LustroPrngBatch(len={})", self.inner.len())
@@ -331,7 +404,8 @@ impl LustroPrngBatchPy {
 
     /// Returns lane `i` as an independent LustroPrng, positioned at the lane's next block.
     /// The batch is not advanced and later calls on it do not affect the copy.
-    /// Raises IndexError if `i >= len(self)`; a negative `i` raises OverflowError.
+    /// Raises IndexError if `i >= len(self)`; a negative `i` raises OverflowError
+    /// (`self[i]` accepts negative indexes).
     pub fn lane(&self, i: usize) -> PyResult<LustroPrngPy> {
         self.inner
             .lane(i)
@@ -565,7 +639,9 @@ impl LustroPrngBatchPy {
         })
     }
 
-    /// Exports the current state as `16 + len(self) * 48` bytes.
+    /// Exports the current state as `16 + len(self) * 48` bytes. The snapshot holds every
+    /// lane's state: whoever has it can reproduce the rest of each stream and its forks. Keep
+    /// it as private as the seed.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let snapshot = self.inner.export_snapshot();
         PyBytes::new(py, &snapshot.to_le_bytes())

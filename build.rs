@@ -52,10 +52,40 @@ fn generate_header() {
          \tLUSTRO_ERROR_INVALID_KIND         = 8,\n\
          \tLUSTRO_ERROR_INVALID_CURSOR       = 9,\n\
          \tLUSTRO_ERROR_OUT_OF_MEMORY        = 10,\n\
-         \t/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane */\n\
+         \t/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane;\n\
+         \t * 13: the entropy functions */\n\
          \tLUSTRO_ERROR_ALREADY_CONFIGURED   = 11,\n\
-         \tLUSTRO_ERROR_INVALID_ARGUMENT     = 12\n\
-         } LustroError;"
+         \tLUSTRO_ERROR_INVALID_ARGUMENT     = 12,\n\
+         \tLUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13\n\
+         } LustroError;\n\
+         \n\
+         /*\n\
+         \x20* 128-bit values.\n\
+         \x20* Inputs (stream IDs) are passed as two uint64_t: `hi` (upper 64 bits) first, then `lo`.\n\
+         \x20* Arrays of IDs are parallel arrays `*_hi` and `*_lo` of the same length.\n\
+         \x20* Outputs (`lustro_*_next_u128`) are 16 bytes, little-endian: byte 0 is the lowest\n\
+         \x20* byte of `lo`, byte 15 the highest byte of `hi`.\n\
+         \x20* The two helpers below convert between the forms. They do not depend on the host\n\
+         \x20* byte order and do not check their pointers.\n\
+         \x20*/\n\
+         static inline void lustro_u128_from_parts(uint64_t hi, uint64_t lo, uint8_t out[16])\n\
+         {\n\
+         \tfor (int i = 0; i < 8; i++) {\n\
+         \t\tout[i] = (uint8_t)(lo >> (8 * i));\n\
+         \t\tout[8 + i] = (uint8_t)(hi >> (8 * i));\n\
+         \t}\n\
+         }\n\
+         \n\
+         static inline void lustro_u128_to_parts(const uint8_t in[16], uint64_t *hi, uint64_t *lo)\n\
+         {\n\
+         \tuint64_t h = 0, l = 0;\n\
+         \tfor (int i = 7; i >= 0; i--) {\n\
+         \t\tl = (l << 8) | in[i];\n\
+         \t\th = (h << 8) | in[8 + i];\n\
+         \t}\n\
+         \t*hi = h;\n\
+         \t*lo = l;\n\
+         }"
             .to_string(),
     );
     config.trailer = Some(

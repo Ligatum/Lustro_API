@@ -25,6 +25,39 @@ pub fn hash128(data: &[u8]) -> Hash128 {
 // ==========================================
 
 /// CONVENIENCE RUST API.
+/// Hashes the `data.len() / message_len` messages of `message_len` bytes each, stored back to
+/// back in `data`, and returns their 256-bit digests.
+///
+/// Panics if `message_len` is 0 (the message count is undefined, use
+/// `hash256_many_fixed_into`) or if `data.len()` is not a multiple of `message_len`.
+pub fn hash256_many_fixed(data: &[u8], message_len: usize) -> Vec<Hash256> {
+    let mut out = vec![Hash256::default(); fixed_count("hash256_many_fixed", data, message_len)];
+    hash256_many_fixed_into(data, message_len, &mut out);
+    out
+}
+
+/// CONVENIENCE RUST API.
+/// As `hash256_many_fixed`, returning 128-bit digests.
+pub fn hash128_many_fixed(data: &[u8], message_len: usize) -> Vec<Hash128> {
+    let mut out = vec![Hash128::default(); fixed_count("hash128_many_fixed", data, message_len)];
+    hash128_many_fixed_into(data, message_len, &mut out);
+    out
+}
+
+// Message count of `data` split into `message_len` pieces; panics as documented above.
+fn fixed_count(name: &str, data: &[u8], message_len: usize) -> usize {
+    assert!(
+        message_len != 0,
+        "{name}: message_len must not be 0, use the _into variant"
+    );
+    assert!(
+        data.len().is_multiple_of(message_len),
+        "{name}: data.len() must be a multiple of message_len"
+    );
+    data.len() / message_len
+}
+
+/// CONVENIENCE RUST API.
 /// Hashes N independent messages of any lengths and returns N 256-bit digests.
 pub fn hash256_many_var(messages: &[&[u8]]) -> Vec<Hash256> {
     let mut out = vec![Hash256::default(); messages.len()];

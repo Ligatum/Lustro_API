@@ -1,6 +1,6 @@
 //! Lustro V1 — runtime settings and their errors.
 
-/// Execution settings of this process, as configured.
+/// Execution settings of this process, as configured, and what the process can use.
 /// Reading them does not start the thread pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -14,6 +14,21 @@ pub struct RuntimeInfo {
     /// thread (disabled by the settings or built without `parallel`). A nonzero value does
     /// not guarantee a running pool: if it cannot be built, batches run on the calling thread.
     pub threads: usize,
+    /// `true` if the settings are fixed (by `configure`, a batch call or `runtime_info`).
+    /// `false` only from `runtime_preview`: the values then come from the current
+    /// environment and may differ from the ones fixed later.
+    pub fixed: bool,
+    /// Built with the `parallel` feature. With `false`, `threads` is 0 always.
+    pub parallel_built: bool,
+    /// The CPU has the SIMD instructions the crate uses (AVX2 today). This is not the
+    /// choice: `backend` is `"scalar"` if the settings turn SIMD off.
+    pub simd_available: bool,
+    /// The pool is built and this process can use it. `false` also before the first
+    /// parallel batch, if the pool could not be built, and in a child forked after its
+    /// parent started the pool.
+    pub pool_usable: bool,
+    /// Logical CPUs available to the process, detected at the call (as the pool size cap).
+    pub logical_cpus: usize,
 }
 
 /// Process-wide execution settings for [`configure`](crate::configure).
@@ -58,7 +73,7 @@ impl RuntimeOptions {
 #[non_exhaustive]
 pub enum ConfigError {
     /// The settings are already fixed, by an earlier `configure` or by the first use of
-    /// the dispatcher (batch calls, `suggested_steps()`, `runtime_info()`).
+    /// the dispatcher (batch calls, `runtime_info()`), and differ from the requested ones.
     AlreadyConfigured,
 }
 
