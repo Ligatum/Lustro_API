@@ -23,10 +23,6 @@ cd Lustro_API
 
 cargo build --release
 
-# System entropy for Seed256::from_entropy() and LustroPrng::from_entropy() (Rust; also enabled by ffi and python)
-
-cargo build --release --features entropy
-
 # rand_core traits for LustroPrng and LustroXof (Rust, also enables entropy)
 
 cargo build --release --features rand
@@ -51,7 +47,7 @@ Running Lustro with the GIL disabled is not supported.
 
 ## Speed Test
 
-This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. It runs the equivalent sections on native Rust and FFI layers. The results can be compared.
+This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. It runs the equivalent sections on native Rust, Python and C layers. The results can be compared.
 
 `````bash
 # rust target (built on request only, no other build includes it)
@@ -209,7 +205,7 @@ use lustro::{LustroPrng, StreamId};
 // Stream 0 of a fresh seed; the seed is not kept.
 let mut rng = LustroPrng::from_entropy()?;
 
-// Another stream of a fresh seed.
+// Stream 5 of another fresh seed; unrelated to `rng`.
 let mut other = LustroPrng::from_entropy_with_id(StreamId(5))?;
 ```
 
@@ -221,6 +217,7 @@ To keep the seed, take it first: `Seed256::from_entropy()?`, then `LustroPrng::n
 from lustro import LustroPrng
 
 rng = LustroPrng.from_entropy()  # OSError if the system source is unavailable
+other = LustroPrng.from_entropy(stream_id=5)  # another fresh seed, unrelated to `rng`
 ```
 
 The seed is not kept. To keep it, use `LustroPrng(os.urandom(32), 0)`.
@@ -242,9 +239,10 @@ err = lustro_seed_from_entropy(seed);
 if (err == LUSTRO_ERROR_OK) {
     err = lustro_prng_new(seed, 0, 0, &kept);
 }
-```
 
-Available with the `ffi` feature, which enables `entropy`.
+lustro_prng_free(kept);
+lustro_prng_free(rng);
+```
 
 ---
 
@@ -271,6 +269,11 @@ rng.fill_bytes(&mut buf);
 
 let mut bytes = Vec::new();
 rng.by_ref().take(100).read_to_end(&mut bytes).unwrap();   // std::io::Read
+
+rng.advance_bytes(50);   // skip 50 bytes
+rng.advance_blocks(2);   // skip 2 blocks
+
+let position: u128 = rng.position();
 ```
 
 **Python**
@@ -285,6 +288,11 @@ b = rng.next_u64()
 c = rng.next_u128()
 block = rng.next_block()        # bytes, 32
 data = rng.fill(100)            # bytes, 100
+
+rng.advance_bytes(50)           # skip 50 bytes
+rng.advance_blocks(2)           # skip 2 blocks
+
+position = rng.position()       # int
 ```
 
 **C / C++**
@@ -581,6 +589,8 @@ For a PRNG, `derive_path(seed, path)` gives the same stream as `new` with the fi
 identifier followed by `fork` for each remaining one, in a single call. For an XOF,
 every identifier in `path` is a `fork`, since the message already is the root.
 
+`path` must not be empty: `derive_path` panics in Rust (`try_derive_path` returns an error), Python raises `ValueError`, and C/C++ returns `LUSTRO_ERROR_INVALID_LENGTH`. The same holds for the batch versions below.
+
 ---
 
 ## Batches
@@ -838,6 +848,7 @@ prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
 prng.blocks(2)
 
 lane = prng.lane(1)  # IndexError if the index is out of range
+same = prng[1]       # the same lane; prng[-1] is the last one
 block = lane.next_block()
 ```
 
@@ -1015,7 +1026,8 @@ let one_each = prng.fork(&[StreamId(10), StreamId(11), StreamId(12), StreamId(13
 let children = prng.fork_range(StreamId(100));
 let many_children = prng.fork_many(&[StreamId(100), StreamId(200)]);
 
-// Return an error instead of panicking if the lanes cannot be allocated.
+// Return an error instead of panicking if the lanes cannot be allocated
+// (`try_fork` also for a wrong number of ids).
 let one_each = prng.try_fork(&[StreamId(10), StreamId(11), StreamId(12), StreamId(13)])?;
 let children = prng.try_fork_range(StreamId(100))?;
 let many_children = prng.try_fork_many(&[StreamId(100), StreamId(200)])?;
@@ -1032,7 +1044,8 @@ let one_each = xof.fork(&[StreamId(10), StreamId(11), StreamId(12)]);
 let children = xof.fork_range(StreamId(100));
 let many_children = xof.fork_many(&[StreamId(100), StreamId(200)]);
 
-// Return an error instead of panicking if the lanes cannot be allocated.
+// Return an error instead of panicking if the lanes cannot be allocated
+// (`try_fork` also for a wrong number of ids).
 let one_each = xof.try_fork(&[StreamId(10), StreamId(11), StreamId(12)])?;
 let children = xof.try_fork_range(StreamId(100))?;
 let many_children = xof.try_fork_many(&[StreamId(100), StreamId(200)])?;
@@ -1340,6 +1353,8 @@ lustro_xof_free(restored);
 lustro_xof_free(xof);
 ```
 
+A snapshot holds the full stream state, so keep it as private as the seed. Importing malformed bytes fails: `SnapshotError` from `from_le_bytes` (Rust), `lustro.SnapshotError`, a `ValueError` (Python), or `LUSTRO_ERROR_UNSUPPORTED_VERSION`, `_INVALID_KIND`, `_INVALID_CURSOR` or `_INVALID_LENGTH` (C/C++). A PRNG snapshot cannot be imported as an XOF or the other way round, and a single-stream snapshot cannot be imported as a batch.
+
 ---
 
 ### Batch Snapshot
@@ -1577,6 +1592,8 @@ n = rng.readinto(buf)         # n == 1000, any writable C-contiguous buffer
 
 Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, `hash128_many_var` and `LustroXofBatch` take any sequence of such objects, but not a single string or buffer.
 
+Stream IDs and path elements are Python ints from 0 to `2**128 - 1`; a negative or larger value raises `OverflowError`.
+
 All four classes can be pickled, for example to pass them to a worker process. A pickle holds the same data as `export_snapshot()`, so the restored object continues from the same position. It is a copy, like `copy()`, not a new stream: workers that need independent streams should use `fork()` or different stream IDs. Pickles contain generator state and, as always, must not be loaded from untrusted sources. They refer to the class as `lustro.LustroPrng` and so on; to store state long term, use `export_snapshot()`.
 
 An instance must not be used by several threads at the same time (an overlapping call raises `RuntimeError`). Use `copy()`, `fork()` or separate instances instead. The installed version is available as `lustro.__version__`, and the package ships type stubs (`lustro.pyi`, `py.typed`).
@@ -1593,6 +1610,7 @@ An instance must not be used by several threads at the same time (an overlapping
 | `hash*_many_var`, `hash*_many_var_into` | released by default, held with `release_gil=False` |
 | `fill_blocks` (`LustroPrngBatch`, `LustroXofBatch`) | released by default, held with `release_gil=False` |
 | `fill`, `fill_u64`, `blocks` | released while generating |
+| `advance_bytes`, `advance_blocks` | released while skipping |
 | `fill_into`, `readinto` | held |
 
 By default (`release_gil=True`) other Python threads run during the call. Input is copied before the GIL is released and results are copied into `out` after it is taken back, which costs time on large batches.
