@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::panic::{catch_unwind, UnwindSafe};
 
 use crate::errors::LustroError;
-use crate::types::{BatchError, DerivePathError, RuntimeOptions};
+use crate::types::RuntimeOptions;
 
 // Panic guard for exported fns: returns `on_panic` if `f` unwinds.
 // Nothing is rolled back.
@@ -37,20 +37,6 @@ pub(crate) unsafe fn construct<T>(
         }
         Ok(Err(e)) => e,
         Err(_) => LustroError::InternalPanic,
-    }
-}
-
-pub(crate) fn batch_status(e: BatchError) -> LustroError {
-    match e {
-        BatchError::SizeOverflow | BatchError::LengthMismatch { .. } => LustroError::InvalidLength,
-        BatchError::Reserve(_) => LustroError::OutOfMemory,
-    }
-}
-
-pub(crate) fn derive_path_status(e: DerivePathError) -> LustroError {
-    match e {
-        DerivePathError::EmptyPath => LustroError::InvalidLength,
-        DerivePathError::Reserve(_) => LustroError::OutOfMemory,
     }
 }
 
@@ -249,3 +235,4 @@ pub extern "C" fn lustro_strerror(code: i32) -> *const c_char {
         None => b"unknown error code\0".as_ptr() as *const c_char,
     }
 }
+

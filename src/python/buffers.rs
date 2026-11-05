@@ -7,10 +7,21 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::borrow::Cow;
 
-// Writes into a writable, C-contiguous byte buffer; the GIL stays held throughout.
+// Smallest input handled with the GIL released; for less, releasing it costs more than it gives.
+pub(crate) const DETACH_MIN: usize = 4096;
+
+// Address of a writable buffer for the thread that fills it while the GIL is released.
+struct SendPtr(*mut u8);
+
+// SAFETY: the exporting object is kept alive and in place by the buffer view held by the
+// caller until the fill returns; only the filling thread writes to it.
+unsafe impl Send for SendPtr {}
+
+// Writes into a writable, C-contiguous byte buffer. From `DETACH_MIN` bytes the GIL is
+// released while writing; the held buffer view keeps the exporter alive and blocks resizing.
 pub(crate) fn fill_buffer(
     buf: &Bound<'_, pyo3::PyAny>,
-    fill: impl FnOnce(&mut [u8]),
+    fill: impl FnOnce(&mut [u8]) + Send,
 ) -> PyResult<()> {
     let bad = || {
         pyo3::exceptions::PyTypeError::new_err(
@@ -26,14 +37,21 @@ pub(crate) fn fill_buffer(
     if len == 0 {
         return Ok(());
     }
-    // SAFETY: `view` is writable and C-contiguous, so `buf_ptr()` covers `len`
-    // consecutive bytes. `view` keeps the exporting object alive until `fill` returns.
-    let slice = unsafe { std::slice::from_raw_parts_mut(view.buf_ptr() as *mut u8, len) };
-    fill(slice);
+    let ptr = SendPtr(view.buf_ptr() as *mut u8);
+    // SAFETY: `view` is writable and C-contiguous, so `ptr` covers `len` consecutive bytes.
+    // `view` keeps the exporting object alive until `fill` returns.
+    if len < DETACH_MIN {
+        fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) });
+    } else {
+        buf.py().detach(move || {
+            let ptr = ptr;
+            fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) })
+        });
+    }
     Ok(())
 }
 
-// Exported buffer, released when dropped. The GIL is held for the whole life of the value.
+// Exported buffer, released when dropped. Dropped with the GIL held.
 struct RawBuffer(pyo3::ffi::Py_buffer);
 
 impl Drop for RawBuffer {
@@ -46,11 +64,12 @@ impl Drop for RawBuffer {
 // As `fill_buffer`, but for any writable, C-contiguous buffer, whatever its item format
 // (`bytearray`, `array('I')`, a numpy array of any dtype, ...). The stream bytes are written
 // as raw memory, without conversion, and the number of bytes written is returned. The GIL
-// stays held. TypeError for an object without a buffer, a read-only or non-contiguous one;
-// the exporters report those cases with TypeError, BufferError or ValueError.
+// is released from `DETACH_MIN` bytes. TypeError for an object without a buffer, a read-only
+// or non-contiguous one; the exporters report those cases with TypeError, BufferError or
+// ValueError.
 pub(crate) fn fill_raw_buffer(
     buf: &Bound<'_, pyo3::PyAny>,
-    fill: impl FnOnce(&mut [u8]),
+    fill: impl FnOnce(&mut [u8]) + Send,
 ) -> PyResult<usize> {
     let py = buf.py();
     let bad = || {
@@ -80,11 +99,17 @@ pub(crate) fn fill_raw_buffer(
     if len == 0 {
         return Ok(0);
     }
-    // SAFETY: the buffer was requested writable and is C-contiguous, so `buf` covers `len`
-    // consecutive bytes. `raw` keeps the export alive, and no Python code runs until `fill`
-    // returns.
-    let slice = unsafe { std::slice::from_raw_parts_mut(raw.0.buf as *mut u8, len) };
-    fill(slice);
+    let ptr = SendPtr(raw.0.buf as *mut u8);
+    // SAFETY: the buffer was requested writable and is C-contiguous, so `ptr` covers `len`
+    // consecutive bytes. `raw` keeps the export alive until `fill` returns.
+    if len < DETACH_MIN {
+        fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) });
+    } else {
+        py.detach(move || {
+            let ptr = ptr;
+            fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) })
+        });
+    }
     Ok(len)
 }
 

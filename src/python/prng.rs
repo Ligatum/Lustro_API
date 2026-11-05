@@ -137,9 +137,9 @@ impl LustroPrngPy {
 
     /// Fills a writable, C-contiguous byte buffer (bytearray, writable memoryview,
     /// numpy uint8 array) in place with the next `len(buf)` bytes of the stream.
-    /// The GIL is held while writing. Raises TypeError for any other object, a
-    /// read-only or non-contiguous buffer, or a buffer whose items are not bytes
-    /// (for other numpy dtypes pass `arr.view(numpy.uint8)`).
+    /// The GIL is released while writing 4096 bytes or more. Raises TypeError for any
+    /// other object, a read-only or non-contiguous buffer, or a buffer whose items are
+    /// not bytes (for other numpy dtypes pass `arr.view(numpy.uint8)`).
     pub fn fill_into(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<()> {
         crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
@@ -154,8 +154,9 @@ impl LustroPrngPy {
     /// returns the number of bytes written (`nbytes`, not the number of items). Accepts any
     /// item format: the bytes are written as raw memory, without conversion, so for a numpy
     /// array of another dtype the values are a reinterpretation of the stream bytes. The GIL
-    /// is held while writing. Raises TypeError for an object without a buffer, a read-only
-    /// or a non-contiguous buffer. An empty buffer gives 0 and does not move the stream.
+    /// is released while writing 4096 bytes or more. Raises TypeError for an object without
+    /// a buffer, a read-only or a non-contiguous buffer. An empty buffer gives 0 and does
+    /// not move the stream.
     pub fn readinto(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<usize> {
         crate::python::fill_raw_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }

@@ -7,7 +7,7 @@ use crate::prng::LustroPrngBatch;
 use crate::types::{Seed256, StreamId};
 
 use super::types::{buf_in, buf_out, bytes_in, fits_slice, ids_from_parts, slice_out};
-use super::{batch_status, construct, derive_path_status, guarded};
+use super::{construct, guarded};
 
 // ==========================================
 // FFI STREAM SINGLE API
@@ -435,7 +435,7 @@ pub unsafe extern "C" fn lustro_prng_batch_new(
         let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
         let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrngBatch::try_new(&seed256, &stream_ids).map_err(batch_status)
+        LustroPrngBatch::try_new(&seed256, &stream_ids).map_err(LustroError::from)
     })
 }
 
@@ -461,7 +461,7 @@ pub unsafe extern "C" fn lustro_prng_batch_new_range(
         let seed_bytes = buf_in(seed, 32).ok_or(LustroError::InvalidPointer)?;
         let first_id = ((first_hi as u128) << 64) | (first_lo as u128);
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrngBatch::try_new_range(&seed256, StreamId(first_id), count).map_err(batch_status)
+        LustroPrngBatch::try_new_range(&seed256, StreamId(first_id), count).map_err(LustroError::from)
     })
 }
 
@@ -499,7 +499,7 @@ pub unsafe extern "C" fn lustro_prng_batch_clone(
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
-        (*ctx).try_clone().map_err(batch_status)
+        (*ctx).try_clone().map_err(LustroError::from)
     })
 }
 
@@ -642,7 +642,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
             return Err(LustroError::InvalidLength);
         }
         let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
-        batch.try_fork(&stream_ids).map_err(batch_status)
+        batch.try_fork(&stream_ids).map_err(LustroError::from)
     })
 }
 
@@ -678,7 +678,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
             return Err(LustroError::InvalidLength);
         }
         let ids = ids_from_parts(ids_hi, ids_lo, k)?;
-        batch.try_fork_many(&ids).map_err(batch_status)
+        batch.try_fork_many(&ids).map_err(LustroError::from)
     })
 }
 
@@ -717,7 +717,7 @@ pub unsafe extern "C" fn lustro_prng_batch_derive_path(
         let roots = ids_from_parts(roots_hi, roots_lo, n_roots)?;
         let path = ids_from_parts(path_hi, path_lo, n_path)?;
         let seed256 = Seed256::from_bytes(seed_bytes.try_into().unwrap());
-        LustroPrngBatch::try_derive_path(&seed256, &roots, &path).map_err(derive_path_status)
+        LustroPrngBatch::try_derive_path(&seed256, &roots, &path).map_err(LustroError::from)
     })
 }
 
@@ -744,7 +744,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_range(
             return Err(LustroError::InvalidPointer);
         }
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-        (*ctx).try_fork_range(StreamId(first)).map_err(batch_status)
+        (*ctx).try_fork_range(StreamId(first)).map_err(LustroError::from)
     })
 }
 

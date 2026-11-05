@@ -126,9 +126,9 @@ impl<'py> MessageSeq<'py> {
         }
         let obj = self.0.as_ptr();
         let (is_list, n) = if ffi::PyList_CheckExact(obj) != 0 {
-            (true, ffi::PyList_GET_SIZE(obj) as usize)
+            (true, ffi::PyList_Size(obj) as usize)
         } else if ffi::PyTuple_CheckExact(obj) != 0 {
-            (false, ffi::PyTuple_GET_SIZE(obj) as usize)
+            (false, ffi::PyTuple_Size(obj) as usize)
         } else {
             return false;
         };
@@ -204,9 +204,9 @@ impl<'py> MessageSeq<'py> {
         // SAFETY: the GIL is held; `obj` is a live object.
         let (is_list, n) = unsafe {
             if ffi::PyList_CheckExact(obj) != 0 {
-                (true, ffi::PyList_GET_SIZE(obj) as usize)
+                (true, ffi::PyList_Size(obj) as usize)
             } else if ffi::PyTuple_CheckExact(obj) != 0 {
-                (false, ffi::PyTuple_GET_SIZE(obj) as usize)
+                (false, ffi::PyTuple_Size(obj) as usize)
             } else {
                 return Ok(None);
             }
@@ -285,9 +285,9 @@ impl ItemSource {
     unsafe fn item(&self, i: usize) -> *mut pyo3::ffi::PyObject {
         use pyo3::ffi;
         if self.is_list {
-            ffi::PyList_GET_ITEM(self.obj, i as ffi::Py_ssize_t)
+            ffi::PyList_GetItem(self.obj, i as ffi::Py_ssize_t)
         } else {
-            ffi::PyTuple_GET_ITEM(self.obj, i as ffi::Py_ssize_t)
+            ffi::PyTuple_GetItem(self.obj, i as ffi::Py_ssize_t)
         }
     }
 
@@ -299,10 +299,10 @@ impl ItemSource {
         if ffi::PyBytes_CheckExact(item) == 0 {
             return None;
         }
-        let data = ffi::PyBytes_AS_STRING(item) as *const u8;
+        let data = ffi::PyBytes_AsString(item) as *const u8;
         Some(std::slice::from_raw_parts(
             data,
-            ffi::Py_SIZE(item) as usize,
+            ffi::PyBytes_Size(item) as usize,
         ))
     }
 }

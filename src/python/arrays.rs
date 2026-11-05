@@ -45,6 +45,15 @@ pub(crate) fn require_numpy(py: Python<'_>) -> PyResult<()> {
     IMPORTED
         .get_or_try_init(py, || numpy::get_array_module(py).map(|_| ()))
         .map(|_| ())
+        .map_err(|e| {
+            if e.is_instance_of::<pyo3::exceptions::PyImportError>(py) {
+                pyo3::exceptions::PyImportError::new_err(
+                    "this function needs NumPy (pip install numpy)",
+                )
+            } else {
+                e
+            }
+        })
 }
 
 // Zeroed words for a new array; MemoryError if they cannot be reserved.

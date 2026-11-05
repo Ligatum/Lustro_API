@@ -16,7 +16,9 @@ use crate::hash::hash256 as hash256_impl;
 use crate::hash::hash256_many_fixed_into;
 use crate::hash::hash256_many_var_into;
 use crate::hash::{hash128_many_var_blocks, hash256_many_var_blocks};
-use crate::python::{bytes_arg, messages_arg, require_numpy, ListMessages, MessageSeq, Messages};
+use crate::python::{
+    bytes_arg, messages_arg, require_numpy, ListMessages, MessageSeq, Messages, DETACH_MIN,
+};
 use crate::types::{Hash128, Hash256};
 
 // ==========================================
@@ -286,26 +288,36 @@ fn digests_into<T: Send, const W: usize>(
 // ==========================================
 
 /// 256-bit digest of `data` (bytes or a byte buffer of any length) as 32 bytes.
-/// `bytes` is not copied; other buffers are copied. The GIL is released while hashing.
+/// `bytes` is not copied; other buffers are copied. The GIL is released while hashing
+/// 4096 bytes or more.
 #[pyfunction]
 #[pyo3(name = "hash256")]
 pub fn hash256_py<'py>(
     py: Python<'py>,
     #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
 ) -> Bound<'py, PyBytes> {
-    let result = py.detach(|| hash256_impl(&data));
+    let result = if data.len() < DETACH_MIN {
+        hash256_impl(&data)
+    } else {
+        py.detach(|| hash256_impl(&data))
+    };
     PyBytes::new(py, result.as_bytes())
 }
 
 /// 128-bit digest of `data` (bytes or a byte buffer of any length) as 16 bytes.
-/// `bytes` is not copied; other buffers are copied. The GIL is released while hashing.
+/// `bytes` is not copied; other buffers are copied. The GIL is released while hashing
+/// 4096 bytes or more.
 #[pyfunction]
 #[pyo3(name = "hash128")]
 pub fn hash128_py<'py>(
     py: Python<'py>,
     #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
 ) -> Bound<'py, PyBytes> {
-    let result = py.detach(|| hash128_impl(&data));
+    let result = if data.len() < DETACH_MIN {
+        hash128_impl(&data)
+    } else {
+        py.detach(|| hash128_impl(&data))
+    };
     PyBytes::new(py, result.as_bytes())
 }
 

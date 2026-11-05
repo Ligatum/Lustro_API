@@ -1604,14 +1604,14 @@ An instance must not be used by several threads at the same time (an overlapping
 
 | Call | GIL |
 |---|---|
-| `hash256`, `hash128` | released while hashing |
-| `hash256_many_fixed`, `hash128_many_fixed` | released; the input is copied first |
+| `hash256`, `hash128` | released for inputs of 4096 bytes or more, held below |
+| `hash256_many_fixed`, `hash128_many_fixed` | released; the input is copied first (`hash*_many_fixed_into` with `release_gil=False` reads in place) |
 | `hash*_many_fixed_into` | released by default, held with `release_gil=False` |
 | `hash*_many_var`, `hash*_many_var_into` | released by default, held with `release_gil=False` |
 | `fill_blocks` (`LustroPrngBatch`, `LustroXofBatch`) | released by default, held with `release_gil=False` |
 | `fill`, `fill_u64`, `blocks` | released while generating |
 | `advance_bytes`, `advance_blocks` | released while skipping |
-| `fill_into`, `readinto` | held |
+| `fill_into`, `readinto` | released for buffers of 4096 bytes or more, held below |
 
 By default (`release_gil=True`) other Python threads run during the call. Input is copied before the GIL is released and results are copied into `out` after it is taken back, which costs time on large batches.
 

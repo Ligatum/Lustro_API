@@ -3,11 +3,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FFI");
     println!("cargo:rerun-if-env-changed=LUSTRO_HEADER_DIR");
 
-    if std::env::var_os("CARGO_FEATURE_FFI").is_some() {
-        generate_header();
-    }
+    #[cfg(feature = "ffi")]
+    generate_header();
 }
 
+#[cfg(feature = "ffi")]
 fn generate_header() {
     use cbindgen::{EnumConfig, RenameRule};
     use std::path::PathBuf;

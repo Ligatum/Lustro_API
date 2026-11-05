@@ -107,6 +107,26 @@ impl From<crate::types::SnapshotError> for LustroError {
     }
 }
 
+impl From<crate::types::BatchError> for LustroError {
+    fn from(e: crate::types::BatchError) -> Self {
+        use crate::types::BatchError as B;
+        match e {
+            B::SizeOverflow | B::LengthMismatch { .. } => LustroError::InvalidLength,
+            B::Reserve(_) => LustroError::OutOfMemory,
+        }
+    }
+}
+
+impl From<crate::types::DerivePathError> for LustroError {
+    fn from(e: crate::types::DerivePathError) -> Self {
+        use crate::types::DerivePathError as D;
+        match e {
+            D::EmptyPath => LustroError::InvalidLength,
+            D::Reserve(_) => LustroError::OutOfMemory,
+        }
+    }
+}
+
 impl From<crate::types::ConfigError> for LustroError {
     fn from(e: crate::types::ConfigError) -> Self {
         use crate::types::ConfigError as C;

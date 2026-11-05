@@ -2,8 +2,8 @@
 //! Output stream is derived from an absorbed message.
 
 use crate::api::{
-    absorb_with_domain, derive_branch_stream, derive_path_lane, fork_lane, prepare_base,
-    StreamState,
+    absorb_hash256_var_into, absorb_with_domain, derive_branch_stream, derive_path_lane, fork_lane,
+    prepare_base, StreamState,
 };
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, suggested_steps, StreamLane};
@@ -188,6 +188,11 @@ impl core::fmt::Debug for LustroXofBatch {
     }
 }
 
+// Messages absorbed per call of `absorb_hash256_var_into`. One call for a whole large batch
+// would need a digest buffer as long as the batch; a portion keeps it small and is still
+// big enough for the pool.
+pub(crate) const ABSORB_PORTION: usize = 16384;
+
 impl LustroXofBatch {
     /// Creates a batch by independently absorbing each message.
     /// Panics if the lane buffer cannot be allocated.
@@ -205,10 +210,23 @@ impl LustroXofBatch {
         streams
             .try_reserve_exact(messages.len())
             .map_err(BatchError::Reserve)?;
-        streams.extend(messages.iter().map(|&message| {
-            let (s0, s1) = absorb_with_domain(message, Domain::Xof as u128);
-            StreamLane { s0, s1, step: 0 }
-        }));
+
+        // Digests are the two lane words, `s0` then `s1`, little-endian.
+        let mut digests: Vec<[u8; 32]> = Vec::new();
+        let portion = messages.len().min(ABSORB_PORTION);
+        digests
+            .try_reserve_exact(portion)
+            .map_err(BatchError::Reserve)?;
+        digests.resize(portion, [0; 32]);
+        for part in messages.chunks(ABSORB_PORTION) {
+            let out = &mut digests[..part.len()];
+            absorb_hash256_var_into(part, Domain::Xof as u128, out);
+            streams.extend(out.iter().map(|d| StreamLane {
+                s0: u128::from_le_bytes(d[..16].try_into().unwrap()),
+                s1: u128::from_le_bytes(d[16..].try_into().unwrap()),
+                step: 0,
+            }));
+        }
 
         Ok(Self { streams })
     }

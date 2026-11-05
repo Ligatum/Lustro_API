@@ -8,7 +8,7 @@ use crate::xof::LustroXofBatch;
 use super::types::{
     buf_in, buf_out, bytes_in, fits_slice, ids_from_parts, messages_from_parts, slice_out,
 };
-use super::{batch_status, construct, derive_path_status, guarded};
+use super::{construct, guarded};
 
 // ==========================================
 // FFI XOF SINGLE API
@@ -393,7 +393,7 @@ pub unsafe extern "C" fn lustro_xof_batch_new(
 ) -> LustroError {
     construct(out_ctx, || {
         let messages = messages_from_parts(message_ptrs, message_lens, n)?;
-        LustroXofBatch::try_new(&messages).map_err(batch_status)
+        LustroXofBatch::try_new(&messages).map_err(LustroError::from)
     })
 }
 
@@ -431,7 +431,7 @@ pub unsafe extern "C" fn lustro_xof_batch_clone(
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
-        (*ctx).try_clone().map_err(batch_status)
+        (*ctx).try_clone().map_err(LustroError::from)
     })
 }
 
@@ -574,7 +574,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
             return Err(LustroError::InvalidLength);
         }
         let stream_ids = ids_from_parts(ids_hi, ids_lo, n)?;
-        batch.try_fork(&stream_ids).map_err(batch_status)
+        batch.try_fork(&stream_ids).map_err(LustroError::from)
     })
 }
 
@@ -610,7 +610,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
             return Err(LustroError::InvalidLength);
         }
         let ids = ids_from_parts(ids_hi, ids_lo, k)?;
-        batch.try_fork_many(&ids).map_err(batch_status)
+        batch.try_fork_many(&ids).map_err(LustroError::from)
     })
 }
 
@@ -648,7 +648,7 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
         }
         let messages = messages_from_parts(message_ptrs, message_lens, n_messages)?;
         let path = ids_from_parts(path_hi, path_lo, n_path)?;
-        LustroXofBatch::try_derive_path(&messages, &path).map_err(derive_path_status)
+        LustroXofBatch::try_derive_path(&messages, &path).map_err(LustroError::from)
     })
 }
 
@@ -675,7 +675,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_range(
             return Err(LustroError::InvalidPointer);
         }
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-        (*ctx).try_fork_range(StreamId(first)).map_err(batch_status)
+        (*ctx).try_fork_range(StreamId(first)).map_err(LustroError::from)
     })
 }
 

@@ -1,7 +1,5 @@
 //! Lustro V1 — Parallel, Scalar and AVX2 Engine Dispatcher.
 
-#![allow(non_snake_case)]
-
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
