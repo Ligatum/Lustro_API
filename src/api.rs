@@ -443,6 +443,13 @@ impl StreamState {
         }
     }
 
+    // Lane state `(s0, s1, step)` if the stream is at a block boundary (cursor 32),
+    // `None` while part of the current block is unread.
+    #[inline]
+    pub(crate) fn to_block_aligned(&self) -> Option<(u128, u128, u64)> {
+        (self.cursor == 32).then_some((self.s0, self.s1, self.step))
+    }
+
     // Reconstructs StreamState from internal state components.
     // Panics unless `cursor` is in `1..=32`.
     #[inline]

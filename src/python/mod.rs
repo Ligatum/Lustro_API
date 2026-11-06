@@ -153,6 +153,17 @@ pub(crate) fn derive_path_error(e: crate::types::DerivePathError) -> pyo3::PyErr
     }
 }
 
+// BatchError as a Python exception. Every variant is listed, so a new one needs a choice here.
+pub(crate) fn batch_error(e: crate::types::BatchError) -> pyo3::PyErr {
+    use crate::types::BatchError as B;
+    match e {
+        B::Reserve(_) => alloc_error(),
+        B::SizeOverflow | B::LengthMismatch { .. } | B::PartialBlock { .. } => {
+            pyo3::exceptions::PyValueError::new_err(e.to_string())
+        }
+    }
+}
+
 // Wrong type, dtype or ndim of an array argument.
 pub(crate) fn array_type_error(name: &str, expected: &str) -> pyo3::PyErr {
     pyo3::exceptions::PyTypeError::new_err(format!("{name} must be {expected}"))
@@ -178,8 +189,29 @@ pub(crate) fn u128_arg(obj: &Bound<'_, PyAny>) -> PyResult<u128> {
 
 // List of u128 ids (`from_py_with`), same rules per item as `u128_arg`.
 pub(crate) fn ids_arg(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u128>> {
-    let items: Vec<Bound<'_, PyAny>> = obj.extract()?;
-    items.iter().map(u128_arg).collect()
+    seq_items(obj)?.iter().map(u128_arg).collect()
+}
+
+// Items of a sequence argument, accepted as by PyO3's `Vec` extraction (`PySequence_Check`,
+// a `str` is TypeError) but read one by one. PyO3 reserves `len()` items first, so a wrong
+// or huge `__len__` ends in a panic (capacity overflow) or an abort (failed allocation).
+// A plain loop, not `collect`: the iterator's `size_hint` calls `__length_hint__`/`__len__`.
+pub(crate) fn seq_items<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    if obj.is_instance_of::<pyo3::types::PyString>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "Can't extract `str` to `Vec`",
+        ));
+    }
+    // SAFETY: `obj` is a valid object pointer and the GIL is held.
+    if unsafe { pyo3::ffi::PySequence_Check(obj.as_ptr()) } == 0 {
+        let sequence = <pyo3::types::PySequence as pyo3::PyTypeInfo>::type_object(obj.py());
+        return Err(pyo3::CastError::new(obj.as_borrowed(), sequence.into_any()).into());
+    }
+    let mut items = Vec::new();
+    for item in obj.try_iter()? {
+        items.push(item?);
+    }
+    Ok(items)
 }
 
 // ==========================================

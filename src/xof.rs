@@ -96,6 +96,83 @@ impl LustroXof {
         }
     }
 
+    /// Derives one child per identifier, as a batch: lane `i` is `fork(ids[i])`.
+    /// Panics if the lane buffer cannot be allocated.
+    pub fn fork_batch(&self, ids: &[StreamId]) -> LustroXofBatch {
+        match self.try_fork_batch(ids) {
+            Ok(batch) => batch,
+            Err(BatchError::Reserve(e)) => panic!("fork_batch: lane allocation failed: {e:?}"),
+            Err(e) => panic!("fork_batch: {e}"),
+        }
+    }
+
+    /// As `fork_batch`, returning `Err(BatchError::Reserve)` if reserving the lane buffer fails.
+    pub fn try_fork_batch(&self, ids: &[StreamId]) -> Result<LustroXofBatch, BatchError> {
+        self.try_fork_lanes(ids.len(), ids.iter().map(|id| id.get()))
+    }
+
+    /// As `fork_batch` with ids `first`, `first + 1`, ... (`count` lanes, wrapping modulo
+    /// 2^128). Panics if the lane buffer cannot be allocated.
+    pub fn fork_batch_range(&self, first: StreamId, count: usize) -> LustroXofBatch {
+        match self.try_fork_batch_range(first, count) {
+            Ok(batch) => batch,
+            Err(BatchError::Reserve(e)) => {
+                panic!("fork_batch_range: lane allocation failed: {e:?}")
+            }
+            Err(e) => panic!("fork_batch_range: {e}"),
+        }
+    }
+
+    /// As `fork_batch_range`, returning `Err(BatchError::Reserve)` if reserving the lane
+    /// buffer fails.
+    pub fn try_fork_batch_range(
+        &self,
+        first: StreamId,
+        count: usize,
+    ) -> Result<LustroXofBatch, BatchError> {
+        let first = first.get();
+        self.try_fork_lanes(count, (0..count).map(|i| first.wrapping_add(i as u128)))
+    }
+
+    // Children of the current state, one lane per id, each at step 0.
+    fn try_fork_lanes(
+        &self,
+        count: usize,
+        ids: impl Iterator<Item = u128>,
+    ) -> Result<LustroXofBatch, BatchError> {
+        let (s0, s1, _, _) = self.state.to_parts();
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(count)
+            .map_err(BatchError::Reserve)?;
+        let (base_s0, base_s1) = prepare_base(s0, s1, Domain::Xof as u128);
+        streams.extend(ids.map(|id| {
+            let (s0, s1) = derive_branch_stream(base_s0, base_s1, id);
+            StreamLane { s0, s1, step: 0 }
+        }));
+        Ok(LustroXofBatch { streams })
+    }
+
+    /// Derives a stream from the current state along `path`: the same as `fork` for each
+    /// id in turn. Panics if `path` is empty.
+    pub fn fork_path(&self, path: &[StreamId]) -> Self {
+        assert!(!path.is_empty(), "fork_path: path must not be empty");
+        let (s0, s1, _, _) = self.state.to_parts();
+        let (s0, s1) =
+            derive_path_lane(s0, s1, Domain::Xof as u128, path.iter().map(|id| id.get()));
+        Self {
+            state: StreamState::new(s0, s1),
+        }
+    }
+
+    /// As `fork_path`, returning `Err(DerivePathError::EmptyPath)` for an empty `path`.
+    pub fn try_fork_path(&self, path: &[StreamId]) -> Result<Self, DerivePathError> {
+        if path.is_empty() {
+            return Err(DerivePathError::EmptyPath);
+        }
+        Ok(self.fork_path(path))
+    }
+
     /// Derives a stream from `message` along `path`.
     /// Equivalent to `new(message)` followed by `fork` for each id in `path`.
     /// Panics if `path` is empty.
@@ -291,6 +368,42 @@ impl LustroXofBatch {
         out.resize(count, [0u8; 32]);
         self.fill_blocks(&mut out, steps);
         Ok(out)
+    }
+
+    /// Batch with one lane per stream, in order. Lane `i` continues `streams[i]` at its
+    /// next block, so `lane(i)` returns a copy of `streams[i]`. Panics if a stream is inside
+    /// a block or the lane buffer cannot be allocated.
+    pub fn from_streams(streams: &[LustroXof]) -> Self {
+        match Self::try_from_streams(streams) {
+            Ok(batch) => batch,
+            Err(BatchError::Reserve(e)) => panic!("from_streams: lane allocation failed: {e:?}"),
+            Err(e) => panic!("from_streams: {e}"),
+        }
+    }
+
+    /// As `from_streams`, returning `Err(BatchError::PartialBlock)` for the first stream that
+    /// is inside a block (part of its current block unread) and `Err(BatchError::Reserve)` if
+    /// reserving the lane buffer fails. The streams are not changed.
+    pub fn try_from_streams(streams: &[LustroXof]) -> Result<Self, BatchError> {
+        Self::try_from_stream_refs(streams.iter())
+    }
+
+    // `try_from_streams` over borrowed streams (Python objects, C pointers).
+    pub(crate) fn try_from_stream_refs<'a>(
+        streams: impl ExactSizeIterator<Item = &'a LustroXof>,
+    ) -> Result<Self, BatchError> {
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(streams.len())
+            .map_err(BatchError::Reserve)?;
+        for (index, s) in streams.enumerate() {
+            let (s0, s1, step) = s
+                .state
+                .to_block_aligned()
+                .ok_or(BatchError::PartialBlock { index })?;
+            lanes.push(StreamLane { s0, s1, step });
+        }
+        Ok(Self { streams: lanes })
     }
 
     /// Copy of lane `i` as a single stream, positioned at the lane's next block.

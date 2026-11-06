@@ -52,8 +52,8 @@ fn generate_header() {
          \tLUSTRO_ERROR_INVALID_KIND         = 8,\n\
          \tLUSTRO_ERROR_INVALID_CURSOR       = 9,\n\
          \tLUSTRO_ERROR_OUT_OF_MEMORY        = 10,\n\
-         \t/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane;\n\
-         \t * 13: the entropy functions */\n\
+         \t/* 11: lustro_configure; 12: lustro_configure, lustro_*_batch_lane and\n\
+         \t * lustro_*_batch_from_streams; 13: the entropy functions */\n\
          \tLUSTRO_ERROR_ALREADY_CONFIGURED   = 11,\n\
          \tLUSTRO_ERROR_INVALID_ARGUMENT     = 12,\n\
          \tLUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13\n\
@@ -63,8 +63,8 @@ fn generate_header() {
          \x20* 128-bit values.\n\
          \x20* Inputs (stream IDs) are passed as two uint64_t: `hi` (upper 64 bits) first, then `lo`.\n\
          \x20* Arrays of IDs are parallel arrays `*_hi` and `*_lo` of the same length.\n\
-         \x20* Outputs (`lustro_*_next_u128`) are 16 bytes, little-endian: byte 0 is the lowest\n\
-         \x20* byte of `lo`, byte 15 the highest byte of `hi`.\n\
+         \x20* Outputs (`lustro_*_next_u128`, `lustro_*_position`) are 16 bytes, little-endian:\n\
+         \x20* byte 0 is the lowest byte of `lo`, byte 15 the highest byte of `hi`.\n\
          \x20* The two helpers below convert between the forms. They do not depend on the host\n\
          \x20* byte order and do not check their pointers.\n\
          \x20*/\n\

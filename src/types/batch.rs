@@ -1,6 +1,6 @@
 //! Lustro V1 — errors of batch construction and path derivation.
 
-/// Why a path derivation was rejected by a `try_derive_path` function.
+/// Why a path derivation was rejected by a `try_derive_path` or `try_fork_path` function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DerivePathError {
@@ -29,7 +29,7 @@ impl std::error::Error for DerivePathError {
     }
 }
 
-/// Why a batch operation failed in `try_new`, `try_new_range`, `try_fork`, `try_fork_many`, `try_fork_range`, `try_clone` or `try_blocks`.
+/// Why a batch operation failed in `try_new`, `try_new_range`, `try_from_streams`, `try_fork`, `try_fork_many`, `try_fork_range`, `try_fork_batch`, `try_fork_batch_range`, `try_clone` or `try_blocks`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BatchError {
@@ -40,6 +40,9 @@ pub enum BatchError {
     Reserve(std::collections::TryReserveError),
     /// The number of identifiers given to `try_fork` differs from the batch length.
     LengthMismatch { expected: usize, actual: usize },
+    /// Stream `index` given to `try_from_streams` is inside a block: part of its current
+    /// block is unread and a lane cannot hold it.
+    PartialBlock { index: usize },
 }
 
 impl core::fmt::Display for BatchError {
@@ -50,6 +53,9 @@ impl core::fmt::Display for BatchError {
             BatchError::LengthMismatch { expected, actual } => {
                 write!(f, "expected {expected} identifiers, got {actual}")
             }
+            BatchError::PartialBlock { index } => {
+                write!(f, "stream {index} is inside a block")
+            }
         }
     }
 }
@@ -57,7 +63,9 @@ impl core::fmt::Display for BatchError {
 impl std::error::Error for BatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            BatchError::SizeOverflow | BatchError::LengthMismatch { .. } => None,
+            BatchError::SizeOverflow
+            | BatchError::LengthMismatch { .. }
+            | BatchError::PartialBlock { .. } => None,
             BatchError::Reserve(e) => Some(e),
         }
     }

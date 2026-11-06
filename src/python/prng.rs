@@ -194,6 +194,55 @@ impl LustroPrngPy {
         }
     }
 
+    /// Derives one child per id, as a batch: lane `i` is `fork(ids[i])`. The parent is not
+    /// advanced. MemoryError if the lanes cannot be allocated.
+    pub fn fork_batch(
+        &self,
+        #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>,
+    ) -> PyResult<LustroPrngBatchPy> {
+        let ids: Vec<StreamId> = ids.into_iter().map(StreamId).collect();
+        let inner = self
+            .inner
+            .try_fork_batch(&ids)
+            .map_err(crate::python::batch_error)?;
+        Ok(LustroPrngBatchPy {
+            inner,
+            blocks_buf: Vec::new(),
+        })
+    }
+
+    /// As `fork_batch` with ids `first`, `first + 1`, ... (`count` lanes, modulo 2**128).
+    /// MemoryError if the lanes cannot be allocated.
+    pub fn fork_batch_range(
+        &self,
+        #[pyo3(from_py_with = u128_arg)] first: u128,
+        count: usize,
+    ) -> PyResult<LustroPrngBatchPy> {
+        let inner = self
+            .inner
+            .try_fork_batch_range(StreamId(first), count)
+            .map_err(crate::python::batch_error)?;
+        Ok(LustroPrngBatchPy {
+            inner,
+            blocks_buf: Vec::new(),
+        })
+    }
+
+    /// Derives a generator from the current state along `path`:
+    /// `self.fork(path[0]).fork(path[1])...`. The parent is not advanced.
+    /// `path` must not be empty (ValueError).
+    pub fn fork_path(&self, #[pyo3(from_py_with = ids_arg)] path: Vec<u128>) -> PyResult<Self> {
+        if path.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "path must not be empty",
+            ));
+        }
+        let ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
+        Ok(Self {
+            inner: self.inner.fork_path(&ids),
+        })
+    }
+
     /// Derives a generator from `seed` along `path`:
     /// `LustroPrng(seed, path[0]).fork(path[1]).fork(path[2])...`
     /// `path` must not be empty (ValueError).
@@ -306,8 +355,7 @@ impl LustroPrngBatchPy {
         }
         let seed256 = Seed256::from_bytes((&*seed).try_into().unwrap());
         let ids: Vec<StreamId> = stream_ids.into_iter().map(StreamId).collect();
-        let inner =
-            LustroPrngBatch::try_new(&seed256, &ids).map_err(|_| crate::python::alloc_error())?;
+        let inner = LustroPrngBatch::try_new(&seed256, &ids).map_err(crate::python::batch_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -329,7 +377,27 @@ impl LustroPrngBatchPy {
         }
         let seed256 = Seed256::from_bytes((&*seed).try_into().unwrap());
         let inner = LustroPrngBatch::try_new_range(&seed256, StreamId(first_stream_id), count)
-            .map_err(|_| crate::python::alloc_error())?;
+            .map_err(crate::python::batch_error)?;
+        Ok(Self {
+            inner,
+            blocks_buf: Vec::new(),
+        })
+    }
+
+    /// One lane per stream of `streams` (a sequence of LustroPrng), in order. Lane `i`
+    /// continues `streams[i]` at its next block; the streams are not changed.
+    /// ValueError if a stream is inside a block (part of its current block unread),
+    /// TypeError for an item that is not a LustroPrng, RuntimeError if a stream is in use
+    /// in another thread, MemoryError if the lanes cannot be allocated.
+    #[staticmethod]
+    pub fn from_streams(streams: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let items = crate::python::seq_items(streams)?;
+        let refs = items
+            .iter()
+            .map(|item| Ok(item.cast::<LustroPrngPy>()?.try_borrow()?))
+            .collect::<PyResult<Vec<_>>>()?;
+        let inner = LustroPrngBatch::try_from_stream_refs(refs.iter().map(|r| &r.inner))
+            .map_err(crate::python::batch_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -361,10 +429,7 @@ impl LustroPrngBatchPy {
     /// works on a copy of the lane states taken here: later calls on the batch do not
     /// affect it. Raises MemoryError if the lanes cannot be allocated.
     pub fn __iter__(&self) -> PyResult<LustroPrngBatchIterPy> {
-        let inner = self
-            .inner
-            .try_clone()
-            .map_err(|_| crate::python::alloc_error())?;
+        let inner = self.inner.try_clone().map_err(crate::python::batch_error)?;
         Ok(LustroPrngBatchIterPy { inner, next: 0 })
     }
 
@@ -376,10 +441,7 @@ impl LustroPrngBatchPy {
     /// Returns an independent batch with identical lane states.
     /// Raises MemoryError if the lanes cannot be allocated.
     pub fn copy(&self) -> PyResult<Self> {
-        let inner = self
-            .inner
-            .try_clone()
-            .map_err(|_| crate::python::alloc_error())?;
+        let inner = self.inner.try_clone().map_err(crate::python::batch_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -572,7 +634,7 @@ impl LustroPrngBatchPy {
         let inner = self
             .inner
             .try_fork(&stream_ids)
-            .map_err(|_| crate::python::alloc_error())?;
+            .map_err(crate::python::batch_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -589,7 +651,7 @@ impl LustroPrngBatchPy {
         let inner = self
             .inner
             .try_fork_many(&stream_ids)
-            .map_err(|_| crate::python::alloc_error())?;
+            .map_err(crate::python::batch_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),
@@ -633,7 +695,7 @@ impl LustroPrngBatchPy {
         let inner = self
             .inner
             .try_fork_range(StreamId(first))
-            .map_err(|_| crate::python::alloc_error())?;
+            .map_err(crate::python::batch_error)?;
         Ok(Self {
             inner,
             blocks_buf: Vec::new(),

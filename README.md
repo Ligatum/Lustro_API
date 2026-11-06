@@ -7,7 +7,7 @@
 
 Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
 
-The core mechanism and the API implementation are considered non-cryptographic at this moment.
+The core mechanism and the API implementation are currently considered non-cryptographic.
 
 ## Get the Code
 
@@ -47,7 +47,7 @@ Running Lustro with the GIL disabled is not supported.
 
 ## Speed Test
 
-This repo is the full API implementation and also contains **Lustro_Speed_Tester.py**. It runs the equivalent sections on native Rust, Python and C layers. The results can be compared.
+The repo also contains **Lustro_Speed_Tester.py**. It runs equivalent sections on native Rust, Python and C layers. The results can be compared.
 
 `````bash
 # rust target (built on request only, no other build includes it)
@@ -222,7 +222,9 @@ other = LustroPrng.from_entropy(stream_id=5)  # another fresh seed, unrelated to
 
 The seed is not kept. To keep it, use `LustroPrng(os.urandom(32), 0)`.
 
-**C / C++** — `lustro_seed_from_entropy` fills a 32-byte seed from the system's entropy source;
+**C / C++**
+
+`lustro_seed_from_entropy` fills a 32-byte seed from the system's entropy source;
 `lustro_prng_from_entropy` creates a PRNG directly (stream ID as `hi`, `lo`, the seed is not kept):
 
 ```c
@@ -593,6 +595,71 @@ every identifier in `path` is a `fork`, since the message already is the root.
 
 ---
 
+### Fork into a Batch
+
+Derive many children of one stream in a single call. `fork_batch(ids)` returns a batch whose lane `i` is `fork(ids[i])`, and `fork_batch_range(first, count)` uses the IDs `first`, `first + 1`, ... `fork_path(path)` returns `fork(path[0]).fork(path[1])...` without the intermediate streams. All three start from the current state, like `fork`, and do not change the parent.
+
+**Rust**
+
+```rust
+use lustro::{LustroPrng, Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let rng = LustroPrng::new(&seed, StreamId(0));
+
+let children = rng.fork_batch(&[StreamId(10), StreamId(20)]); // LustroPrngBatch, 2 lanes
+let numbered = rng.fork_batch_range(StreamId(100), 8);        // ids 100 to 107
+let leaf = rng.fork_path(&[StreamId(12), StreamId(7)]);       // rng.fork(12).fork(7)
+```
+
+**Python**
+
+```python
+from lustro import LustroPrng
+
+rng = LustroPrng(bytes(32), 0)
+
+children = rng.fork_batch([10, 20])        # LustroPrngBatch, 2 lanes
+numbered = rng.fork_batch_range(100, 8)    # ids 100 to 107
+leaf = rng.fork_path([12, 7])              # rng.fork(12).fork(7)
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
+LustroPrng *rng = NULL;
+lustro_prng_new(seed, 0, 0, &rng);
+
+uint64_t ids_hi[2] = {0, 0};
+uint64_t ids_lo[2] = {10, 20};
+
+LustroPrngBatch *children = NULL;
+lustro_prng_fork_batch(rng, ids_hi, ids_lo, 2, &children);
+
+LustroPrngBatch *numbered = NULL;
+lustro_prng_fork_batch_range(rng, 0, 100, 8, &numbered);  /* first id as (hi, lo), then count */
+
+uint64_t path_hi[2] = {0, 0};
+uint64_t path_lo[2] = {12, 7};
+
+LustroPrng *leaf = NULL;
+lustro_prng_fork_path(rng, path_hi, path_lo, 2, &leaf);
+
+lustro_prng_free(leaf);
+lustro_prng_batch_free(numbered);
+lustro_prng_batch_free(children);
+lustro_prng_free(rng);
+```
+
+`LustroXof` has the same methods (`lustro_xof_fork_batch`, `lustro_xof_fork_batch_range` and `lustro_xof_fork_path` in C/C++) and returns a `LustroXofBatch`.
+
+For a stream that has not produced output yet, `fork_path` gives what `derive_path` gives: `LustroPrng::new(&seed, StreamId(5)).fork_path(path)` is `derive_path(&seed, [5] + path)`. It is for the cases `derive_path` does not cover: a stream from `from_entropy()`, a lane of a batch, a restored snapshot, or a stream that has already produced output. `path` must not be empty, with the same errors as `derive_path`. If the lanes cannot be allocated, `fork_batch` and `fork_batch_range` panic in Rust (`try_fork_batch` and `try_fork_batch_range` return `BatchError::Reserve`), Python raises `MemoryError`, and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`.
+
+---
+
 ## Batches
 
 ### Batch Hash
@@ -795,6 +862,8 @@ free(out);
 lustro_xof_batch_free(xof);
 ```
 
+`lustro_*_batch_len` returns 0 for an empty batch and also for `NULL`. `lustro_*_batch_get_len(ctx, &len)` tells the two apart: it returns `LUSTRO_ERROR_INVALID_POINTER` for `NULL` and writes nothing.
+
 In C/C++, `lustro_batch_block_offset(step, batch_len, lane)` from `lustro.h` gives the byte offset of one block in the output: `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`. It expects `step < steps` and `lane < batch_len` and does not check its arguments.
 
 ```c
@@ -910,6 +979,109 @@ lustro_xof_batch_free(xof);
 The result is an ordinary single stream (`LustroPrng` or `LustroXof`), so it supports typed reads, `fork` and snapshots.
 
 In Python, `batch[i]` does what `batch.lane(i)` does, and a negative `i` counts from the end (`batch[-1]` is the last lane). `for lane in batch` goes through all lanes in order. Each lane is a copy, and the loop uses the lane states as they were when it started, so later calls on the batch do not change it. Slices are not supported, and `lane(i)` itself still rejects a negative `i`.
+
+---
+
+### Single Streams into Batch
+
+Build a batch from single streams, one lane per stream, in order. Each lane continues its stream at the next block, so `batch.lane(i)` gives back a copy of stream `i`. The streams are not changed.
+
+A lane holds whole blocks only, so every stream must be at a block boundary: freshly created, or read in whole 32-byte blocks. A stream in the middle of a block is rejected rather than moved on, so no bytes are dropped. Read or skip the rest of the block first: a stream whose `position()` is not a multiple of 32 is inside a block, and `32 - position() % 32` more bytes bring it to the next boundary.
+
+**Rust**
+
+```rust
+// PRNG
+use lustro::{LustroPrng, LustroPrngBatch, Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let a = LustroPrng::new(&seed, StreamId(0));
+let mut b = LustroPrng::new(&seed, StreamId(1));
+b.next_u64();   // b is now inside a block
+
+// Err(BatchError::PartialBlock { index: 1 }); from_streams would panic.
+assert!(LustroPrngBatch::try_from_streams(&[a.clone(), b.clone()]).is_err());
+
+b.advance_bytes(24);   // the rest of the block
+let batch = LustroPrngBatch::from_streams(&[a, b]);
+```
+
+```rust
+// XOF
+use lustro::{LustroXof, LustroXofBatch};
+
+let a = LustroXof::new(b"msg0");
+let mut b = LustroXof::new(b"msg1");
+b.next_block();   // a whole block, b stays at a block boundary
+
+let batch = LustroXofBatch::from_streams(&[a, b]);
+```
+
+**Python**
+
+```python
+# PRNG
+from lustro import LustroPrng, LustroPrngBatch
+
+a = LustroPrng(bytes(32), 0)
+b = LustroPrng(bytes(32), 1)
+b.next_u64()          # b is now inside a block; from_streams would raise ValueError
+
+b.advance_bytes(24)   # the rest of the block
+batch = LustroPrngBatch.from_streams([a, b])
+```
+
+```python
+# XOF
+from lustro import LustroXof, LustroXofBatch
+
+a = LustroXof(b"msg0")
+b = LustroXof(b"msg1")
+b.next_block()
+
+batch = LustroXofBatch.from_streams([a, b])
+```
+
+**C / C++**
+
+```c
+/* PRNG */
+#include "lustro.h"
+
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
+LustroPrng *a = NULL;
+LustroPrng *b = NULL;
+lustro_prng_new(seed, 0, 0, &a);
+lustro_prng_new(seed, 0, 1, &b);
+
+const LustroPrng *streams[] = {a, b};
+LustroPrngBatch *batch = NULL;
+LustroError err = lustro_prng_batch_from_streams(streams, 2, &batch);  /* LUSTRO_ERROR_INVALID_ARGUMENT if a stream is inside a block */
+
+lustro_prng_batch_free(batch);
+lustro_prng_free(b);
+lustro_prng_free(a);
+```
+
+```c
+/* XOF */
+#include "lustro.h"
+
+LustroXof *a = NULL;
+LustroXof *b = NULL;
+lustro_xof_new((const uint8_t *)"msg0", 4, &a);
+lustro_xof_new((const uint8_t *)"msg1", 4, &b);
+
+const LustroXof *streams[] = {a, b};
+LustroXofBatch *batch = NULL;
+LustroError err = lustro_xof_batch_from_streams(streams, 2, &batch);
+
+lustro_xof_batch_free(batch);
+lustro_xof_free(b);
+lustro_xof_free(a);
+```
+
+The streams can come from different seeds or messages, and the same stream can appear more than once. A stream inside a block gives `BatchError::PartialBlock { index }` from `try_from_streams` in Rust (`index` is the first such stream; `from_streams` panics), `ValueError` in Python and `LUSTRO_ERROR_INVALID_ARGUMENT` in C/C++. If the lanes cannot be allocated, Rust returns `BatchError::Reserve` (or panics), Python raises `MemoryError` and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`. In C/C++ the streams stay owned by the caller and are freed separately.
 
 ---
 
@@ -1592,7 +1764,7 @@ n = rng.readinto(buf)         # n == 1000, any writable C-contiguous buffer
 
 Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, `hash128_many_var` and `LustroXofBatch` take any sequence of such objects, but not a single string or buffer.
 
-Stream IDs and path elements are Python ints from 0 to `2**128 - 1`; a negative or larger value raises `OverflowError`.
+Stream IDs and path elements are Python ints from 0 to `2**128 - 1`; a negative or larger value raises `OverflowError`. A list of them can be any sequence, for example a `tuple`, a `range` or a NumPy integer array.
 
 All four classes can be pickled, for example to pass them to a worker process. A pickle holds the same data as `export_snapshot()`, so the restored object continues from the same position. It is a copy, like `copy()`, not a new stream: workers that need independent streams should use `fork()` or different stream IDs. Pickles contain generator state and, as always, must not be loaded from untrusted sources. They refer to the class as `lustro.LustroPrng` and so on; to store state long term, use `export_snapshot()`.
 
@@ -1673,15 +1845,30 @@ let b = draw(&mut xof);
 // On a LustroPrng, fork takes a StreamId.
 let mut child = prng.fork(StreamId(1));
 let c = child.next_u64();
+
+// Clone keeps the exact state: both continue with the same bytes.
+let mut twin = prng.clone();
+assert_eq!(draw(&mut prng), draw(&mut twin));
+
+// Derive a stream from a seed (or message) and a path of identifiers.
+let seed = Seed256::from_bytes([7u8; 32]);
+let mut leaf = LustroPrng::derive_path(&seed, &[StreamId(12), StreamId(7)]);
+let mut leaf_xof = LustroXof::derive_path(b"message", &[StreamId(12), StreamId(7)]);
 ```
 
 - **Same stream:** `Rng` returns the same bytes, from the same position, as the
   inherent `next_u32`, `next_u64` and `fill_bytes`.
 - **Seeding:** `from_seed` starts at stream 0. `rand_core` 0.10 has no
   `from_entropy`; use `LustroPrng::from_entropy()?`.
-- **`fork`:** `LustroPrng::fork(StreamId)` shadows `SeedableRng::fork()` on a
-  concrete `LustroPrng`. Only code that is generic over `SeedableRng` calls the
-  trait method.
+- **`fork`:** on a concrete `LustroPrng`, `prng.fork(id)` is the inherent
+  `LustroPrng::fork(StreamId)`. The trait method `SeedableRng::fork()` runs in code
+  generic over `SeedableRng` or when called as `SeedableRng::fork(&mut prng)`; it
+  seeds a new generator from the next 32 bytes of `prng`.
+- **Clone and `derive_path`:** both exist on `LustroPrng` and `LustroXof` and work
+  without the `rand` feature. A clone repeats the same bytes, so do not use it to get
+  a second independent stream; use `fork` or `derive_path` for that. `derive_path` is
+  not a trait method, so generic code over `Rng` cannot call it; `clone` needs a
+  `Clone` bound.
 - **Quality:** implementing `Rng` is an interface, not a claim about cryptographic quality. `CryptoRng` is not implemented.
 
 ---

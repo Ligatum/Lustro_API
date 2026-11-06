@@ -113,6 +113,7 @@ impl From<crate::types::BatchError> for LustroError {
         match e {
             B::SizeOverflow | B::LengthMismatch { .. } => LustroError::InvalidLength,
             B::Reserve(_) => LustroError::OutOfMemory,
+            B::PartialBlock { .. } => LustroError::InvalidArgument,
         }
     }
 }

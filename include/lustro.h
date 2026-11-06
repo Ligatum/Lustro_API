@@ -19,8 +19,8 @@ typedef enum {
 	LUSTRO_ERROR_INVALID_KIND         = 8,
 	LUSTRO_ERROR_INVALID_CURSOR       = 9,
 	LUSTRO_ERROR_OUT_OF_MEMORY        = 10,
-	/* 11: lustro_configure; 12: lustro_configure and lustro_*_batch_lane;
-	 * 13: the entropy functions */
+	/* 11: lustro_configure; 12: lustro_configure, lustro_*_batch_lane and
+	 * lustro_*_batch_from_streams; 13: the entropy functions */
 	LUSTRO_ERROR_ALREADY_CONFIGURED   = 11,
 	LUSTRO_ERROR_INVALID_ARGUMENT     = 12,
 	LUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13
@@ -30,8 +30,8 @@ typedef enum {
  * 128-bit values.
  * Inputs (stream IDs) are passed as two uint64_t: `hi` (upper 64 bits) first, then `lo`.
  * Arrays of IDs are parallel arrays `*_hi` and `*_lo` of the same length.
- * Outputs (`lustro_*_next_u128`) are 16 bytes, little-endian: byte 0 is the lowest
- * byte of `lo`, byte 15 the highest byte of `hi`.
+ * Outputs (`lustro_*_next_u128`, `lustro_*_position`) are 16 bytes, little-endian:
+ * byte 0 is the lowest byte of `lo`, byte 15 the highest byte of `hi`.
  * The two helpers below convert between the forms. They do not depend on the host
  * byte order and do not check their pointers.
  */
@@ -485,6 +485,67 @@ LustroError lustro_prng_fork(const struct LustroPrng *ctx,
                              struct LustroPrng **out_ctx);
 
 /**
+ * Derives one child PRNG per identifier, as a batch: lane `i` is `lustro_prng_fork` with
+ * `(ids_hi[i], ids_lo[i])`. The parent is not changed.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+ * `n > 0`), `InvalidLength` for an `n` too large to address, `OutOfMemory` if the identifiers or
+ * the lane buffer cannot be allocated.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of `ctx`.
+ */
+LustroError lustro_prng_fork_batch(const struct LustroPrng *ctx,
+                                   const uint64_t *ids_hi,
+                                   const uint64_t *ids_lo,
+                                   uintptr_t n,
+                                   struct LustroPrngBatch **out_ctx);
+
+/**
+ * As `lustro_prng_fork_batch` with `count` sequential IDs starting at `first`, wrapping
+ * modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+ * be reserved.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of `ctx`.
+ */
+LustroError lustro_prng_fork_batch_range(const struct LustroPrng *ctx,
+                                         uint64_t first_hi,
+                                         uint64_t first_lo,
+                                         uintptr_t count,
+                                         struct LustroPrngBatch **out_ctx);
+
+/**
+ * Derives a PRNG from the current state along a path of `n` identifiers: the same as
+ * `lustro_prng_fork` for each ID in turn. IDs are passed as parallel `(hi, lo)` u64 arrays.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+ * `n > 0`), `InvalidLength` for `n == 0` or an `n` too large to address, `OutOfMemory` if the
+ * identifier array cannot be allocated.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrng` context that
+ * is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of `ctx`.
+ */
+LustroError lustro_prng_fork_path(const struct LustroPrng *ctx,
+                                  const uint64_t *ids_hi,
+                                  const uint64_t *ids_lo,
+                                  uintptr_t n,
+                                  struct LustroPrng **out_ctx);
+
+/**
  * Derives a PRNG from a 32-byte seed along a path of `n` identifiers.
  * IDs are passed as parallel `(hi, lo)` u64 arrays.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
@@ -612,6 +673,26 @@ LustroError lustro_prng_batch_lane(const struct LustroPrngBatch *ctx,
                                    struct LustroPrng **out_ctx);
 
 /**
+ * Creates a PRNG batch with one lane per stream, in order. Lane `i` continues
+ * `streams[i]` at its next block; the streams are not changed.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for a null or misaligned `streams` array (when `n > 0`)
+ * or element, `InvalidLength` for an `n` too large to address, `InvalidArgument` if a stream is
+ * inside a block (part of its current block unread), `OutOfMemory` if the lane buffer cannot be
+ * reserved.
+ *
+ * # Safety
+ * When `n > 0`, `streams` must be valid for `n` readable elements, each pointing to a live
+ * `LustroPrng` context that is not mutably accessed or freed during the call. The same context
+ * may appear more than once.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of the contexts.
+ */
+LustroError lustro_prng_batch_from_streams(const struct LustroPrng *const *streams,
+                                           uintptr_t n,
+                                           struct LustroPrngBatch **out_ctx);
+
+/**
  * Returns the number of streams, or 0 for null `ctx`.
  *
  * # Safety
@@ -619,6 +700,19 @@ LustroError lustro_prng_batch_lane(const struct LustroPrngBatch *ctx,
  * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_prng_batch_len(const struct LustroPrngBatch *ctx);
+
+/**
+ * Writes the number of streams to `*out_len`. Unlike `lustro_prng_batch_len`, a null `ctx`
+ * is reported (`InvalidPointer`, also for a null `out_len`) instead of reading as an empty
+ * batch. Nothing is written on error.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
+ * that is not mutably accessed or freed during the call.
+ * If `out_len` is non-null, it must be valid for writing one `uintptr_t` and must not
+ * overlap the context.
+ */
+LustroError lustro_prng_batch_get_len(const struct LustroPrngBatch *ctx, uintptr_t *out_len);
 
 /**
  * Returns the suggested `steps` for `fill_blocks` at the batch length,
@@ -926,6 +1020,67 @@ LustroError lustro_xof_fork(const struct LustroXof *ctx,
                             struct LustroXof **out_ctx);
 
 /**
+ * Derives one child XOF per identifier, as a batch: lane `i` is `lustro_xof_fork` with
+ * `(ids_hi[i], ids_lo[i])`. The parent is not changed.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+ * `n > 0`), `InvalidLength` for an `n` too large to address, `OutOfMemory` if the identifiers or
+ * the lane buffer cannot be allocated.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of `ctx`.
+ */
+LustroError lustro_xof_fork_batch(const struct LustroXof *ctx,
+                                  const uint64_t *ids_hi,
+                                  const uint64_t *ids_lo,
+                                  uintptr_t n,
+                                  struct LustroXofBatch **out_ctx);
+
+/**
+ * As `lustro_xof_fork_batch` with `count` sequential IDs starting at `first`, wrapping
+ * modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+ * be reserved.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of `ctx`.
+ */
+LustroError lustro_xof_fork_batch_range(const struct LustroXof *ctx,
+                                        uint64_t first_hi,
+                                        uint64_t first_lo,
+                                        uintptr_t count,
+                                        struct LustroXofBatch **out_ctx);
+
+/**
+ * Derives an XOF from the current state along a path of `n` identifiers: the same as
+ * `lustro_xof_fork` for each ID in turn. IDs are passed as parallel `(hi, lo)` u64 arrays.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+ * `n > 0`), `InvalidLength` for `n == 0` or an `n` too large to address, `OutOfMemory` if the
+ * identifier array cannot be allocated.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXof` context that
+ * is not mutably accessed or freed during the call.
+ * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of `ctx`.
+ */
+LustroError lustro_xof_fork_path(const struct LustroXof *ctx,
+                                 const uint64_t *ids_hi,
+                                 const uint64_t *ids_lo,
+                                 uintptr_t n,
+                                 struct LustroXof **out_ctx);
+
+/**
  * Derives an XOF from a message along a path of `n` identifiers.
  * IDs are passed as parallel `(hi, lo)` u64 arrays.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
@@ -1036,6 +1191,26 @@ LustroError lustro_xof_batch_lane(const struct LustroXofBatch *ctx,
                                   struct LustroXof **out_ctx);
 
 /**
+ * Creates an XOF batch with one lane per stream, in order. Lane `i` continues
+ * `streams[i]` at its next block; the streams are not changed.
+ * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+ * for a null or misaligned `out_ctx`, or for a null or misaligned `streams` array (when `n > 0`)
+ * or element, `InvalidLength` for an `n` too large to address, `InvalidArgument` if a stream is
+ * inside a block (part of its current block unread), `OutOfMemory` if the lane buffer cannot be
+ * reserved.
+ *
+ * # Safety
+ * When `n > 0`, `streams` must be valid for `n` readable elements, each pointing to a live
+ * `LustroXof` context that is not mutably accessed or freed during the call. The same context
+ * may appear more than once.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer
+ * and must not overlap any input buffer or the memory of the contexts.
+ */
+LustroError lustro_xof_batch_from_streams(const struct LustroXof *const *streams,
+                                          uintptr_t n,
+                                          struct LustroXofBatch **out_ctx);
+
+/**
  * Returns the number of streams, or 0 for null `ctx`.
  *
  * # Safety
@@ -1043,6 +1218,19 @@ LustroError lustro_xof_batch_lane(const struct LustroXofBatch *ctx,
  * that is not mutably accessed or freed during the call.
  */
 uintptr_t lustro_xof_batch_len(const struct LustroXofBatch *ctx);
+
+/**
+ * Writes the number of streams to `*out_len`. Unlike `lustro_xof_batch_len`, a null `ctx`
+ * is reported (`InvalidPointer`, also for a null `out_len`) instead of reading as an empty
+ * batch. Nothing is written on error.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+ * that is not mutably accessed or freed during the call.
+ * If `out_len` is non-null, it must be valid for writing one `uintptr_t` and must not
+ * overlap the context.
+ */
+LustroError lustro_xof_batch_get_len(const struct LustroXofBatch *ctx, uintptr_t *out_len);
 
 /**
  * Returns the suggested `steps` for `fill_blocks` at the batch length,

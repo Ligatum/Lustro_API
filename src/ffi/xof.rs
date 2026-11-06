@@ -6,7 +6,8 @@ use crate::xof::LustroXof;
 use crate::xof::LustroXofBatch;
 
 use super::types::{
-    buf_in, buf_out, bytes_in, fits_slice, ids_from_parts, messages_from_parts, slice_out,
+    buf_in, buf_out, bytes_in, ctx_array, fits_slice, ids_from_parts, messages_from_parts,
+    slice_out,
 };
 use super::{construct, guarded};
 
@@ -282,6 +283,99 @@ pub unsafe extern "C" fn lustro_xof_fork(
     })
 }
 
+/// Derives one child XOF per identifier, as a batch: lane `i` is `lustro_xof_fork` with
+/// `(ids_hi[i], ids_lo[i])`. The parent is not changed.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+/// `n > 0`), `InvalidLength` for an `n` too large to address, `OutOfMemory` if the identifiers or
+/// the lane buffer cannot be allocated.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
+/// `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer or the memory of `ctx`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_fork_batch(
+    ctx: *const LustroXof,
+    ids_hi: *const u64,
+    ids_lo: *const u64,
+    n: usize,
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        let ids = ids_from_parts(ids_hi, ids_lo, n)?;
+        (*ctx).try_fork_batch(&ids).map_err(LustroError::from)
+    })
+}
+
+/// As `lustro_xof_fork_batch` with `count` sequential IDs starting at `first`, wrapping
+/// modulo 2^128. `first` is passed as `(hi, lo)` u64 values.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx`, `OutOfMemory` if the lane buffer cannot
+/// be reserved.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer or the memory of `ctx`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_fork_batch_range(
+    ctx: *const LustroXof,
+    first_hi: u64,
+    first_lo: u64,
+    count: usize,
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        let first = ((first_hi as u128) << 64) | (first_lo as u128);
+        (*ctx)
+            .try_fork_batch_range(StreamId(first), count)
+            .map_err(LustroError::from)
+    })
+}
+
+/// Derives an XOF from the current state along a path of `n` identifiers: the same as
+/// `lustro_xof_fork` for each ID in turn. IDs are passed as parallel `(hi, lo)` u64 arrays.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for null `ctx` or a null or misaligned ID array (when
+/// `n > 0`), `InvalidLength` for `n == 0` or an `n` too large to address, `OutOfMemory` if the
+/// identifier array cannot be allocated.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXof` context that
+/// is not mutably accessed or freed during the call.
+/// `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer or the memory of `ctx`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_fork_path(
+    ctx: *const LustroXof,
+    ids_hi: *const u64,
+    ids_lo: *const u64,
+    n: usize,
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        if n == 0 {
+            return Err(LustroError::InvalidLength);
+        }
+        let path = ids_from_parts(ids_hi, ids_lo, n)?;
+        Ok((*ctx).fork_path(&path))
+    })
+}
+
 /// Derives an XOF from a message along a path of `n` identifiers.
 /// IDs are passed as parallel `(hi, lo)` u64 arrays.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
@@ -459,6 +553,33 @@ pub unsafe extern "C" fn lustro_xof_batch_lane(
     })
 }
 
+/// Creates an XOF batch with one lane per stream, in order. Lane `i` continues
+/// `streams[i]` at its next block; the streams are not changed.
+/// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
+/// for a null or misaligned `out_ctx`, or for a null or misaligned `streams` array (when `n > 0`)
+/// or element, `InvalidLength` for an `n` too large to address, `InvalidArgument` if a stream is
+/// inside a block (part of its current block unread), `OutOfMemory` if the lane buffer cannot be
+/// reserved.
+///
+/// # Safety
+/// When `n > 0`, `streams` must be valid for `n` readable elements, each pointing to a live
+/// `LustroXof` context that is not mutably accessed or freed during the call. The same context
+/// may appear more than once.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer
+/// and must not overlap any input buffer or the memory of the contexts.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_from_streams(
+    streams: *const *const LustroXof,
+    n: usize,
+    out_ctx: *mut *mut LustroXofBatch,
+) -> LustroError {
+    construct(out_ctx, || {
+        let streams = ctx_array(streams, n)?;
+        LustroXofBatch::try_from_stream_refs(streams.iter().map(|&p| &*p))
+            .map_err(LustroError::from)
+    })
+}
+
 /// Returns the number of streams, or 0 for null `ctx`.
 ///
 /// # Safety
@@ -470,6 +591,29 @@ pub unsafe extern "C" fn lustro_xof_batch_len(ctx: *const LustroXofBatch) -> usi
         return 0;
     }
     (*ctx).len()
+}
+
+/// Writes the number of streams to `*out_len`. Unlike `lustro_xof_batch_len`, a null `ctx`
+/// is reported (`InvalidPointer`, also for a null `out_len`) instead of reading as an empty
+/// batch. Nothing is written on error.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
+/// that is not mutably accessed or freed during the call.
+/// If `out_len` is non-null, it must be valid for writing one `uintptr_t` and must not
+/// overlap the context.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_batch_get_len(
+    ctx: *const LustroXofBatch,
+    out_len: *mut usize,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() || out_len.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        core::ptr::write_unaligned(out_len, (*ctx).len());
+        LustroError::Ok
+    })
 }
 
 /// Returns the suggested `steps` for `fill_blocks` at the batch length,
@@ -675,7 +819,9 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_range(
             return Err(LustroError::InvalidPointer);
         }
         let first = ((first_hi as u128) << 64) | (first_lo as u128);
-        (*ctx).try_fork_range(StreamId(first)).map_err(LustroError::from)
+        (*ctx)
+            .try_fork_range(StreamId(first))
+            .map_err(LustroError::from)
     })
 }
 

@@ -121,6 +121,27 @@ pub(super) unsafe fn messages_from_parts<'a>(
     Ok(messages)
 }
 
+/// Checks an array of `n` context pointers.
+/// `InvalidLength` if `n` is not addressable; `InvalidPointer` on a null or misaligned array
+/// (n > 0) or on a null or misaligned element.
+/// SAFETY: the array must be valid for `n` elements if n > 0.
+pub(super) unsafe fn ctx_array<'a, T>(
+    ptrs: *const *const T,
+    n: usize,
+) -> Result<&'a [*const T], LustroError> {
+    if !fits_slice::<*const T>(n) {
+        return Err(LustroError::InvalidLength);
+    }
+    let ptrs = slice_in(ptrs, n).ok_or(LustroError::InvalidPointer)?;
+    if ptrs
+        .iter()
+        .any(|&p| p.is_null() || (p as usize) % std::mem::align_of::<T>() != 0)
+    {
+        return Err(LustroError::InvalidPointer);
+    }
+    Ok(ptrs)
+}
+
 /// Whether byte ranges [a, a+a_len) and [b, b+b_len) overlap.
 /// Some(false)/Some(true) is the answer; None means a range's end overflowed
 /// usize, so the caller can't even address it — treat as invalid input.
