@@ -108,6 +108,65 @@ Digests are `Hash` and `Ord`, so they work as keys in `HashMap` and `BTreeMap`. 
 
 `parse()` reads a digest back from hex: 64 digits for `Hash256`, 32 for `Hash128`, either case, with an optional `0x` or `0X` prefix. Spaces are not trimmed. `ParseHashError` says whether the length or a digit is wrong. `Hash256::first_128()` returns the first 16 bytes as a `Hash128`, the same value `hash128` returns for that message. In Python use `bytes.fromhex(s)`.
 
+### Incremental Hash
+
+A message that is not in memory at once, such as a large file, can be hashed in pieces. The length of the whole message goes into the initial state, so it has to be known before the first byte. Pass it to the hasher; `update` then takes the bytes in pieces of any size, and the digest equals `hash256` of the whole message.
+
+**Rust**
+
+```rust
+use lustro::{hash256, hash256_reader, LustroHasher};
+use std::fs::File;
+
+let mut h = LustroHasher::new(11);
+h.update(b"hello ")?;
+h.update(b"world")?;
+assert_eq!(h.finalize()?, hash256(b"hello world"));
+
+// A file, read in 8 KiB pieces.
+let file = File::open("data.bin")?;
+let len = file.metadata()?.len();
+let digest = hash256_reader(len, file)?;
+```
+
+**Python**
+
+```python
+import os
+import lustro
+
+h = lustro.LustroHasher(11)
+h.update(b"hello ")
+h.update(b"world")
+assert h.digest() == lustro.hash256(b"hello world")
+
+h = lustro.LustroHasher(os.path.getsize("data.bin"))
+with open("data.bin", "rb") as f:
+    while chunk := f.read(1 << 16):
+        h.update(chunk)
+digest = h.digest()
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+LustroHasher *h = NULL;
+lustro_hasher_new(11, &h);
+lustro_hasher_update(h, (const uint8_t *)"hello ", 6);
+lustro_hasher_update(h, (const uint8_t *)"world", 5);
+
+uint8_t digest[LUSTRO_HASH256_LEN];
+lustro_hasher_finalize256(h, digest);
+lustro_hasher_free(h);
+```
+
+- **Length:** a piece that would go past the declared length is rejected whole (`HashError::TooMuchData` in Rust, `ValueError` in Python, `LUSTRO_ERROR_INVALID_LENGTH` in C/C++) and nothing of it is absorbed. Asking for the digest early fails the same way (`HashError::TooLittleData`), and more pieces can follow. `remaining()` (`lustro_hasher_remaining`) tells how many bytes are still expected.
+- **Digest:** reading it does not end the hasher; every call gives the same value. Its first 16 bytes are `hash128` of the message.
+- **Reader:** `hash256_reader(len, reader)` reads exactly `len` bytes and leaves the rest in the reader (pass `&mut reader` to keep it). A reader that ends early gives `ErrorKind::UnexpectedEof`.
+- **Copy:** `clone()` in Rust, `copy()` in Python and `lustro_hasher_clone` in C/C++ continue independently, for example to hash several messages of the same length that share a prefix.
+
 ---
 
 ### PRNG and XOF
@@ -193,6 +252,62 @@ lustro_xof_free(xof);
 Every constructor returns a `LustroError` and stores the new context in its last argument (`out_ctx`).
 On failure `*out_ctx` is set to `NULL` and the status tells why (`lustro_strerror` returns a message). The `lustro_*_free` functions accept `NULL`.
 The C examples below omit the status checks for brevity.
+
+### Incremental XOF
+
+`LustroXofAbsorber` is the XOF counterpart of the hasher from [Incremental Hash](#incremental-hash): give it the total length, feed the message with `update`, and `finalize` returns the `LustroXof` of the whole message. `LustroXof::from_reader` does the same from a reader, like `hash256_reader`.
+
+**Rust**
+
+```rust
+use lustro::{LustroXof, LustroXofAbsorber};
+use std::fs::File;
+
+let mut a = LustroXofAbsorber::new(11);
+a.update(b"hello ")?;
+a.update(b"world")?;
+let mut xof = a.finalize()?;
+assert_eq!(xof.next_u64(), LustroXof::new(b"hello world").next_u64());
+
+// A file, read in 8 KiB pieces.
+let file = File::open("data.bin")?;
+let len = file.metadata()?.len();
+let mut xof = LustroXof::from_reader(len, file)?;
+```
+
+**Python**
+
+```python
+import lustro
+
+a = lustro.LustroXofAbsorber(11)
+a.update(b"hello ")
+a.update(b"world")
+xof = a.finalize()
+assert xof.fill(64) == lustro.LustroXof(b"hello world").fill(64)
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+LustroXofAbsorber *a = NULL;
+lustro_xof_absorber_new(11, &a);
+lustro_xof_absorber_update(a, (const uint8_t *)"hello ", 6);
+lustro_xof_absorber_update(a, (const uint8_t *)"world", 5);
+
+LustroXof *xof = NULL;
+lustro_xof_absorber_finalize(a, &xof);
+lustro_xof_absorber_free(a);
+
+uint64_t value;
+lustro_xof_next_u64(xof, &value);
+lustro_xof_free(xof);
+```
+
+- **Errors:** as for the hasher. `finalize` before the declared length is reached fails (`HashError::TooLittleData`, `ValueError`, `LUSTRO_ERROR_INVALID_LENGTH` with `*out_ctx` set to `NULL`), and more pieces can follow.
+- **Stream:** `finalize` does not end the absorber; each call returns a new stream at position 0. In C it is an ordinary `LustroXof` context, freed with `lustro_xof_free`, also after the absorber is freed.
 
 ### Random Seed
 
@@ -1784,6 +1899,7 @@ An instance must not be used by several threads at the same time (an overlapping
 | `fill`, `fill_u64`, `blocks` | released while generating |
 | `advance_bytes`, `advance_blocks` | released while skipping |
 | `fill_into`, `readinto` | released for buffers of 4096 bytes or more, held below |
+| `LustroHasher.update`, `LustroXofAbsorber.update` | released for inputs of 4096 bytes or more, held below |
 
 By default (`release_gil=True`) other Python threads run during the call. Input is copied before the GIL is released and results are copied into `out` after it is taken back, which costs time on large batches.
 

@@ -13,16 +13,17 @@ pub use api::{configure, lustro_api_version, runtime_info, runtime_preview};
 pub use hash::{
     hash128, hash128_many_fixed, hash128_many_fixed_into, hash128_many_var, hash128_many_var_into,
     hash256, hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into,
+    hash256_reader, LustroHasher,
 };
 pub use prng::{LustroPrng, LustroPrngBatch};
 #[cfg(feature = "entropy")]
 pub use types::EntropyError;
 pub use types::{
-    BatchError, ConfigError, DerivePathError, Hash128, Hash256, LustroPrngBatchSnapshot,
+    BatchError, ConfigError, DerivePathError, Hash128, Hash256, HashError, LustroPrngBatchSnapshot,
     LustroPrngSnapshot, LustroXofBatchSnapshot, LustroXofSnapshot, ParseHashError, RuntimeInfo,
     RuntimeOptions, Seed256, SnapshotError, SnapshotKind, StreamId,
 };
-pub use xof::{LustroXof, LustroXofBatch};
+pub use xof::{LustroXof, LustroXofAbsorber, LustroXofBatch};
 
 pub mod hash;
 pub mod prng;
@@ -57,10 +58,12 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::hash::hash256_many_var_into_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_into_py, m)?)?;
     m.add("SnapshotError", m.py().get_type::<python::SnapshotError>())?;
+    m.add_class::<python::hash::LustroHasherPy>()?;
     m.add_class::<python::prng::LustroPrngPy>()?;
     m.add_class::<python::prng::LustroPrngBatchPy>()?;
     m.add_class::<python::xof::LustroXofPy>()?;
     m.add_class::<python::xof::LustroXofBatchPy>()?;
+    m.add_class::<python::xof::LustroXofAbsorberPy>()?;
     m.add_function(wrap_pyfunction!(python::lustro_api_version, m)?)?;
     m.add_function(wrap_pyfunction!(python::runtime_info, m)?)?;
     m.add_function(wrap_pyfunction!(python::runtime_preview, m)?)?;

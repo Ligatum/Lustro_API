@@ -47,14 +47,14 @@ pub(super) unsafe fn slice_out<'a, T>(ptr: *mut T, len: usize) -> Option<&'a mut
     Some(std::slice::from_raw_parts_mut(ptr, len))
 }
 
-/// Safely reconstructs a &[u8] from a C pointer + length.
+/// `slice_in` for bytes.
 /// SAFETY: ptr must be valid for len bytes if len > 0.
 #[inline]
 pub(super) unsafe fn buf_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     slice_in(ptr, len)
 }
 
-/// Safely reconstructs a &mut [u8] from a C pointer + length.
+/// `slice_out` for bytes.
 /// SAFETY: ptr must be valid for len bytes if len > 0.
 #[inline]
 pub(super) unsafe fn buf_out<'a>(ptr: *mut u8, len: usize) -> Option<&'a mut [u8]> {
@@ -144,7 +144,7 @@ pub(super) unsafe fn ctx_array<'a, T>(
 
 /// Whether byte ranges [a, a+a_len) and [b, b+b_len) overlap.
 /// Some(false)/Some(true) is the answer; None means a range's end overflowed
-/// usize, so the caller can't even address it — treat as invalid input.
+/// usize: the caller cannot address it, so it is invalid input.
 /// Zero-length ranges never overlap.
 #[inline]
 pub(super) fn ranges_overlap(

@@ -15,11 +15,12 @@ use crate::hash::hash128_many_var_into;
 use crate::hash::hash256 as hash256_impl;
 use crate::hash::hash256_many_fixed_into;
 use crate::hash::hash256_many_var_into;
+use crate::hash::LustroHasher;
 use crate::hash::{hash128_many_var_blocks, hash256_many_var_blocks};
 use crate::python::{
     bytes_arg, messages_arg, require_numpy, ListMessages, MessageSeq, Messages, DETACH_MIN,
 };
-use crate::types::{Hash128, Hash256};
+use crate::types::{Hash128, Hash256, HashError};
 
 // ==========================================
 // INPUT HELPERS
@@ -51,7 +52,7 @@ impl Drop for FlatRows {
     }
 }
 
-// Own copy — can't hold a &[u8] into NumPy's buffer across detach().
+// Own copy: a &[u8] into NumPy's buffer cannot be held across detach().
 // Row-contiguous views (a[::2], a[:, :16]) are accepted, ValueError if any row is not.
 fn copy_rows(view: ArrayView2<u8>) -> PyResult<FlatRows> {
     let (n, len) = view.dim();
@@ -86,7 +87,7 @@ fn non_contiguous_error() -> PyErr {
 // OUTPUT HELPERS
 // ==========================================
 
-// Digests go straight into the output array buffer.
+// `data` as a 2D uint8 array; TypeError otherwise.
 fn rows_array<'a, 'py>(data: &'a Bound<'py, PyAny>) -> PyResult<&'a Bound<'py, PyArray2<u8>>> {
     data.cast::<PyArray2<u8>>()
         .map_err(|_| crate::python::array_type_error("data", "a 2D numpy.ndarray of dtype uint8"))
@@ -319,6 +320,91 @@ pub fn hash128_py<'py>(
         py.detach(|| hash128_impl(&data))
     };
     PyBytes::new(py, result.as_bytes())
+}
+
+// ==========================================
+// INCREMENTAL HASH API
+// ==========================================
+
+pub(crate) fn hash_error(e: HashError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// `hash256` of a message given in pieces. The length of the whole message is passed to
+/// the constructor (it enters the initial state); `update` takes the bytes in pieces of
+/// any size and `digest()` returns `hash256` of their concatenation. For a 128-bit digest
+/// take the first 16 bytes.
+#[pyclass(name = "LustroHasher", module = "lustro")]
+pub struct LustroHasherPy {
+    inner: LustroHasher,
+}
+
+#[pymethods]
+impl LustroHasherPy {
+    /// `length` is the length of the whole message in bytes. It must fit in 64 bits
+    /// (OverflowError otherwise, also for negative).
+    #[new]
+    pub fn new(length: u64) -> Self {
+        Self {
+            inner: LustroHasher::new(length),
+        }
+    }
+
+    /// Absorbs the next bytes of the message: bytes or a byte buffer (`bytes` is not
+    /// copied, other buffers are). The GIL is released for 4096 bytes or more. Raises
+    /// ValueError and absorbs nothing if `data` is longer than what is left.
+    pub fn update(
+        &mut self,
+        py: Python<'_>,
+        #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
+    ) -> PyResult<()> {
+        let r = if data.len() < DETACH_MIN {
+            self.inner.update(&data)
+        } else {
+            py.detach(|| self.inner.update(&data))
+        };
+        r.map_err(hash_error)
+    }
+
+    /// `hash256` of the message as 32 bytes. Raises ValueError while bytes are left;
+    /// `update` can continue after it. The hasher is not ended: every call gives the
+    /// same digest.
+    pub fn digest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let d = self.inner.finalize().map_err(hash_error)?;
+        Ok(PyBytes::new(py, d.as_bytes()))
+    }
+
+    /// `digest()` as 64 lowercase hex digits.
+    pub fn hexdigest(&self) -> PyResult<String> {
+        self.inner
+            .finalize()
+            .map(|d| d.to_string())
+            .map_err(hash_error)
+    }
+
+    /// Bytes still expected before `digest()` succeeds.
+    pub fn remaining(&self) -> u64 {
+        self.inner.remaining()
+    }
+
+    /// Returns an independent hasher with the same absorbed bytes.
+    pub fn copy(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub fn __copy__(&self) -> Self {
+        self.copy()
+    }
+
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy()
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("LustroHasher(remaining={})", self.inner.remaining())
+    }
 }
 
 // ==========================================

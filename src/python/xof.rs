@@ -6,9 +6,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::borrow::Cow;
 
-use crate::python::{bytes_arg, ids_arg, messages_arg, u128_arg, MessageSeq};
+use crate::python::hash::hash_error;
+use crate::python::{bytes_arg, ids_arg, messages_arg, u128_arg, MessageSeq, DETACH_MIN};
 use crate::types::StreamId;
-use crate::xof::{LustroXof, LustroXofBatch};
+use crate::xof::{LustroXof, LustroXofAbsorber, LustroXofBatch};
 
 // ==========================================
 // XOF SINGLE API
@@ -266,6 +267,80 @@ impl LustroXofPy {
         Ok(Self {
             inner: LustroXof::import_snapshot(snapshot),
         })
+    }
+}
+
+// ==========================================
+// INCREMENTAL XOF API
+// ==========================================
+
+/// `LustroXof(message)` of a message given in pieces. The length of the whole message is
+/// passed to the constructor (it enters the initial state); `update` takes the bytes in
+/// pieces of any size and `finalize()` returns the stream of their concatenation.
+#[pyclass(name = "LustroXofAbsorber", module = "lustro")]
+pub struct LustroXofAbsorberPy {
+    inner: LustroXofAbsorber,
+}
+
+#[pymethods]
+impl LustroXofAbsorberPy {
+    /// `length` is the length of the whole message in bytes. It must fit in 64 bits
+    /// (OverflowError otherwise, also for negative).
+    #[new]
+    pub fn new(length: u64) -> Self {
+        Self {
+            inner: LustroXofAbsorber::new(length),
+        }
+    }
+
+    /// Absorbs the next bytes of the message: bytes or a byte buffer (`bytes` is not
+    /// copied, other buffers are). The GIL is released for 4096 bytes or more. Raises
+    /// ValueError and absorbs nothing if `data` is longer than what is left.
+    pub fn update(
+        &mut self,
+        py: Python<'_>,
+        #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
+    ) -> PyResult<()> {
+        let r = if data.len() < DETACH_MIN {
+            self.inner.update(&data)
+        } else {
+            py.detach(|| self.inner.update(&data))
+        };
+        r.map_err(hash_error)
+    }
+
+    /// New `LustroXof` of the message, at the start of the stream. Raises ValueError while
+    /// bytes are left; `update` can continue after it. The absorber is not ended: every
+    /// call gives the same stream.
+    pub fn finalize(&self) -> PyResult<LustroXofPy> {
+        self.inner
+            .finalize()
+            .map(|inner| LustroXofPy { inner })
+            .map_err(hash_error)
+    }
+
+    /// Bytes still expected before `finalize()` succeeds.
+    pub fn remaining(&self) -> u64 {
+        self.inner.remaining()
+    }
+
+    /// Returns an independent absorber with the same absorbed bytes.
+    pub fn copy(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub fn __copy__(&self) -> Self {
+        self.copy()
+    }
+
+    pub fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> Self {
+        self.copy()
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!("LustroXofAbsorber(remaining={})", self.inner.remaining())
     }
 }
 
@@ -581,7 +656,8 @@ impl LustroXofBatchPy {
     }
 
     /// Derives `len(ids)` children per lane. Parent-major order:
-    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result.
+    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result. ValueError if
+    /// `len(self) * len(ids)` overflows, MemoryError if the lanes cannot be allocated.
     pub fn fork_many(&self, #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>) -> PyResult<Self> {
         self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")

@@ -73,6 +73,27 @@ impl core::fmt::Display for ParseHashError {
 
 impl std::error::Error for ParseHashError {}
 
+/// Why `update` or `finalize` of `LustroHasher` or `LustroXofAbsorber` failed. Nothing is changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HashError {
+    /// `update` was given more bytes than are left of the declared length.
+    TooMuchData,
+    /// `finalize` was called before the declared length was reached.
+    TooLittleData,
+}
+
+impl core::fmt::Display for HashError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HashError::TooMuchData => f.write_str("more data than the declared length"),
+            HashError::TooLittleData => f.write_str("less data than the declared length"),
+        }
+    }
+}
+
+impl std::error::Error for HashError {}
+
 #[inline]
 fn hex_value(b: u8) -> Option<u8> {
     match b {

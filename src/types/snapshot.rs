@@ -215,7 +215,7 @@ impl LustroXofSnapshot {
         encode_single_snapshot(SnapshotKind::Xof, self.s0, self.s1, self.step, self.cursor)
     }
 
-    /// Deserializes a XOF snapshot from the 56-byte format.
+    /// Deserializes an XOF snapshot from the 56-byte format.
     #[inline]
     pub fn from_le_bytes(bytes: &[u8; SINGLE_SNAPSHOT_LEN]) -> Result<Self, SnapshotError> {
         let (s0, s1, step, cursor) = decode_single_snapshot(bytes, SnapshotKind::Xof)?;
@@ -409,7 +409,7 @@ impl LustroXofBatchSnapshot {
         out
     }
 
-    /// Deserializes a XOF batch snapshot.
+    /// Deserializes an XOF batch snapshot.
     /// Rejects trailing or missing bytes.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let lane_count = decode_batch_header(bytes, SnapshotKind::XofBatch)?;

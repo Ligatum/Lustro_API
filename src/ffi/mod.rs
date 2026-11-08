@@ -1,6 +1,6 @@
 //! Lustro V1 FFI — C-compatible interface.
-//! All functions are #[no_mangle] extern "C".
-//! Stateful modules use opaque pointers managed by Rust allocator.
+//! Exported functions are #[no_mangle] extern "C"; contexts are opaque pointers to values
+//! allocated by Rust.
 
 pub mod hash;
 pub mod prng;

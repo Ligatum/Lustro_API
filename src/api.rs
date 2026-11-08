@@ -52,7 +52,7 @@ pub fn configure(options: RuntimeOptions) -> Result<(), ConfigError> {
 // INTERNAL CORE API
 // ==========================================
 
-// PRNG step: IDM + ERD with counter.
+// Stream step (PRNG and XOF): IDM + ERD with the block counter.
 #[inline(always)]
 pub(crate) fn stream_step(s0: u128, s1: u128, step: u64) -> (u128, u128) {
     let (s0, s1) = idm_scalar_ref(s0, s1);
@@ -120,28 +120,45 @@ pub(crate) fn derive_path_lane(
 // Partial input is terminated with 0x80 and zero-padded.
 #[inline]
 pub(crate) fn absorb_with_domain(data: &[u8], domain: u128) -> (u128, u128) {
-    use crate::constants::{IV_S0, IV_S1};
-    let mut s0 = IV_S0;
-    let mut s1 = IV_S1;
-    s0 ^= domain;
-    let len64 = (data.len() as u64).wrapping_mul(8);
-    s1 ^= ((len64.rotate_left(17) as u128) << 64) | (len64 as u128);
+    let (mut s0, mut s1) = absorb_init(data.len() as u64, domain);
 
     let chunks = data.chunks_exact(32);
     let remainder = chunks.remainder();
 
     for block in chunks {
-        let b0 = u128::from_le_bytes(block[..16].try_into().unwrap());
-        let b1 = u128::from_le_bytes(block[16..].try_into().unwrap());
-        let prev0 = s0;
-        let prev1 = s1;
-        let (y0, y1) = evaluate_scalar(s0 ^ b0, s1 ^ b1);
-        s0 = y0 ^ prev0;
-        s1 = y1 ^ prev1;
+        (s0, s1) = absorb_block(s0, s1, block.try_into().unwrap());
     }
 
+    absorb_tail(s0, s1, remainder, data.is_empty())
+}
+
+// Initial state for a message of `len` bytes: the domain tag and the length in bits.
+// The length is committed before the first block, so it has to be known up front.
+#[inline(always)]
+pub(crate) fn absorb_init(len: u64, domain: u128) -> (u128, u128) {
+    use crate::constants::{IV_S0, IV_S1};
+    let len64 = len.wrapping_mul(8);
+    (
+        IV_S0 ^ domain,
+        IV_S1 ^ (((len64.rotate_left(17) as u128) << 64) | (len64 as u128)),
+    )
+}
+
+// Absorbs one full block with feed-forward.
+#[inline(always)]
+pub(crate) fn absorb_block(s0: u128, s1: u128, block: &[u8; 32]) -> (u128, u128) {
+    let b0 = u128::from_le_bytes(block[..16].try_into().unwrap());
+    let b1 = u128::from_le_bytes(block[16..].try_into().unwrap());
+    let (y0, y1) = evaluate_scalar(s0 ^ b0, s1 ^ b1);
+    (y0 ^ s0, y1 ^ s1)
+}
+
+// Ends the absorption after the full blocks. `remainder` is the partial last block,
+// `empty` is true for the empty message.
+#[inline]
+pub(crate) fn absorb_tail(s0: u128, s1: u128, remainder: &[u8], empty: bool) -> (u128, u128) {
     // Length is already committed; no terminator round is needed.
-    if remainder.is_empty() && !data.is_empty() {
+    if remainder.is_empty() && !empty {
         return (s0, s1);
     }
 
@@ -269,7 +286,8 @@ pub(crate) fn unbounded_read_error() -> std::io::Error {
     )
 }
 
-// Shared PRNG stream state and buffer management.
+// State of a PRNG or XOF stream: `(s0, s1)`, the block counter and the read position in
+// the current block.
 #[derive(Clone)]
 pub(crate) struct StreamState {
     s0: u128,

@@ -6,6 +6,7 @@ use super::*;
 // ==========================================
 // CONFIG
 // ==========================================
+// Values tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 
 // HASH POLICY PARAMETERS
 // Hash batches use the backend of their count (AVX2 from 4 messages); single messages use
@@ -24,7 +25,6 @@ pub(crate) struct HashParams {
     pub(crate) tasks_per_thread: usize,
 }
 
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 pub(super) const HASH_PARAMS: HashParams = HashParams {
     mt_threshold_messages: 2048,
     mt_threshold_bytes: 80 * 1024,
@@ -34,7 +34,6 @@ const _: () = assert!(HASH_PARAMS.tasks_per_thread > 0);
 
 // Scalar parameters of batches of messages of any lengths. Same values as `HASH_PARAMS`, tuned
 // apart from it.
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 pub(super) const HASH_VAR_PARAMS: HashParams = HashParams {
     mt_threshold_messages: 2048,
     mt_threshold_bytes: 80 * 1024,
@@ -42,7 +41,6 @@ pub(super) const HASH_VAR_PARAMS: HashParams = HashParams {
 };
 const _: () = assert!(HASH_VAR_PARAMS.tasks_per_thread > 0);
 
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 pub(super) const HASH_AVX2_PARAMS: HashParams = HashParams {
     mt_threshold_messages: 4096,
@@ -53,7 +51,6 @@ pub(super) const HASH_AVX2_PARAMS: HashParams = HashParams {
 const _: () = assert!(HASH_AVX2_PARAMS.tasks_per_thread > 0);
 
 // AVX2 parameters of batches of messages of any lengths.
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 pub(super) const HASH_AVX2_VAR_PARAMS: HashParams = HashParams {
     mt_threshold_messages: 3072,
@@ -143,7 +140,6 @@ impl StreamParams {
     }
 }
 
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 pub(super) const SCALAR_STREAM: StreamParams = StreamParams {
     chunk: ChunkRule::Adaptive {
         near_tasks: 8,
@@ -157,7 +153,6 @@ const _: () = assert!(matches!(
     ChunkRule::Adaptive { near_tasks, rounds } if near_tasks > 0 && rounds > 0
 ));
 
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 pub(super) const AVX2_STREAM: StreamParams = StreamParams {
     chunk: ChunkRule::Adaptive {
@@ -197,7 +192,6 @@ impl StepsPolicy {
     }
 }
 
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 pub(super) const SCALAR_STEPS: StepsPolicy = StepsPolicy {
     table: &[
         (640, 512),
@@ -216,7 +210,6 @@ pub(super) const SCALAR_STEPS: StepsPolicy = StepsPolicy {
     tail: 4,
 };
 
-// Tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 #[cfg(target_arch = "x86_64")]
 pub(super) const AVX2_STEPS: StepsPolicy = StepsPolicy {
     table: &[

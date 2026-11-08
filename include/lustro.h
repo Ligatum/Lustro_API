@@ -110,6 +110,18 @@ static inline void lustro_u128_to_parts(const uint8_t in[16], uint64_t *hi, uint
 #define LUSTRO_SIMD_SCALAR 2
 
 /**
+ * `hash256` of a message given in pieces. The length of the whole message enters the
+ * initial state, so it is passed to `new`; `update` takes the bytes in pieces of any
+ * size and `finalize` returns `hash256` of their concatenation. For a 128-bit digest
+ * use `Hash256::first_128()`.
+ *
+ * Errors leave the hasher unchanged: `update` past the declared length rejects the
+ * whole piece, and `finalize` before it is reached can be followed by more `update`.
+ * `finalize` does not consume the hasher and gives the same digest on every call.
+ */
+typedef struct LustroHasher LustroHasher;
+
+/**
  * PRNG stream. Cloning preserves the exact stream state and future sequence.
  */
 typedef struct LustroPrng LustroPrng;
@@ -123,6 +135,17 @@ typedef struct LustroPrngBatch LustroPrngBatch;
  * XOF stream. Cloning preserves the exact stream state and future sequence.
  */
 typedef struct LustroXof LustroXof;
+
+/**
+ * `LustroXof::new` of a message given in pieces. As in `LustroHasher`, the length of the
+ * whole message enters the initial state and is passed to `new`; `update` takes the bytes
+ * in pieces of any size and `finalize` returns the stream of their concatenation.
+ *
+ * Errors leave the absorber unchanged: `update` past the declared length rejects the
+ * whole piece, and `finalize` before it is reached can be followed by more `update`.
+ * `finalize` does not consume the absorber; every call returns the stream from its start.
+ */
+typedef struct LustroXofAbsorber LustroXofAbsorber;
 
 /**
  * Independent XOF streams advanced together by `fill_blocks`.
@@ -229,7 +252,6 @@ const char *lustro_strerror(int32_t code);
 
 /**
  * Computes a 256-bit hash into `out`.
- * `out` must point to at least 32 bytes.
  *
  * # Safety
  * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -240,7 +262,6 @@ LustroError lustro_hash256(const uint8_t *data, uintptr_t data_len, uint8_t *out
 
 /**
  * Computes a 128-bit hash into `out`.
- * `out` must point to at least 16 bytes.
  *
  * # Safety
  * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -248,6 +269,78 @@ LustroError lustro_hash256(const uint8_t *data, uintptr_t data_len, uint8_t *out
  * must not overlap.
  */
 LustroError lustro_hash128(const uint8_t *data, uintptr_t data_len, uint8_t *out);
+
+/**
+ * Starts a `lustro_hash256` of a message of exactly `total_len` bytes, given in pieces
+ * to `lustro_hasher_update`. Stores the new context in `*out_ctx` (null on failure) and
+ * returns the status: `InvalidPointer` for a null or misaligned `out_ctx`.
+ *
+ * # Safety
+ * If `out_ctx` is non-null, it must be valid for writing one pointer.
+ */
+LustroError lustro_hasher_new(uint64_t total_len, struct LustroHasher **out_ctx);
+
+/**
+ * Frees a hasher context. Passing null is safe (no-op).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroHasher` context
+ * allocated by this API. It must not have been freed already or be in use
+ * concurrently.
+ */
+void lustro_hasher_free(struct LustroHasher *ctx);
+
+/**
+ * Absorbs the next `data_len` bytes of the message. Returns `InvalidLength` and absorbs
+ * nothing if fewer than `data_len` bytes are left (or `data_len` exceeds isize::MAX);
+ * `InvalidPointer` for a null `ctx`, a null `data` with `data_len > 0`, or `data`
+ * overlapping the context.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroHasher` context and
+ * be exclusively accessible for the duration of the call.
+ * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+ */
+LustroError lustro_hasher_update(struct LustroHasher *ctx, const uint8_t *data, uintptr_t data_len);
+
+/**
+ * Writes the 32-byte `lustro_hash256` of the message to `out`. Returns `InvalidLength`
+ * while bytes are left (`out` is not written; more `lustro_hasher_update` calls can
+ * follow) and `InvalidPointer` for a null `ctx` or `out`, or `out` overlapping the
+ * context. The context is not changed: every call writes the same digest.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroHasher` context that
+ * is not mutably accessed or freed during the call.
+ * If `out` is non-null, it must be valid for 32 writable bytes.
+ */
+LustroError lustro_hasher_finalize256(const struct LustroHasher *ctx, uint8_t *out);
+
+/**
+ * Writes the number of bytes still expected before `lustro_hasher_finalize256` succeeds.
+ * Returns `InvalidPointer` for a null `ctx` or `out_remaining`, or `out_remaining`
+ * overlapping the context, writing nothing. `out_remaining` need not be aligned.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroHasher` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_remaining` is non-null, it must be valid for writing one `uint64_t`.
+ */
+LustroError lustro_hasher_remaining(const struct LustroHasher *ctx, uint64_t *out_remaining);
+
+/**
+ * Clones the hasher context: the copy holds the same absorbed bytes and continues
+ * independently. Stores the new context in `*out_ctx` (null on failure) and returns the
+ * status: `InvalidPointer` for a null or misaligned `out_ctx`, or for null `ctx`. An
+ * `out_ctx` overlapping the context is `InvalidPointer` too, and then `*out_ctx` is not
+ * written.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroHasher` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer.
+ */
+LustroError lustro_hasher_clone(const struct LustroHasher *ctx, struct LustroHasher **out_ctx);
 
 /**
  * Hashes `n` fixed-length messages into `out_ptr`.
@@ -365,7 +458,7 @@ LustroError lustro_prng_from_entropy(uint64_t stream_id_hi,
 void lustro_prng_free(struct LustroPrng *ctx);
 
 /**
- * Returns the next 32 random bits.
+ * Writes the next 32 bits of the stream to `*out` (`out` need not be aligned).
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -376,7 +469,7 @@ void lustro_prng_free(struct LustroPrng *ctx);
 LustroError lustro_prng_next_u32(struct LustroPrng *ctx, uint32_t *out);
 
 /**
- * Returns the next 64 random bits.
+ * Writes the next 64 bits of the stream to `*out` (`out` need not be aligned).
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -387,7 +480,7 @@ LustroError lustro_prng_next_u32(struct LustroPrng *ctx, uint32_t *out);
 LustroError lustro_prng_next_u64(struct LustroPrng *ctx, uint64_t *out);
 
 /**
- * Returns the next 128 random bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+ * Writes the next 128 bits of the stream to `out` as 16 bytes (LE). `lustro_u128_to_parts` splits them
  * into `(hi, lo)`.
  *
  * # Safety
@@ -395,7 +488,8 @@ LustroError lustro_prng_next_u64(struct LustroPrng *ctx, uint64_t *out);
  * be exclusively accessible for the duration of the call.
  * `out` must be valid for 16 writable bytes and must not overlap the context.
  */
-LustroError lustro_prng_next_u128(struct LustroPrng *ctx, uint8_t *out);
+LustroError lustro_prng_next_u128(struct LustroPrng *ctx,
+                                  uint8_t *out);
 
 /**
  * Writes the next full 32-byte block. Unread bytes of the current block are discarded.
@@ -731,7 +825,7 @@ uintptr_t lustro_prng_batch_suggested_steps(const struct LustroPrngBatch *ctx);
  * byte offset `(step * batch_len + lane) * 32`.
  *
  * # Safety
- * `ctx` must point to a live `LustroPrngBatch` context and be exclusively
+ * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context and be exclusively
  * accessible for the duration of the call.
  * When the expected output length is nonzero, `out` must be valid for
  * that many writable bytes and must not overlap the context.
@@ -900,7 +994,7 @@ LustroError lustro_xof_new(const uint8_t *message,
 void lustro_xof_free(struct LustroXof *ctx);
 
 /**
- * Returns the next 32 output bits.
+ * Writes the next 32 bits of the stream to `*out` (`out` need not be aligned).
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -911,7 +1005,7 @@ void lustro_xof_free(struct LustroXof *ctx);
 LustroError lustro_xof_next_u32(struct LustroXof *ctx, uint32_t *out);
 
 /**
- * Returns the next 64 output bits.
+ * Writes the next 64 bits of the stream to `*out` (`out` need not be aligned).
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -922,7 +1016,7 @@ LustroError lustro_xof_next_u32(struct LustroXof *ctx, uint32_t *out);
 LustroError lustro_xof_next_u64(struct LustroXof *ctx, uint64_t *out);
 
 /**
- * Returns the next 128 output bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+ * Writes the next 128 bits of the stream to `out` as 16 bytes (LE). `lustro_u128_to_parts` splits them
  * into `(hi, lo)`.
  *
  * # Safety
@@ -930,7 +1024,8 @@ LustroError lustro_xof_next_u64(struct LustroXof *ctx, uint64_t *out);
  * be exclusively accessible for the duration of the call.
  * `out` must be valid for 16 writable bytes and must not overlap the context.
  */
-LustroError lustro_xof_next_u128(struct LustroXof *ctx, uint8_t *out);
+LustroError lustro_xof_next_u128(struct LustroXof *ctx,
+                                 uint8_t *out);
 
 /**
  * Writes the next full 32-byte block. Unread bytes of the current block are discarded.
@@ -1129,6 +1224,87 @@ LustroError lustro_xof_export_snapshot(const struct LustroXof *ctx, uint8_t *out
 LustroError lustro_xof_import_snapshot(const uint8_t *bytes, struct LustroXof **out_ctx);
 
 /**
+ * Starts a `lustro_xof_new` of a message of exactly `total_len` bytes, given in pieces
+ * to `lustro_xof_absorber_update`. Stores the new context in `*out_ctx` (null on failure)
+ * and returns the status: `InvalidPointer` for a null or misaligned `out_ctx`.
+ *
+ * # Safety
+ * If `out_ctx` is non-null, it must be valid for writing one pointer.
+ */
+LustroError lustro_xof_absorber_new(uint64_t total_len, struct LustroXofAbsorber **out_ctx);
+
+/**
+ * Frees an absorber context. Passing null is safe (no-op).
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context
+ * allocated by this API. It must not have been freed already or be in use
+ * concurrently.
+ */
+void lustro_xof_absorber_free(struct LustroXofAbsorber *ctx);
+
+/**
+ * Absorbs the next `data_len` bytes of the message. Returns `InvalidLength` and absorbs
+ * nothing if fewer than `data_len` bytes are left (or `data_len` exceeds isize::MAX);
+ * `InvalidPointer` for a null `ctx`, a null `data` with `data_len > 0`, or `data`
+ * overlapping the context.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context and
+ * be exclusively accessible for the duration of the call.
+ * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+ */
+LustroError lustro_xof_absorber_update(struct LustroXofAbsorber *ctx,
+                                       const uint8_t *data,
+                                       uintptr_t data_len);
+
+/**
+ * Creates the XOF context `lustro_xof_new` would give for the whole message, at the start
+ * of the stream; free it with `lustro_xof_free`. Stores it in `*out_ctx` (null on failure)
+ * and returns the status: `InvalidLength` while bytes are left (more
+ * `lustro_xof_absorber_update` calls can follow), `InvalidPointer` for a null or
+ * misaligned `out_ctx`, or for null `ctx`. An `out_ctx` overlapping the context is
+ * `InvalidPointer` too, and then `*out_ctx` is not written. The absorber is not changed:
+ * every call gives the same stream.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer.
+ */
+LustroError lustro_xof_absorber_finalize(const struct LustroXofAbsorber *ctx,
+                                         struct LustroXof **out_ctx);
+
+/**
+ * Writes the number of bytes still expected before `lustro_xof_absorber_finalize`
+ * succeeds. Returns `InvalidPointer` for a null `ctx` or `out_remaining`, or
+ * `out_remaining` overlapping the context, writing nothing. `out_remaining` need not be
+ * aligned.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_remaining` is non-null, it must be valid for writing one `uint64_t`.
+ */
+LustroError lustro_xof_absorber_remaining(const struct LustroXofAbsorber *ctx,
+                                          uint64_t *out_remaining);
+
+/**
+ * Clones the absorber context: the copy holds the same absorbed bytes and continues
+ * independently. Stores the new context in `*out_ctx` (null on failure) and returns the
+ * status: `InvalidPointer` for a null or misaligned `out_ctx`, or for null `ctx`. An
+ * `out_ctx` overlapping the context is `InvalidPointer` too, and then `*out_ctx` is not
+ * written.
+ *
+ * # Safety
+ * If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context that
+ * is not mutably accessed or freed during the call.
+ * If `out_ctx` is non-null, it must be valid for writing one pointer.
+ */
+LustroError lustro_xof_absorber_clone(const struct LustroXofAbsorber *ctx,
+                                      struct LustroXofAbsorber **out_ctx);
+
+/**
  * Creates an XOF batch from `n` messages.
  * Messages are passed as parallel pointer/length arrays.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
@@ -1249,7 +1425,7 @@ uintptr_t lustro_xof_batch_suggested_steps(const struct LustroXofBatch *ctx);
  * byte offset `(step * batch_len + lane) * 32`.
  *
  * # Safety
- * `ctx` must point to a live `LustroXofBatch` context and be exclusively
+ * If `ctx` is non-null, it must point to a live `LustroXofBatch` context and be exclusively
  * accessible for the duration of the call.
  * When the expected output length is nonzero, `out` must be valid for
  * that many writable bytes and must not overlap the context.

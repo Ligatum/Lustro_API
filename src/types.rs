@@ -7,7 +7,7 @@ mod seed;
 mod snapshot;
 
 pub use batch::{BatchError, DerivePathError};
-pub use digest::{Hash128, Hash256, ParseHashError};
+pub use digest::{Hash128, Hash256, HashError, ParseHashError};
 pub use runtime::{ConfigError, RuntimeInfo, RuntimeOptions};
 #[cfg(feature = "entropy")]
 pub use seed::EntropyError;
@@ -22,11 +22,11 @@ pub(crate) use batch::fork_many_lane_count;
 pub(crate) use snapshot::batch_snapshot_encoded_len;
 
 //=================================
-// PRNG STREAM ID
+// STREAM ID
 //=================================
 
-/// Identifies a PRNG stream.
-/// Different IDs derive independent streams from the same seed.
+/// Identifies a stream: a PRNG stream of a seed, or a child in `fork` and `derive_path`
+/// (PRNG and XOF). Different IDs give independent streams of the same seed or parent.
 /// `Ord` compares the identifiers numerically.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

@@ -217,7 +217,6 @@ pub(crate) fn seq_items<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py,
 // ==========================================
 // GIL STATE
 // ==========================================
-// Whether the interpreter runs with the GIL; read once at module init.
 
 // Whether the GIL is enabled (False on a free-threaded build run without it). Read once, at
 // module init (`init_gil_flag`), so the later calls run no Python code. No `sys._is_gil_enabled`

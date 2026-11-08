@@ -1,7 +1,6 @@
 //! Lustro V1 — error codes of the C ABI.
 
-// NOTE: If you add a variant here, you MUST also update the manual
-// typedef enum definition in build.rs (generate_header fn).
+// A new variant also goes into the hand-written enum in build.rs (`generate_header`).
 /// Status code returned by the C ABI. Values are fixed.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,7 +10,7 @@ pub enum LustroError {
     Ok = 0,
     /// Length or size argument is invalid.
     InvalidLength = 1,
-    /// Required pointer is NULL or misaligned (hash functions: ranges overlap).
+    /// Required pointer is NULL or misaligned (hash functions and `lustro_hasher_*`: ranges overlap).
     InvalidPointer = 2,
     /// Reserved, not returned by V1 (`InvalidLength` is used instead).
     OutputTooSmall = 3,
@@ -124,6 +123,15 @@ impl From<crate::types::DerivePathError> for LustroError {
         match e {
             D::EmptyPath => LustroError::InvalidLength,
             D::Reserve(_) => LustroError::OutOfMemory,
+        }
+    }
+}
+
+impl From<crate::types::HashError> for LustroError {
+    fn from(e: crate::types::HashError) -> Self {
+        use crate::types::HashError as H;
+        match e {
+            H::TooMuchData | H::TooLittleData => LustroError::InvalidLength,
         }
     }
 }

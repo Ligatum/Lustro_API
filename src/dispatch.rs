@@ -964,7 +964,7 @@ pub(crate) fn suggested_steps(n: usize) -> usize {
     suggested_steps_with(Caps::detect(), runtime_config_peek().0.overrides(), n)
 }
 
-// Advances every lane by `steps` stream steps, planned for the capabilities of CPU and the runtime config.
+// Advances every lane by `steps` stream steps, planned for the CPU and the runtime config.
 // Output is step-major: `out[step * n + lane]`, with `n = lanes.len()`.
 pub(crate) fn dispatch_streams(lanes: &mut [StreamLane], out: &mut [[u8; 32]], steps: usize) {
     dispatch_streams_with(
@@ -1039,7 +1039,7 @@ fn execute_streams(
             }
             #[cfg(not(feature = "parallel"))]
             let _ = chunk;
-            // SAFETY: fallback to single thread when there is no pool.
+            // SAFETY: no pool: one call covers all lanes; out holds n * steps blocks.
             unsafe { process_lanes(backend, lanes, out_ptr.get(), n, 0, steps) };
         }
     }

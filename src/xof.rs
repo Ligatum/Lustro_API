@@ -7,9 +7,10 @@ use crate::api::{
 };
 use crate::constants::Domain;
 use crate::dispatch::{dispatch_streams, suggested_steps, StreamLane};
+use crate::hash::LustroHasher;
 use crate::types::{
-    fork_many_lane_count, BatchError, DerivePathError, LustroXofBatchSnapshot, LustroXofSnapshot,
-    StreamId,
+    fork_many_lane_count, BatchError, DerivePathError, HashError, LustroXofBatchSnapshot,
+    LustroXofSnapshot, StreamId,
 };
 use std::collections::TryReserveError;
 
@@ -31,6 +32,14 @@ impl LustroXof {
         Self {
             state: StreamState::new(s0, s1),
         }
+    }
+
+    /// `new` of the next `total_len` bytes of `reader`, read in pieces of up to 8 KiB.
+    /// Reading and its errors are the same as in `hash256_reader`.
+    pub fn from_reader<R: std::io::Read>(total_len: u64, reader: R) -> std::io::Result<Self> {
+        let mut absorber = LustroXofAbsorber::new(total_len);
+        absorber.inner.read_rest(reader)?;
+        Ok(absorber.stream())
     }
 
     /// Returns the next 4 bytes of the stream as a little-endian `u32`.
@@ -241,6 +250,70 @@ impl std::io::Read for LustroXof {
 
     fn read_to_string(&mut self, _buf: &mut String) -> std::io::Result<usize> {
         Err(crate::api::unbounded_read_error())
+    }
+}
+
+// ==========================================
+// RUST INCREMENTAL XOF API
+// ==========================================
+
+/// `LustroXof::new` of a message given in pieces. As in `LustroHasher`, the length of the
+/// whole message enters the initial state and is passed to `new`; `update` takes the bytes
+/// in pieces of any size and `finalize` returns the stream of their concatenation.
+///
+/// Errors leave the absorber unchanged: `update` past the declared length rejects the
+/// whole piece, and `finalize` before it is reached can be followed by more `update`.
+/// `finalize` does not consume the absorber; every call returns the stream from its start.
+#[must_use]
+#[derive(Clone)]
+pub struct LustroXofAbsorber {
+    inner: LustroHasher,
+}
+
+impl LustroXofAbsorber {
+    /// Starts absorbing a message of exactly `total_len` bytes.
+    pub fn new(total_len: u64) -> Self {
+        Self {
+            inner: LustroHasher::with_domain(total_len, Domain::Xof),
+        }
+    }
+
+    /// Absorbs the next `data.len()` bytes of the message. Returns
+    /// `Err(HashError::TooMuchData)` and absorbs nothing if fewer than `data.len()`
+    /// bytes are left.
+    pub fn update(&mut self, data: &[u8]) -> Result<(), HashError> {
+        self.inner.update(data)
+    }
+
+    /// The stream of the message, or `Err(HashError::TooLittleData)` while bytes are left.
+    pub fn finalize(&self) -> Result<LustroXof, HashError> {
+        if self.inner.remaining() != 0 {
+            return Err(HashError::TooLittleData);
+        }
+        Ok(self.stream())
+    }
+
+    /// Bytes still expected before `finalize` succeeds.
+    #[must_use]
+    #[inline]
+    pub fn remaining(&self) -> u64 {
+        self.inner.remaining()
+    }
+
+    fn stream(&self) -> LustroXof {
+        let (s0, s1) = self.inner.final_state();
+        LustroXof {
+            state: StreamState::new(s0, s1),
+        }
+    }
+}
+
+// Redacted: the state and the buffered bytes come from the message.
+impl core::fmt::Debug for LustroXofAbsorber {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LustroXofAbsorber")
+            .field("remaining", &self.inner.remaining())
+            .finish_non_exhaustive()
     }
 }
 

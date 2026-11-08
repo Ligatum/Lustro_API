@@ -93,7 +93,7 @@ pub unsafe extern "C" fn lustro_prng_free(ctx: *mut LustroPrng) {
     })
 }
 
-/// Returns the next 32 random bits.
+/// Writes the next 32 bits of the stream to `*out` (`out` need not be aligned).
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -114,7 +114,7 @@ pub unsafe extern "C" fn lustro_prng_next_u32(ctx: *mut LustroPrng, out: *mut u3
     })
 }
 
-/// Returns the next 64 random bits.
+/// Writes the next 64 bits of the stream to `*out` (`out` need not be aligned).
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -135,7 +135,7 @@ pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u6
     })
 }
 
-/// Returns the next 128 random bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+/// Writes the next 128 bits of the stream to `out` as 16 bytes (LE). `lustro_u128_to_parts` splits them
 /// into `(hi, lo)`.
 ///
 /// # Safety
@@ -706,7 +706,7 @@ pub unsafe extern "C" fn lustro_prng_batch_suggested_steps(ctx: *const LustroPrn
 /// byte offset `(step * batch_len + lane) * 32`.
 ///
 /// # Safety
-/// `ctx` must point to a live `LustroPrngBatch` context and be exclusively
+/// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context and be exclusively
 /// accessible for the duration of the call.
 /// When the expected output length is nonzero, `out` must be valid for
 /// that many writable bytes and must not overlap the context.

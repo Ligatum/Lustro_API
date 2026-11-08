@@ -1,10 +1,10 @@
 //! FFI bindings for Lustro Hash.
 
-use super::guarded;
 use super::types::{buf_in, buf_out, fits_slice, ranges_overlap, slice_in, slice_out};
+use super::{construct, guarded};
 use crate::dispatch::{map_ranges, RawMessages};
 use crate::errors::LustroError;
-use crate::hash::{hash128, hash256};
+use crate::hash::{hash128, hash256, LustroHasher};
 
 // ==========================================
 // FFI HASH API
@@ -64,7 +64,6 @@ unsafe fn check_var_table(
 }
 
 /// Computes a 256-bit hash into `out`.
-/// `out` must point to at least 32 bytes.
 ///
 /// # Safety
 /// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -101,7 +100,6 @@ pub unsafe extern "C" fn lustro_hash256(
 }
 
 /// Computes a 128-bit hash into `out`.
-/// `out` must point to at least 16 bytes.
 ///
 /// # Safety
 /// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -134,6 +132,171 @@ pub unsafe extern "C" fn lustro_hash128(
         let result = hash128(input);
         output.copy_from_slice(result.as_bytes());
         LustroError::Ok
+    })
+}
+
+// ==========================================
+// FFI INCREMENTAL HASH API
+// ==========================================
+
+/// Starts a `lustro_hash256` of a message of exactly `total_len` bytes, given in pieces
+/// to `lustro_hasher_update`. Stores the new context in `*out_ctx` (null on failure) and
+/// returns the status: `InvalidPointer` for a null or misaligned `out_ctx`.
+///
+/// # Safety
+/// If `out_ctx` is non-null, it must be valid for writing one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_hasher_new(
+    total_len: u64,
+    out_ctx: *mut *mut LustroHasher,
+) -> LustroError {
+    construct(out_ctx, || Ok(LustroHasher::new(total_len)))
+}
+
+/// Frees a hasher context. Passing null is safe (no-op).
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroHasher` context
+/// allocated by this API. It must not have been freed already or be in use
+/// concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_hasher_free(ctx: *mut LustroHasher) {
+    guarded((), || {
+        if !ctx.is_null() {
+            drop(Box::from_raw(ctx));
+        }
+    })
+}
+
+/// Absorbs the next `data_len` bytes of the message. Returns `InvalidLength` and absorbs
+/// nothing if fewer than `data_len` bytes are left (or `data_len` exceeds isize::MAX);
+/// `InvalidPointer` for a null `ctx`, a null `data` with `data_len > 0`, or `data`
+/// overlapping the context.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroHasher` context and
+/// be exclusively accessible for the duration of the call.
+/// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_hasher_update(
+    ctx: *mut LustroHasher,
+    data: *const u8,
+    data_len: usize,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !fits_slice::<u8>(data_len) {
+            return LustroError::InvalidLength;
+        }
+        let ctx_len = std::mem::size_of::<LustroHasher>();
+        match ranges_overlap(data, data_len, ctx as *const u8, ctx_len) {
+            Some(true) => return LustroError::InvalidPointer,
+            Some(false) => {}
+            None => return LustroError::InvalidLength,
+        }
+        let input = match buf_in(data, data_len) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        match (*ctx).update(input) {
+            Ok(()) => LustroError::Ok,
+            Err(e) => e.into(),
+        }
+    })
+}
+
+/// Writes the 32-byte `lustro_hash256` of the message to `out`. Returns `InvalidLength`
+/// while bytes are left (`out` is not written; more `lustro_hasher_update` calls can
+/// follow) and `InvalidPointer` for a null `ctx` or `out`, or `out` overlapping the
+/// context. The context is not changed: every call writes the same digest.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroHasher` context that
+/// is not mutably accessed or freed during the call.
+/// If `out` is non-null, it must be valid for 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_hasher_finalize256(
+    ctx: *const LustroHasher,
+    out: *mut u8,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let ctx_len = std::mem::size_of::<LustroHasher>();
+        if ranges_overlap(out as *const u8, 32, ctx as *const u8, ctx_len) != Some(false) {
+            return LustroError::InvalidPointer;
+        }
+        let output = match buf_out(out, 32) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        match (*ctx).finalize() {
+            Ok(d) => {
+                output.copy_from_slice(d.as_bytes());
+                LustroError::Ok
+            }
+            Err(e) => e.into(),
+        }
+    })
+}
+
+/// Writes the number of bytes still expected before `lustro_hasher_finalize256` succeeds.
+/// Returns `InvalidPointer` for a null `ctx` or `out_remaining`, or `out_remaining`
+/// overlapping the context, writing nothing. `out_remaining` need not be aligned.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroHasher` context that
+/// is not mutably accessed or freed during the call.
+/// If `out_remaining` is non-null, it must be valid for writing one `uint64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_hasher_remaining(
+    ctx: *const LustroHasher,
+    out_remaining: *mut u64,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() || out_remaining.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let ctx_len = std::mem::size_of::<LustroHasher>();
+        if ranges_overlap(out_remaining as *const u8, 8, ctx as *const u8, ctx_len) != Some(false) {
+            return LustroError::InvalidPointer;
+        }
+        core::ptr::write_unaligned(out_remaining, (*ctx).remaining());
+        LustroError::Ok
+    })
+}
+
+/// Clones the hasher context: the copy holds the same absorbed bytes and continues
+/// independently. Stores the new context in `*out_ctx` (null on failure) and returns the
+/// status: `InvalidPointer` for a null or misaligned `out_ctx`, or for null `ctx`. An
+/// `out_ctx` overlapping the context is `InvalidPointer` too, and then `*out_ctx` is not
+/// written.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroHasher` context that
+/// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_hasher_clone(
+    ctx: *const LustroHasher,
+    out_ctx: *mut *mut LustroHasher,
+) -> LustroError {
+    // `construct` writes NULL to `*out_ctx` first, which would overwrite part of the source.
+    if !ctx.is_null() {
+        let ctx_len = std::mem::size_of::<LustroHasher>();
+        let slot = std::mem::size_of::<*mut LustroHasher>();
+        if ranges_overlap(out_ctx as *const u8, slot, ctx as *const u8, ctx_len) != Some(false) {
+            return LustroError::InvalidPointer;
+        }
+    }
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        Ok((*ctx).clone())
     })
 }
 

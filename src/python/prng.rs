@@ -642,7 +642,8 @@ impl LustroPrngBatchPy {
     }
 
     /// Derives `len(ids)` children per lane. Parent-major order:
-    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result.
+    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result. ValueError if
+    /// `len(self) * len(ids)` overflows, MemoryError if the lanes cannot be allocated.
     pub fn fork_many(&self, #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>) -> PyResult<Self> {
         self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")

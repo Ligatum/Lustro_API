@@ -3,11 +3,12 @@
 use crate::errors::LustroError;
 use crate::types::StreamId;
 use crate::xof::LustroXof;
+use crate::xof::LustroXofAbsorber;
 use crate::xof::LustroXofBatch;
 
 use super::types::{
     buf_in, buf_out, bytes_in, ctx_array, fits_slice, ids_from_parts, messages_from_parts,
-    slice_out,
+    ranges_overlap, slice_out,
 };
 use super::{construct, guarded};
 
@@ -52,7 +53,7 @@ pub unsafe extern "C" fn lustro_xof_free(ctx: *mut LustroXof) {
     })
 }
 
-/// Returns the next 32 output bits.
+/// Writes the next 32 bits of the stream to `*out` (`out` need not be aligned).
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -73,7 +74,7 @@ pub unsafe extern "C" fn lustro_xof_next_u32(ctx: *mut LustroXof, out: *mut u32)
     })
 }
 
-/// Returns the next 64 output bits.
+/// Writes the next 64 bits of the stream to `*out` (`out` need not be aligned).
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -94,7 +95,7 @@ pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64)
     })
 }
 
-/// Returns the next 128 output bits as 16 bytes (LE). `lustro_u128_to_parts` splits them
+/// Writes the next 128 bits of the stream to `out` as 16 bytes (LE). `lustro_u128_to_parts` splits them
 /// into `(hi, lo)`.
 ///
 /// # Safety
@@ -461,6 +462,169 @@ pub unsafe extern "C" fn lustro_xof_import_snapshot(
 }
 
 // ==========================================
+// FFI INCREMENTAL XOF API
+// ==========================================
+
+/// Starts a `lustro_xof_new` of a message of exactly `total_len` bytes, given in pieces
+/// to `lustro_xof_absorber_update`. Stores the new context in `*out_ctx` (null on failure)
+/// and returns the status: `InvalidPointer` for a null or misaligned `out_ctx`.
+///
+/// # Safety
+/// If `out_ctx` is non-null, it must be valid for writing one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_absorber_new(
+    total_len: u64,
+    out_ctx: *mut *mut LustroXofAbsorber,
+) -> LustroError {
+    construct(out_ctx, || Ok(LustroXofAbsorber::new(total_len)))
+}
+
+/// Frees an absorber context. Passing null is safe (no-op).
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context
+/// allocated by this API. It must not have been freed already or be in use
+/// concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_absorber_free(ctx: *mut LustroXofAbsorber) {
+    guarded((), || {
+        if !ctx.is_null() {
+            drop(Box::from_raw(ctx));
+        }
+    })
+}
+
+/// Absorbs the next `data_len` bytes of the message. Returns `InvalidLength` and absorbs
+/// nothing if fewer than `data_len` bytes are left (or `data_len` exceeds isize::MAX);
+/// `InvalidPointer` for a null `ctx`, a null `data` with `data_len > 0`, or `data`
+/// overlapping the context.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context and
+/// be exclusively accessible for the duration of the call.
+/// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_absorber_update(
+    ctx: *mut LustroXofAbsorber,
+    data: *const u8,
+    data_len: usize,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !fits_slice::<u8>(data_len) {
+            return LustroError::InvalidLength;
+        }
+        let ctx_len = std::mem::size_of::<LustroXofAbsorber>();
+        match ranges_overlap(data, data_len, ctx as *const u8, ctx_len) {
+            Some(true) => return LustroError::InvalidPointer,
+            Some(false) => {}
+            None => return LustroError::InvalidLength,
+        }
+        let input = match buf_in(data, data_len) {
+            Some(s) => s,
+            None => return LustroError::InvalidPointer,
+        };
+        match (*ctx).update(input) {
+            Ok(()) => LustroError::Ok,
+            Err(e) => e.into(),
+        }
+    })
+}
+
+/// Creates the XOF context `lustro_xof_new` would give for the whole message, at the start
+/// of the stream; free it with `lustro_xof_free`. Stores it in `*out_ctx` (null on failure)
+/// and returns the status: `InvalidLength` while bytes are left (more
+/// `lustro_xof_absorber_update` calls can follow), `InvalidPointer` for a null or
+/// misaligned `out_ctx`, or for null `ctx`. An `out_ctx` overlapping the context is
+/// `InvalidPointer` too, and then `*out_ctx` is not written. The absorber is not changed:
+/// every call gives the same stream.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context that
+/// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_absorber_finalize(
+    ctx: *const LustroXofAbsorber,
+    out_ctx: *mut *mut LustroXof,
+) -> LustroError {
+    // `construct` writes NULL to `*out_ctx` first, which would overwrite part of the absorber.
+    if !ctx.is_null() {
+        let ctx_len = std::mem::size_of::<LustroXofAbsorber>();
+        let slot = std::mem::size_of::<*mut LustroXof>();
+        if ranges_overlap(out_ctx as *const u8, slot, ctx as *const u8, ctx_len) != Some(false) {
+            return LustroError::InvalidPointer;
+        }
+    }
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        (*ctx).finalize().map_err(LustroError::from)
+    })
+}
+
+/// Writes the number of bytes still expected before `lustro_xof_absorber_finalize`
+/// succeeds. Returns `InvalidPointer` for a null `ctx` or `out_remaining`, or
+/// `out_remaining` overlapping the context, writing nothing. `out_remaining` need not be
+/// aligned.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context that
+/// is not mutably accessed or freed during the call.
+/// If `out_remaining` is non-null, it must be valid for writing one `uint64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_absorber_remaining(
+    ctx: *const LustroXofAbsorber,
+    out_remaining: *mut u64,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if ctx.is_null() || out_remaining.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let ctx_len = std::mem::size_of::<LustroXofAbsorber>();
+        if ranges_overlap(out_remaining as *const u8, 8, ctx as *const u8, ctx_len) != Some(false) {
+            return LustroError::InvalidPointer;
+        }
+        core::ptr::write_unaligned(out_remaining, (*ctx).remaining());
+        LustroError::Ok
+    })
+}
+
+/// Clones the absorber context: the copy holds the same absorbed bytes and continues
+/// independently. Stores the new context in `*out_ctx` (null on failure) and returns the
+/// status: `InvalidPointer` for a null or misaligned `out_ctx`, or for null `ctx`. An
+/// `out_ctx` overlapping the context is `InvalidPointer` too, and then `*out_ctx` is not
+/// written.
+///
+/// # Safety
+/// If `ctx` is non-null, it must point to a live `LustroXofAbsorber` context that
+/// is not mutably accessed or freed during the call.
+/// If `out_ctx` is non-null, it must be valid for writing one pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_xof_absorber_clone(
+    ctx: *const LustroXofAbsorber,
+    out_ctx: *mut *mut LustroXofAbsorber,
+) -> LustroError {
+    // `construct` writes NULL to `*out_ctx` first, which would overwrite part of the source.
+    if !ctx.is_null() {
+        let ctx_len = std::mem::size_of::<LustroXofAbsorber>();
+        let slot = std::mem::size_of::<*mut LustroXofAbsorber>();
+        if ranges_overlap(out_ctx as *const u8, slot, ctx as *const u8, ctx_len) != Some(false) {
+            return LustroError::InvalidPointer;
+        }
+    }
+    construct(out_ctx, || {
+        if ctx.is_null() {
+            return Err(LustroError::InvalidPointer);
+        }
+        Ok((*ctx).clone())
+    })
+}
+
+// ==========================================
 // FFI XOF BATCH API
 // ==========================================
 
@@ -638,7 +802,7 @@ pub unsafe extern "C" fn lustro_xof_batch_suggested_steps(ctx: *const LustroXofB
 /// byte offset `(step * batch_len + lane) * 32`.
 ///
 /// # Safety
-/// `ctx` must point to a live `LustroXofBatch` context and be exclusively
+/// If `ctx` is non-null, it must point to a live `LustroXofBatch` context and be exclusively
 /// accessible for the duration of the call.
 /// When the expected output length is nonzero, `out` must be valid for
 /// that many writable bytes and must not overlap the context.
