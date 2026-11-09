@@ -461,7 +461,7 @@ impl LustroPrngBatchPy {
         slf: &Bound<'py, Self>,
     ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
         let restore = slf.get_type().getattr("import_snapshot")?;
-        let bytes = slf.try_borrow()?.export_snapshot(slf.py());
+        let bytes = slf.try_borrow()?.export_snapshot(slf.py())?;
         Ok((restore, (bytes,)))
     }
 
@@ -705,19 +705,24 @@ impl LustroPrngBatchPy {
 
     /// Exports the current state as `16 + len(self) * 48` bytes. The snapshot holds every
     /// lane's state: whoever has it can reproduce the rest of each stream and its forks. Keep
-    /// it as private as the seed.
-    pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let snapshot = self.inner.export_snapshot();
-        PyBytes::new(py, &snapshot.to_le_bytes())
+    /// it as private as the seed. Raises MemoryError if the buffers cannot be allocated.
+    pub fn export_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self
+            .inner
+            .try_export_snapshot()
+            .and_then(|snapshot| snapshot.try_to_le_bytes())
+            .map_err(crate::python::batch_error)?;
+        crate::python::try_bytes(py, &bytes)
     }
 
     /// Restores a batch from `export_snapshot()` bytes.
-    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or lane count.
+    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or lane count,
+    /// MemoryError if the lanes cannot be allocated.
     #[staticmethod]
     pub fn import_snapshot(
         #[pyo3(from_py_with = bytes_arg)] bytes: Cow<'_, [u8]>,
     ) -> PyResult<Self> {
-        let snapshot = crate::types::LustroPrngBatchSnapshot::from_le_bytes(&bytes)
+        let snapshot = crate::types::LustroPrngBatchSnapshot::try_from_le_bytes(&bytes)
             .map_err(crate::python::snapshot_error)?;
 
         let inner = LustroPrngBatch::import_snapshot(snapshot);

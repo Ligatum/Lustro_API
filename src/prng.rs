@@ -635,23 +635,31 @@ impl LustroPrngBatch {
     /// Batch snapshots are block-aligned and have no cursor.
     /// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
     /// stream and its forks. Keep it as private as the seed.
+    /// Panics if the lane buffer cannot be allocated.
     #[must_use]
     pub fn export_snapshot(&self) -> LustroPrngBatchSnapshot {
-        let lanes = self
-            .streams
-            .iter()
-            .map(|lane| (lane.s0, lane.s1, lane.step))
-            .collect();
-        LustroPrngBatchSnapshot::new(lanes)
+        match self.try_export_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(BatchError::Reserve(e)) => panic!("export_snapshot: lane allocation failed: {e:?}"),
+            Err(e) => panic!("export_snapshot: {e}"),
+        }
+    }
+
+    /// As `export_snapshot`, returning `Err(BatchError::Reserve)` if reserving the lane buffer
+    /// fails. Never returns another variant.
+    pub fn try_export_snapshot(&self) -> Result<LustroPrngBatchSnapshot, BatchError> {
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(self.streams.len())
+            .map_err(BatchError::Reserve)?;
+        lanes.extend_from_slice(&self.streams);
+        Ok(LustroPrngBatchSnapshot::new(lanes))
     }
 
     /// Restores a batch from a snapshot.
     pub fn import_snapshot(snapshot: LustroPrngBatchSnapshot) -> Self {
-        let streams = snapshot
-            .into_lanes()
-            .into_iter()
-            .map(|(s0, s1, step)| StreamLane { s0, s1, step })
-            .collect();
-        Self { streams }
+        Self {
+            streams: snapshot.into_lanes(),
+        }
     }
 }

@@ -731,7 +731,7 @@ fn hash_single<const N: usize>(
 // BATCH STREAM API
 // ==========================================
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamLane {
     pub(crate) s0: u128,
     pub(crate) s1: u128,

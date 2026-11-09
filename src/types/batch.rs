@@ -29,7 +29,7 @@ impl std::error::Error for DerivePathError {
     }
 }
 
-/// Why a batch operation failed in `try_new`, `try_new_range`, `try_from_streams`, `try_fork`, `try_fork_many`, `try_fork_range`, `try_fork_batch`, `try_fork_batch_range`, `try_clone` or `try_blocks`.
+/// Why a batch operation failed in `try_new`, `try_new_range`, `try_from_streams`, `try_fork`, `try_fork_many`, `try_fork_range`, `try_fork_batch`, `try_fork_batch_range`, `try_clone`, `try_blocks`, `try_export_snapshot` or `try_to_le_bytes`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BatchError {

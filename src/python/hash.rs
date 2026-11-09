@@ -326,8 +326,16 @@ pub fn hash128_py<'py>(
 // INCREMENTAL HASH API
 // ==========================================
 
-pub(crate) fn hash_error(e: HashError) -> PyErr {
-    pyo3::exceptions::PyValueError::new_err(e.to_string())
+// `remaining` is what the hasher or absorber still expects; `piece` is the length passed to
+// `update` (None for `digest` and `finalize`). An error changes nothing, so `remaining`
+// can be read after it.
+pub(crate) fn hash_error(e: HashError, remaining: u64, piece: Option<usize>) -> PyErr {
+    let msg = match (e, piece) {
+        (HashError::TooMuchData, Some(n)) => format!("{e}: piece of {n}, {remaining} left"),
+        (HashError::TooLittleData, _) => format!("{e}: {remaining} left"),
+        _ => e.to_string(),
+    };
+    pyo3::exceptions::PyValueError::new_err(msg)
 }
 
 /// `hash256` of a message given in pieces. The length of the whole message is passed to
@@ -363,14 +371,17 @@ impl LustroHasherPy {
         } else {
             py.detach(|| self.inner.update(&data))
         };
-        r.map_err(hash_error)
+        r.map_err(|e| hash_error(e, self.inner.remaining(), Some(data.len())))
     }
 
     /// `hash256` of the message as 32 bytes. Raises ValueError while bytes are left;
     /// `update` can continue after it. The hasher is not ended: every call gives the
     /// same digest.
     pub fn digest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let d = self.inner.finalize().map_err(hash_error)?;
+        let d = self
+            .inner
+            .finalize()
+            .map_err(|e| hash_error(e, self.inner.remaining(), None))?;
         Ok(PyBytes::new(py, d.as_bytes()))
     }
 
@@ -379,7 +390,7 @@ impl LustroHasherPy {
         self.inner
             .finalize()
             .map(|d| d.to_string())
-            .map_err(hash_error)
+            .map_err(|e| hash_error(e, self.inner.remaining(), None))
     }
 
     /// Bytes still expected before `digest()` succeeds.

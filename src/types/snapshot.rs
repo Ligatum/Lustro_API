@@ -1,7 +1,10 @@
 //! Lustro V1 — PRNG/XOF snapshot types and their binary format.
 
+use crate::dispatch::StreamLane;
+
 use super::{
-    LUSTRO_BATCH_SNAPSHOT_HEADER_LEN, LUSTRO_BATCH_SNAPSHOT_LANE_LEN, LUSTRO_SNAPSHOT_LEN,
+    BatchError, LUSTRO_BATCH_SNAPSHOT_HEADER_LEN, LUSTRO_BATCH_SNAPSHOT_LANE_LEN,
+    LUSTRO_SNAPSHOT_LEN,
 };
 
 //==========================
@@ -37,6 +40,8 @@ pub enum SnapshotError {
     InvalidCursor,
     /// Length does not match the format.
     InvalidLength,
+    /// Reserving the decoded lane buffer failed (`try_from_le_bytes` of a batch snapshot).
+    Reserve,
 }
 
 impl core::fmt::Display for SnapshotError {
@@ -46,6 +51,7 @@ impl core::fmt::Display for SnapshotError {
             SnapshotError::InvalidKind => write!(f, "snapshot kind does not match this type"),
             SnapshotError::InvalidCursor => write!(f, "invalid snapshot cursor value"),
             SnapshotError::InvalidLength => write!(f, "invalid snapshot length"),
+            SnapshotError::Reserve => write!(f, "snapshot buffer reservation failed"),
         }
     }
 }
@@ -262,12 +268,12 @@ fn encode_batch_lane(bytes: &mut [u8], s0: u128, s1: u128, step: u64) {
 }
 
 #[inline]
-fn decode_batch_lane(bytes: &[u8]) -> (u128, u128, u64) {
+fn decode_batch_lane(bytes: &[u8]) -> StreamLane {
     debug_assert_eq!(bytes.len(), BATCH_LANE_LEN);
     let s0 = u128::from_le_bytes(bytes[0..16].try_into().unwrap());
     let s1 = u128::from_le_bytes(bytes[16..32].try_into().unwrap());
     let step = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    (s0, s1, step)
+    StreamLane { s0, s1, step }
 }
 
 // Validates the header and exact encoded length.
@@ -302,7 +308,7 @@ fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64,
 /// Debug output is redacted; each lane holds stream state, which continues that stream and its forks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LustroPrngBatchSnapshot {
-    lanes: Vec<(u128, u128, u64)>,
+    lanes: Vec<StreamLane>,
 }
 
 impl core::fmt::Debug for LustroPrngBatchSnapshot {
@@ -318,40 +324,66 @@ impl TryFrom<&[u8]> for LustroPrngBatchSnapshot {
     type Error = SnapshotError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        Self::from_le_bytes(bytes)
+        Self::try_from_le_bytes(bytes)
     }
 }
 
 impl LustroPrngBatchSnapshot {
     #[inline]
-    pub(crate) fn new(lanes: Vec<(u128, u128, u64)>) -> Self {
+    pub(crate) fn new(lanes: Vec<StreamLane>) -> Self {
         Self { lanes }
     }
 
     #[inline]
-    pub(crate) fn into_lanes(self) -> Vec<(u128, u128, u64)> {
+    pub(crate) fn into_lanes(self) -> Vec<StreamLane> {
         self.lanes
     }
 
     /// Serializes the batch snapshot to its variable-length format.
+    /// Panics if the output buffer cannot be allocated.
     #[must_use]
     pub fn to_le_bytes(&self) -> Vec<u8> {
+        match self.try_to_le_bytes() {
+            Ok(out) => out,
+            Err(BatchError::Reserve(e)) => panic!("to_le_bytes: allocation failed: {e:?}"),
+            Err(e) => panic!("to_le_bytes: {e}"),
+        }
+    }
+
+    /// As `to_le_bytes`, returning `Err(BatchError::Reserve)` if reserving the output fails.
+    /// Never returns another variant.
+    pub fn try_to_le_bytes(&self) -> Result<Vec<u8>, BatchError> {
         let lane_count = self.lanes.len() as u64;
-        let mut out = Vec::with_capacity(BATCH_HEADER_LEN + self.lanes.len() * BATCH_LANE_LEN);
+        let mut out = Vec::new();
+        // No overflow: the lanes already fill at most isize::MAX bytes, at least 40 each.
+        out.try_reserve_exact(BATCH_HEADER_LEN + self.lanes.len() * BATCH_LANE_LEN)
+            .map_err(BatchError::Reserve)?;
         out.extend_from_slice(&encode_batch_header(SnapshotKind::PrngBatch, lane_count));
-        for &(s0, s1, step) in &self.lanes {
+        for &StreamLane { s0, s1, step } in &self.lanes {
             let mut lane_bytes = [0u8; BATCH_LANE_LEN];
             encode_batch_lane(&mut lane_bytes, s0, s1, step);
             out.extend_from_slice(&lane_bytes);
         }
-        out
+        Ok(out)
     }
 
     /// Deserializes a PRNG batch snapshot.
-    /// Rejects trailing or missing bytes.
+    /// Rejects trailing or missing bytes. Panics if the lane buffer cannot be allocated.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        match Self::try_from_le_bytes(bytes) {
+            Err(SnapshotError::Reserve) => panic!("from_le_bytes: lane allocation failed"),
+            r => r,
+        }
+    }
+
+    /// As `from_le_bytes`, returning `Err(SnapshotError::Reserve)` if reserving the lane
+    /// buffer fails.
+    pub fn try_from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let lane_count = decode_batch_header(bytes, SnapshotKind::PrngBatch)?;
-        let mut lanes = Vec::with_capacity(lane_count as usize);
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(lane_count as usize)
+            .map_err(|_| SnapshotError::Reserve)?;
         for i in 0..lane_count as usize {
             let start = BATCH_HEADER_LEN + i * BATCH_LANE_LEN;
             lanes.push(decode_batch_lane(&bytes[start..start + BATCH_LANE_LEN]));
@@ -364,7 +396,7 @@ impl LustroPrngBatchSnapshot {
 /// Debug output is redacted; each lane holds stream state, which continues that stream and its forks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LustroXofBatchSnapshot {
-    lanes: Vec<(u128, u128, u64)>,
+    lanes: Vec<StreamLane>,
 }
 
 impl core::fmt::Debug for LustroXofBatchSnapshot {
@@ -380,40 +412,66 @@ impl TryFrom<&[u8]> for LustroXofBatchSnapshot {
     type Error = SnapshotError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        Self::from_le_bytes(bytes)
+        Self::try_from_le_bytes(bytes)
     }
 }
 
 impl LustroXofBatchSnapshot {
     #[inline]
-    pub(crate) fn new(lanes: Vec<(u128, u128, u64)>) -> Self {
+    pub(crate) fn new(lanes: Vec<StreamLane>) -> Self {
         Self { lanes }
     }
 
     #[inline]
-    pub(crate) fn into_lanes(self) -> Vec<(u128, u128, u64)> {
+    pub(crate) fn into_lanes(self) -> Vec<StreamLane> {
         self.lanes
     }
 
     /// Serializes the batch snapshot to its variable-length format.
+    /// Panics if the output buffer cannot be allocated.
     #[must_use]
     pub fn to_le_bytes(&self) -> Vec<u8> {
+        match self.try_to_le_bytes() {
+            Ok(out) => out,
+            Err(BatchError::Reserve(e)) => panic!("to_le_bytes: allocation failed: {e:?}"),
+            Err(e) => panic!("to_le_bytes: {e}"),
+        }
+    }
+
+    /// As `to_le_bytes`, returning `Err(BatchError::Reserve)` if reserving the output fails.
+    /// Never returns another variant.
+    pub fn try_to_le_bytes(&self) -> Result<Vec<u8>, BatchError> {
         let lane_count = self.lanes.len() as u64;
-        let mut out = Vec::with_capacity(BATCH_HEADER_LEN + self.lanes.len() * BATCH_LANE_LEN);
+        let mut out = Vec::new();
+        // No overflow: the lanes already fill at most isize::MAX bytes, at least 40 each.
+        out.try_reserve_exact(BATCH_HEADER_LEN + self.lanes.len() * BATCH_LANE_LEN)
+            .map_err(BatchError::Reserve)?;
         out.extend_from_slice(&encode_batch_header(SnapshotKind::XofBatch, lane_count));
-        for &(s0, s1, step) in &self.lanes {
+        for &StreamLane { s0, s1, step } in &self.lanes {
             let mut lane_bytes = [0u8; BATCH_LANE_LEN];
             encode_batch_lane(&mut lane_bytes, s0, s1, step);
             out.extend_from_slice(&lane_bytes);
         }
-        out
+        Ok(out)
     }
 
     /// Deserializes an XOF batch snapshot.
-    /// Rejects trailing or missing bytes.
+    /// Rejects trailing or missing bytes. Panics if the lane buffer cannot be allocated.
     pub fn from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        match Self::try_from_le_bytes(bytes) {
+            Err(SnapshotError::Reserve) => panic!("from_le_bytes: lane allocation failed"),
+            r => r,
+        }
+    }
+
+    /// As `from_le_bytes`, returning `Err(SnapshotError::Reserve)` if reserving the lane
+    /// buffer fails.
+    pub fn try_from_le_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let lane_count = decode_batch_header(bytes, SnapshotKind::XofBatch)?;
-        let mut lanes = Vec::with_capacity(lane_count as usize);
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(lane_count as usize)
+            .map_err(|_| SnapshotError::Reserve)?;
         for i in 0..lane_count as usize {
             let start = BATCH_HEADER_LEN + i * BATCH_LANE_LEN;
             lanes.push(decode_batch_lane(&bytes[start..start + BATCH_LANE_LEN]));

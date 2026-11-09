@@ -1005,7 +1005,8 @@ pub unsafe extern "C" fn lustro_xof_batch_snapshot_size(ctx: *const LustroXofBat
 }
 
 /// Exports the current batch snapshot.
-/// `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`.
+/// `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`. `OutOfMemory` if the
+/// intermediate buffers cannot be allocated; `out` is not written then.
 /// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
 /// stream and its forks. Keep it as private as the seed.
 ///
@@ -1038,8 +1039,14 @@ pub unsafe extern "C" fn lustro_xof_batch_export_snapshot(
             None => return LustroError::InvalidPointer,
         };
 
-        let snapshot = batch.export_snapshot();
-        output.copy_from_slice(&snapshot.to_le_bytes());
+        let bytes = match batch
+            .try_export_snapshot()
+            .and_then(|snapshot| snapshot.try_to_le_bytes())
+        {
+            Ok(b) => b,
+            Err(e) => return e.into(),
+        };
+        output.copy_from_slice(&bytes);
         LustroError::Ok
     })
 }
@@ -1047,7 +1054,8 @@ pub unsafe extern "C" fn lustro_xof_batch_export_snapshot(
 /// Restores an XOF batch from `len` snapshot bytes.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`,
-/// `UnsupportedVersion` or `InvalidKind` for a rejected snapshot.
+/// `UnsupportedVersion` or `InvalidKind` for a rejected snapshot; `OutOfMemory` if the lane
+/// buffer cannot be allocated.
 ///
 /// # Safety
 /// `bytes` must be valid for `len` bytes if len > 0.
@@ -1061,7 +1069,7 @@ pub unsafe extern "C" fn lustro_xof_batch_import_snapshot(
 ) -> LustroError {
     construct(out_ctx, || {
         let snapshot_bytes = bytes_in(bytes, len)?;
-        let snapshot = crate::types::LustroXofBatchSnapshot::from_le_bytes(snapshot_bytes)?;
+        let snapshot = crate::types::LustroXofBatchSnapshot::try_from_le_bytes(snapshot_bytes)?;
         Ok(LustroXofBatch::import_snapshot(snapshot))
     })
 }

@@ -287,7 +287,8 @@ restoration.
 The `version` byte is 1; it does not follow the crate or API version.
 `SnapshotKind` values: `Prng` = 1, `Xof` = 2, `PrngBatch` = 3, `XofBatch` = 4.
 `SnapshotError` values: `UnsupportedVersion`, `InvalidKind`, `InvalidCursor`,
-`InvalidLength`. Snapshots have no checksum: a changed `s0`, `s1` or `step` is
+`InvalidLength`, `Reserve` (only from `try_from_le_bytes` of a batch snapshot).
+Snapshots have no checksum: a changed `s0`, `s1` or `step` is
 not detected, and the reserved bytes are not checked.
 Format lengths are exposed as constants: `LUSTRO_SNAPSHOT_LEN` (56),
 `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN` (16) and `LUSTRO_BATCH_SNAPSHOT_LANE_LEN` (48).
@@ -617,9 +618,9 @@ snapshot types are re-exported at the crate root as well.
 | `EntropyError` (`feature = "entropy"`) | `Display`, `std::error::Error` (`source()` returns the OS error) |
 | `StreamId` | `get()`, `From<u8>`, `From<u16>`, `From<u32>`, `From<u64>`, `From<u128>`, `From<StreamId> for u128`, `Ord` (numeric) |
 | `LustroPrngSnapshot`, `LustroXofSnapshot` | `to_le_bytes()` (56 bytes, fixed), `from_le_bytes()`, `TryFrom<&[u8]>` |
-| `LustroPrngBatchSnapshot`, `LustroXofBatchSnapshot` | `to_le_bytes()` (variable length), `from_le_bytes()`, `TryFrom<&[u8]>` |
+| `LustroPrngBatchSnapshot`, `LustroXofBatchSnapshot` | `to_le_bytes()` (variable length), `try_to_le_bytes()`, `from_le_bytes()`, `try_from_le_bytes()`, `TryFrom<&[u8]>` |
 | `SnapshotKind` | `Prng`, `Xof`, `PrngBatch`, `XofBatch`; validated before snapshot state fields are decoded |
-| `SnapshotError` | `UnsupportedVersion`, `InvalidKind`, `InvalidCursor`, `InvalidLength`; `#[non_exhaustive]`; implements `Display` and `std::error::Error` |
+| `SnapshotError` | `UnsupportedVersion`, `InvalidKind`, `InvalidCursor`, `InvalidLength`, `Reserve`; `#[non_exhaustive]`; implements `Display` and `std::error::Error` |
 | `RuntimeInfo` | `backend: &'static str` (`"scalar"` or `"avx2"`), `threads: usize`, `fixed: bool`, `parallel_built: bool`, `simd_available: bool`, `pool_usable: bool`, `logical_cpus: usize`; returned by `runtime_info()` and `runtime_preview()`. Fields: see [Runtime Execution Controls](#runtime-execution-controls). `#[non_exhaustive]` |
 | `RuntimeOptions` | `new()`, `threads(NonZeroUsize)`, `allow_simd(bool)` (builder, `const fn`); `Default`, `Copy`. A setting that is not called follows the environment. Passed to `configure()` |
 | `ConfigError` | `AlreadyConfigured`; `#[non_exhaustive]`; `Display`, `std::error::Error` |
@@ -663,7 +664,9 @@ failures may panic.
 
 | Function(s) | Behavior |
 |---|---|
-| `LustroPrngSnapshot::from_le_bytes`, `LustroXofSnapshot::from_le_bytes`, `LustroPrngBatchSnapshot::from_le_bytes`, `LustroXofBatchSnapshot::from_le_bytes` | Returns `Result<Self, SnapshotError>`. |
+| `LustroPrngSnapshot::from_le_bytes`, `LustroXofSnapshot::from_le_bytes` | Returns `Result<Self, SnapshotError>`. |
+| `LustroPrngBatchSnapshot::from_le_bytes` / `LustroXofBatchSnapshot::from_le_bytes` | Returns `Result<Self, SnapshotError>`; panics if the lane buffer cannot be allocated. `try_from_le_bytes` returns `Err(SnapshotError::Reserve)` instead. `TryFrom<&[u8]>` does not panic. |
+| `LustroPrngBatchSnapshot::to_le_bytes` / `LustroXofBatchSnapshot::to_le_bytes` | Panics if the output buffer cannot be allocated. `try_to_le_bytes` returns `Err(BatchError::Reserve)` instead. |
 | `Hash128::try_from`, `Hash256::try_from`, `Seed256::try_from` (via `TryFrom<&[u8]>`) | Returns `Result<Self, TryFromSliceError>` on wrong-length input. |
 | `Hash128::from_str`, `Hash256::from_str` (`str::parse`) | Returns `Result<Self, ParseHashError>`. The length is checked first: `InvalidLength { expected, actual }`, where `actual` counts the bytes after an optional `0x` / `0X`. Then the digits: `InvalidDigit { index }`, where `index` is the byte offset in the whole input, prefix included, always at a char boundary. Spaces are not trimmed. |
 | `Seed256::from_entropy`, `LustroPrng::from_entropy`, `LustroPrng::from_entropy_with_id` (`feature = "entropy"`) | Returns `Result<Self, EntropyError>` when the operating system cannot provide entropy. |
@@ -682,6 +685,7 @@ failures may panic.
 | `LustroPrngBatch::new_range` | Panics if lane allocation fails. `try_new_range` returns `Err(BatchError::Reserve)` instead. |
 | `LustroPrngBatch::fork_many` / `LustroXofBatch::fork_many` | Panics if `len() * ids.len()` overflows `usize`, or if lane allocation fails. `try_fork_many` returns `Err(BatchError::SizeOverflow)` or `Err(BatchError::Reserve)` instead. |
 | `LustroPrngBatch::try_clone` / `LustroXofBatch::try_clone` | Returns `Err(BatchError::Reserve)` if the lane buffer cannot be reserved (never `SizeOverflow`). `clone()` aborts the process in that case. |
+| `LustroPrngBatch::export_snapshot` / `LustroXofBatch::export_snapshot` | Panics if the lane buffer cannot be allocated. `try_export_snapshot` returns `Err(BatchError::Reserve)` instead. |
 | `LustroPrng::derive_path` / `LustroXof::derive_path` | Panics if `path` is empty. `try_derive_path` returns `Err(DerivePathError::EmptyPath)` instead. |
 | `LustroPrng::fork_batch`, `fork_batch_range` / the same on `LustroXof` | Panics if lane allocation fails. `try_fork_batch` and `try_fork_batch_range` return `Err(BatchError::Reserve)` instead. |
 | `LustroPrng::fork_path` / `LustroXof::fork_path` | Panics if `path` is empty. `try_fork_path` returns `Err(DerivePathError::EmptyPath)` instead. |
@@ -727,8 +731,8 @@ see the function tables above. NumPy array *parameters* are required only
 where noted below: a wrong type or dtype raises `TypeError`, a wrong shape
 or layout raises `ValueError`.
 
-NumPy is required for `hash*_many*`, `fill_blocks`, `blocks` and `fill_u64`.
-Without it these calls raise `ImportError`; the stream calls (`fill_blocks`,
+NumPy (the `numpy` extra of the package) is required for `hash*_many*`, `fill_blocks`,
+`blocks` and `fill_u64`. Without it these calls raise `ImportError`; the stream calls (`fill_blocks`,
 `blocks`, `fill_u64`) do so before the stream state moves.
 
 Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message` and snapshot `bytes`) also accept `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` arrays. The buffer must be C-contiguous with byte items, else `TypeError`. `bytes` is read without copying; any other buffer is copied while the GIL is held, so other Python threads cannot change it during the computation (writes from native code without the GIL are not covered). `MemoryError` if the copy cannot be allocated.
@@ -747,8 +751,8 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 | `hash256_many_var_into(messages, out, *, release_gil=True)` | `messages`, `out` | `messages` as in `hash256_many_var`; `out` a writable, C-contiguous `uint8` array of shape `(len(messages), 32)`, errors as above. Returns `None` |
 | `hash128_many_var_into(messages, out, *, release_gil=True)` | `messages`, `out` | as above, `out` of shape `(len(messages), 16)` |
 | `LustroHasher(length)`                                    | `length` | Python `int`, `0 ≤ length < 2⁶⁴` (`OverflowError` if negative or above `2⁶⁴ - 1`): the length of the whole message in bytes |
-| `LustroHasher.update(data)`                               | `data` | as `data` of `hash256`. `ValueError` if `data` is longer than what is left; nothing is absorbed. The GIL is released for 4096 bytes or more. Returns `None` |
-| `LustroHasher.digest()`, `hexdigest()`                    | — | `bytes` (32) / `str` (64 lowercase hex digits), `hash256` of the message. `ValueError` while bytes are left; `update` can continue. Every call gives the same value |
+| `LustroHasher.update(data)`                               | `data` | as `data` of `hash256`. `ValueError` if `data` is longer than what is left (the message gives both lengths); nothing is absorbed. The GIL is released for 4096 bytes or more. Returns `None` |
+| `LustroHasher.digest()`, `hexdigest()`                    | — | `bytes` (32) / `str` (64 lowercase hex digits), `hash256` of the message. `ValueError` while bytes are left (the message gives how many); `update` can continue. Every call gives the same value |
 | `LustroHasher.remaining()`                                | — | returns Python `int`: bytes still expected |
 | `LustroXofAbsorber(length)`, `update(data)`, `remaining()` | `length`, `data` | as for `LustroHasher` |
 | `LustroXofAbsorber.finalize()`                            | — | a new `LustroXof` of the message at position 0. `ValueError` while bytes are left; `update` can continue |
@@ -840,7 +844,9 @@ Byte inputs. Parameters shown as Python `bytes` below (`data`, `seed`, `message`
 - `import_snapshot(bytes)` raises `lustro.SnapshotError` (a subclass of
   `ValueError`) on malformed input: wrong length, unsupported version, kind
   mismatch (e.g. a PRNG snapshot passed to `LustroXof`) or invalid cursor.
-  It maps the Rust `SnapshotError` variants.
+  It maps the Rust `SnapshotError` variants, except `Reserve`: a batch
+  `import_snapshot` raises `MemoryError` if the lanes cannot be allocated, and a
+  batch `export_snapshot` raises it if the buffers cannot be allocated.
 - Pickling goes through the snapshot: `__reduce__` returns
   `(Class.import_snapshot, (export_snapshot(),))`. A restored object continues
   from the pickled position, so it is a copy of the stream, not a new one.
@@ -989,7 +995,7 @@ There are five categories:
   | 7 | `UnsupportedVersion` | snapshot version byte is not supported (constructors only) |
   | 8 | `InvalidKind` | snapshot kind does not match the type (constructors only) |
   | 9 | `InvalidCursor` | snapshot cursor is outside `1..=32` (constructors only) |
-  | 10 | `OutOfMemory` | reserving a batch lane buffer or an input table failed (constructors only) |
+  | 10 | `OutOfMemory` | reserving a batch lane buffer, an input table or a snapshot buffer failed (constructors and `*_batch_export_snapshot`) |
   | 11 | `AlreadyConfigured` | runtime settings are already fixed with another effect (`lustro_configure` only) |
   | 12 | `InvalidArgument` | an argument value is not allowed, nothing was changed (`lustro_configure`, `*_batch_lane`, `*_batch_from_streams`) |
   | 13 | `EntropyUnavailable` | the system entropy source is unavailable (`lustro_seed_from_entropy`, `lustro_prng_from_entropy`) |
@@ -1023,13 +1029,12 @@ There are five categories:
   | `EntropyUnavailable` | `lustro_prng_from_entropy`: the system entropy source is unavailable; nothing is created |
   | `UnsupportedVersion`, `InvalidKind` | `*_import_snapshot`, the same conditions as in `SnapshotError` |
   | `InvalidCursor` | `lustro_prng_import_snapshot`, `lustro_xof_import_snapshot` (batch snapshots carry no cursor) |
-  | `OutOfMemory` | the lane buffer or an input table (identifiers, messages) cannot be reserved (`*_derive_path`, `*_fork_batch`, `*_fork_batch_range`, `*_fork_path`, `*_batch_new`, `*_batch_new_range`, `*_batch_from_streams`, `*_batch_clone`, `*_batch_fork`, `*_batch_fork_many`, `*_batch_fork_range`, `*_batch_derive_path`); covers allocator refusal and capacity overflow |
+  | `OutOfMemory` | the lane buffer or an input table (identifiers, messages) cannot be reserved (`*_derive_path`, `*_fork_batch`, `*_fork_batch_range`, `*_fork_path`, `*_batch_new`, `*_batch_new_range`, `*_batch_from_streams`, `*_batch_clone`, `*_batch_fork`, `*_batch_fork_many`, `*_batch_fork_range`, `*_batch_derive_path`, `*_batch_import_snapshot`, `*_batch_export_snapshot`); covers allocator refusal and capacity overflow |
   | `InternalPanic` | a panic was caught at the FFI boundary |
 
   `OutOfMemory` is reported only for these explicit reservations. Other
-  allocations (the context itself and the internal buffers of
-  `*_batch_import_snapshot`) are not fallible; their failure aborts the process,
-  as in any Rust code.
+  allocations (the context itself) are not fallible; their failure aborts the
+  process, as in any Rust code.
 
 - **Value-returning functions** (`*_len`, `*_snapshot_size`, `*_suggested_steps`,
   `lustro_runtime_threads` → `uintptr_t`; `lustro_api_version` → `uint32_t`;

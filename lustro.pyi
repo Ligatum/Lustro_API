@@ -85,7 +85,7 @@ def hash256_many_var_into(
     messages: Sequence[Buffer], out: npt.NDArray[np.uint8], *, release_gil: bool = True
 ) -> None: ...
 def hash128_many_var_into(
-        messages: Sequence[Buffer], out: npt.NDArray[np.uint8], *, release_gil: bool = True
+    messages: Sequence[Buffer], out: npt.NDArray[np.uint8], *, release_gil: bool = True
 ) -> None: ...
 
 @final

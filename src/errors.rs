@@ -102,6 +102,7 @@ impl From<crate::types::SnapshotError> for LustroError {
             S::InvalidKind => LustroError::InvalidKind,
             S::InvalidCursor => LustroError::InvalidCursor,
             S::InvalidLength => LustroError::InvalidLength,
+            S::Reserve => LustroError::OutOfMemory,
         }
     }
 }

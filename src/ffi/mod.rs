@@ -51,15 +51,18 @@ pub extern "C" fn lustro_api_version() -> u32 {
 
 /// Returns the configured pool size for parallel batches, not the number of active workers.
 /// `0` means parallelism is disabled by settings or the crate was built without `parallel`.
-/// This call does not start the pool. If initialization fails, or this process inherited
-/// a pool-owner PID from its parent through `fork`, batches fall back to the calling thread.
+/// This call does not start the pool, but it fixes the settings like `lustro_runtime_info`
+/// (a later `lustro_configure` with other values returns `AlreadyConfigured`). If
+/// initialization fails, or this process inherited a pool-owner PID from its parent
+/// through `fork`, batches fall back to the calling thread.
 #[no_mangle]
 pub extern "C" fn lustro_runtime_threads() -> usize {
     guarded(0, || crate::api::runtime_info().threads)
 }
 
 /// Returns the backend for batches of streams and hashes as a static NUL-terminated
-/// string ("scalar" or "avx2"). Never NULL; do not free.
+/// string ("scalar" or "avx2"). Never NULL; do not free. Fixes the settings like
+/// `lustro_runtime_info`.
 #[no_mangle]
 pub extern "C" fn lustro_runtime_backend() -> *const c_char {
     guarded(c"unknown".as_ptr(), || {
@@ -235,3 +238,4 @@ pub extern "C" fn lustro_strerror(code: i32) -> *const c_char {
         None => b"unknown error code\0".as_ptr() as *const c_char,
     }
 }
+

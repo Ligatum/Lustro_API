@@ -27,7 +27,7 @@ cargo build --release
 
 cargo build --release --features rand
 
-# Python 3.11-3.14 (requires NumPy)
+# Python 3.11-3.14
 
 pip install maturin numpy
 maturin develop --release
@@ -39,6 +39,8 @@ cargo build --release --features ffi
 ```
 
 In the release profiles (`panic = "unwind"`) the C FFI boundary catches internal panics and returns `LustroError::InternalPanic`; the Python module raises them as `pyo3_runtime.PanicException` (a `BaseException`). Direct Rust calls panic as usual, for example on a length mismatch.
+
+NumPy is needed only by the functions that take or return arrays (`hash*_many*`, `fill_blocks`, `blocks`, `fill_u64`); without it they raise `ImportError`. The install command above includes NumPy; a package built from the repo also has it as the `numpy` extra.
 
 The Python module declares that it requires the GIL (`gil_used = true`).
 On free-threaded CPython builds, importing the module enables the GIL
@@ -542,7 +544,7 @@ lustro_xof_free(xof);
 
 ### Fork
 
-Derive a child stream from the current state and a 128-bit identifier. The parent is not changed.
+Derive a child stream from the current state and a 128-bit identifier. The parent is not changed. The child depends on the parent's current block, not on the position inside it: forking after 1 byte or after 31 bytes of the same block gives the same child.
 
 **Rust**
 
@@ -1770,6 +1772,8 @@ lustro_xof_batch_free(xof);
 ```
 
 The snapshot size is `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN` for `n` streams. In C/C++ call `*_batch_snapshot_size(ctx)` before export; `out_len` must equal it.
+
+Export and import allocate buffers sized by the lane count. If that fails, `export_snapshot`, `to_le_bytes` and `from_le_bytes` panic in Rust. `try_export_snapshot` and `try_to_le_bytes` return `Err(BatchError::Reserve)`, and `try_from_le_bytes` returns `Err(SnapshotError::Reserve)`. Python raises `MemoryError`, and C/C++ returns `LUSTRO_ERROR_OUT_OF_MEMORY`.
 
 ---
 

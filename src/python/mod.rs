@@ -111,12 +111,33 @@ pub use exceptions::SnapshotError;
 
 // Maps SnapshotError to the Python SnapshotError (message from Display).
 pub(crate) fn snapshot_error(err: crate::types::SnapshotError) -> pyo3::PyErr {
-    SnapshotError::new_err(err.to_string())
+    match err {
+        crate::types::SnapshotError::Reserve => alloc_error(),
+        _ => SnapshotError::new_err(err.to_string()),
+    }
 }
 
 // Maps an allocation failure to MemoryError.
 pub(crate) fn alloc_error() -> pyo3::PyErr {
     pyo3::exceptions::PyMemoryError::new_err("allocation failed")
+}
+
+// `bytes` copy of `data`. `PyBytes::new` panics when Python cannot allocate; this raises MemoryError.
+pub(crate) fn try_bytes<'py>(
+    py: Python<'py>,
+    data: &[u8],
+) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+    pyo3::types::PyBytes::new_with(py, data.len(), |out| {
+        out.copy_from_slice(data);
+        Ok(())
+    })
+    .map_err(|e| {
+        if e.is_instance_of::<pyo3::exceptions::PyMemoryError>(py) {
+            alloc_error()
+        } else {
+            e
+        }
+    })
 }
 
 // Index argument of `batch[i]`: anything with `__index__`. As for a list, an integer that

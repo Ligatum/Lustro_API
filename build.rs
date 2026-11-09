@@ -1,6 +1,5 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FFI");
     println!("cargo:rerun-if-env-changed=LUSTRO_HEADER_DIR");
 
     #[cfg(feature = "ffi")]
