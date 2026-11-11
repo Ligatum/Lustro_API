@@ -18,8 +18,10 @@ pub use snapshot::{
 };
 
 pub(crate) use batch::fork_many_lane_count;
-#[cfg(feature = "ffi")]
+#[cfg(any(feature = "ffi", feature = "python"))]
 pub(crate) use snapshot::batch_snapshot_encoded_len;
+#[cfg(any(feature = "ffi", feature = "python", test))]
+pub(crate) use snapshot::encode_batch_into;
 
 //=================================
 // STREAM ID

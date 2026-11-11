@@ -14,9 +14,9 @@ pub struct RuntimeInfo {
     /// thread (disabled by the settings or built without `parallel`). A nonzero value does
     /// not guarantee a running pool: if it cannot be built, batches run on the calling thread.
     pub threads: usize,
-    /// `true` if the settings are fixed (by `configure`, a batch call or `runtime_info`).
-    /// `false` only from `runtime_preview`: the values then come from the current
-    /// environment and may differ from the ones fixed later.
+    /// `true` if the settings are fixed (by `configure` or a batch call). `false` before
+    /// that: the values then come from the current environment and may differ from the
+    /// ones fixed later.
     pub fixed: bool,
     /// Built with the `parallel` feature. With `false`, `threads` is 0 always.
     pub parallel_built: bool,
@@ -27,7 +27,7 @@ pub struct RuntimeInfo {
     /// parallel batch, if the pool could not be built, and in a child forked after its
     /// parent started the pool.
     pub pool_usable: bool,
-    /// Logical CPUs available to the process, detected at the call (as the pool size cap).
+    /// Logical CPUs available to the process, detected at the call; the cap of the pool size.
     pub logical_cpus: usize,
 }
 
@@ -73,7 +73,7 @@ impl RuntimeOptions {
 #[non_exhaustive]
 pub enum ConfigError {
     /// The settings are already fixed, by an earlier `configure` or by the first use of
-    /// the dispatcher (batch calls, `runtime_info()`), and differ from the requested ones.
+    /// the dispatcher (batch calls), and the requested ones would run batches differently.
     AlreadyConfigured,
 }
 

@@ -14,7 +14,7 @@ typedef enum {
 	LUSTRO_ERROR_ALREADY_FINALISED   = 4,
 	LUSTRO_ERROR_VERIFICATION_FAILED = 5,
 	LUSTRO_ERROR_INTERNAL_PANIC      = 6,
-	/* 7..10: reported by the constructors */
+	/* 7..10: reported by the constructors (7 and 8 also by lustro_snapshot_kind) */
 	LUSTRO_ERROR_UNSUPPORTED_VERSION  = 7,
 	LUSTRO_ERROR_INVALID_KIND         = 8,
 	LUSTRO_ERROR_INVALID_CURSOR       = 9,
@@ -23,7 +23,9 @@ typedef enum {
 	 * lustro_*_batch_from_streams; 13: the entropy functions */
 	LUSTRO_ERROR_ALREADY_CONFIGURED   = 11,
 	LUSTRO_ERROR_INVALID_ARGUMENT     = 12,
-	LUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13
+	LUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13,
+	/* 14: snapshot import */
+	LUSTRO_ERROR_INVALID_RESERVED     = 14
 } LustroError;
 
 /*
@@ -110,6 +112,26 @@ static inline void lustro_u128_to_parts(const uint8_t in[16], uint64_t *hi, uint
 #define LUSTRO_SIMD_SCALAR 2
 
 /**
+ * `*out_kind` of `lustro_snapshot_kind`: single PRNG stream.
+ */
+#define LUSTRO_SNAPSHOT_KIND_PRNG 1
+
+/**
+ * `*out_kind` of `lustro_snapshot_kind`: single XOF stream.
+ */
+#define LUSTRO_SNAPSHOT_KIND_XOF 2
+
+/**
+ * `*out_kind` of `lustro_snapshot_kind`: PRNG batch.
+ */
+#define LUSTRO_SNAPSHOT_KIND_PRNG_BATCH 3
+
+/**
+ * `*out_kind` of `lustro_snapshot_kind`: XOF batch.
+ */
+#define LUSTRO_SNAPSHOT_KIND_XOF_BATCH 4
+
+/**
  * `hash256` of a message given in pieces. The length of the whole message enters the
  * initial state, so it is passed to `new`; `update` takes the bytes in pieces of any
  * size and `finalize` returns `hash256` of their concatenation. For a 128-bit digest
@@ -153,10 +175,10 @@ typedef struct LustroXofAbsorber LustroXofAbsorber;
 typedef struct LustroXofBatch LustroXofBatch;
 
 /**
- * Execution settings of this process, as returned by `lustro_runtime_info` and
- * `lustro_runtime_preview`. Same fields as `RuntimeInfo` in Rust. Flags are 0 or 1.
- * The caller passes `sizeof` of this struct to those functions, so that fields added
- * later do not overflow a struct built from an older header.
+ * Execution settings of this process, as returned by `lustro_runtime_info`. Same fields as
+ * `RuntimeInfo` in Rust. Flags are 0 or 1. The caller passes `sizeof` of this struct to
+ * that function, so that fields added later do not overflow a struct built from an older
+ * header.
  */
 typedef struct LustroRuntimeInfo {
   /**
@@ -174,8 +196,7 @@ typedef struct LustroRuntimeInfo {
    */
   const char *backend;
   /**
-   * 1 if the settings are fixed. Always 1 from `lustro_runtime_info`; 0 is possible
-   * only from `lustro_runtime_preview`.
+   * 1 if the settings are fixed (by `lustro_configure` or a batch call); 0 before that.
    */
   uint8_t fixed;
   /**
@@ -192,26 +213,33 @@ typedef struct LustroRuntimeInfo {
   uint8_t pool_usable;
 } LustroRuntimeInfo;
 
+/**
+ * Returns the native API version. It does not follow the crate version or the snapshot
+ * format version.
+ */
 uint32_t lustro_api_version(void);
 
 /**
  * Returns the configured pool size for parallel batches, not the number of active workers.
  * `0` means parallelism is disabled by settings or the crate was built without `parallel`.
- * This call does not start the pool. If initialization fails, or this process inherited
- * a pool-owner PID from its parent through `fork`, batches fall back to the calling thread.
+ * This call does not start the pool and fixes nothing, like `lustro_runtime_info`. If
+ * initialization fails, or this process inherited a pool-owner PID from its parent
+ * through `fork`, batches fall back to the calling thread.
  */
 uintptr_t lustro_runtime_threads(void);
 
 /**
  * Returns the backend for batches of streams and hashes as a static NUL-terminated
- * string ("scalar" or "avx2"). Never NULL; do not free.
+ * string ("scalar" or "avx2"). Never NULL; do not free. Fixes nothing, like
+ * `lustro_runtime_info`.
  */
 const char *lustro_runtime_backend(void);
 
 /**
  * Stores the execution settings of this process in `*out`. Like `runtime_info()` in Rust,
- * this fixes the settings if they are not fixed yet (see `lustro_configure`), so `fixed`
- * is 1. Does not start the pool.
+ * this fixes nothing: settings not yet fixed come from the environment as it is now
+ * (`fixed` is 0) and may differ from the ones fixed later (see `lustro_configure`). Another
+ * thread can fix them meanwhile, so the result can be stale on return. Does not start the pool.
  *
  * `out_size` is `sizeof(LustroRuntimeInfo)`. Only the fields that fit in it are written,
  * so a library newer than the header leaves the extra fields alone. Returns
@@ -224,25 +252,32 @@ const char *lustro_runtime_backend(void);
 LustroError lustro_runtime_info(struct LustroRuntimeInfo *out, uintptr_t out_size);
 
 /**
- * As `lustro_runtime_info`, but fixes nothing. Settings not yet fixed come from the
- * environment as it is now (`fixed` is 0) and may differ from the ones fixed later.
- * A snapshot: it can be stale on return. Does not start the pool.
- *
- * # Safety
- * If `out` is non-null, it must be valid for writing `out_size` bytes.
- */
-LustroError lustro_runtime_preview(struct LustroRuntimeInfo *out, uintptr_t out_size);
-
-/**
  * Sets threads and SIMD for this process, before first use. `threads`: 0 = not set,
  * 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
  * `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
  *
- * Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. A later call returns
- * `Ok` if the arguments give the same settings as the fixed ones, else
- * `AlreadyConfigured`. Unknown `simd` returns `InvalidArgument` and changes nothing.
+ * Fixed once, by an earlier call or a batch call: a hash batch, `*_batch_fill_blocks`, or
+ * `lustro_xof_batch_new` with `n > 0`. A later call returns `Ok` if the
+ * arguments give the same settings as the fixed ones, else `AlreadyConfigured`. Unknown
+ * `simd` returns `InvalidArgument` and changes nothing.
+ *
+ * The settings belong to the whole process. An application sets them early; a library that
+ * uses Lustro leaves this call to the application and reads them with `lustro_runtime_info`.
  */
 LustroError lustro_configure(uintptr_t threads, int32_t simd);
+
+/**
+ * Stores the kind of exported snapshot bytes in `*out_kind` (`LUSTRO_SNAPSHOT_KIND_*`).
+ * Reads only the version and kind bytes, so `Ok` does not mean the import will succeed.
+ * Returns `InvalidPointer` for a null `out_kind` or a null `bytes` when `len > 0`,
+ * `InvalidLength` if `len < 2`, `UnsupportedVersion` or `InvalidKind` for an unknown byte.
+ * Nothing is written on error.
+ *
+ * # Safety
+ * `bytes` must be valid for `len` bytes when `len > 0`. If `out_kind` is non-null, it must
+ * be valid for writing one byte and must not overlap `bytes`.
+ */
+LustroError lustro_snapshot_kind(const uint8_t *bytes, uintptr_t len, uint8_t *out_kind);
 
 /**
  * Returns a static NUL-terminated description of an error code.
@@ -251,7 +286,9 @@ LustroError lustro_configure(uintptr_t threads, int32_t simd);
 const char *lustro_strerror(int32_t code);
 
 /**
- * Computes a 256-bit hash into `out`.
+ * Computes a 256-bit hash into `out`. Returns `InvalidLength` if `data_len` exceeds
+ * isize::MAX, `InvalidPointer` for a null `out`, a null `data` with `data_len > 0`, or
+ * overlapping input and output.
  *
  * # Safety
  * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -261,7 +298,7 @@ const char *lustro_strerror(int32_t code);
 LustroError lustro_hash256(const uint8_t *data, uintptr_t data_len, uint8_t *out);
 
 /**
- * Computes a 128-bit hash into `out`.
+ * Computes a 128-bit hash into `out`. Same statuses as `lustro_hash256`.
  *
  * # Safety
  * If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -343,7 +380,10 @@ LustroError lustro_hasher_remaining(const struct LustroHasher *ctx, uint64_t *ou
 LustroError lustro_hasher_clone(const struct LustroHasher *ctx, struct LustroHasher **out_ctx);
 
 /**
- * Hashes `n` fixed-length messages into `out_ptr`.
+ * Hashes `n` fixed-length messages into `out_ptr`. `n == 0` returns `Ok` and reads nothing.
+ * Returns `InvalidLength` if `n * message_len` or `n * 32` overflows or exceeds isize::MAX,
+ * `InvalidPointer` for a null `out_ptr`, a null `data_ptr` with a nonzero input size, or
+ * overlapping input and output.
  *
  * # Safety
  * If `n * message_len` is nonzero and representable, `data_ptr` must be
@@ -351,6 +391,8 @@ LustroError lustro_hasher_clone(const struct LustroHasher *ctx, struct LustroHas
  * If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
  * for `n * 32` writable bytes.
  * The input and output regions must not overlap.
+ * The input bytes must stay valid and unmodified by any thread until the function returns;
+ * they are read on the thread pool.
  */
 LustroError lustro_hash256_many_fixed(const uint8_t *data_ptr,
                                       uintptr_t n,
@@ -358,7 +400,8 @@ LustroError lustro_hash256_many_fixed(const uint8_t *data_ptr,
                                       uint8_t *out_ptr);
 
 /**
- * Hashes `n` fixed-length messages into 128-bit digests.
+ * Hashes `n` fixed-length messages into 128-bit digests. Same statuses as
+ * `lustro_hash256_many_fixed`, with `n * 16` output bytes.
  *
  * # Safety
  * If `n * message_len` is nonzero and representable, `data_ptr` must be
@@ -366,6 +409,8 @@ LustroError lustro_hash256_many_fixed(const uint8_t *data_ptr,
  * If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
  * for `n * 16` writable bytes.
  * The input and output regions must not overlap.
+ * The input bytes must stay valid and unmodified by any thread until the function returns;
+ * they are read on the thread pool.
  */
 LustroError lustro_hash128_many_fixed(const uint8_t *data_ptr,
                                       uintptr_t n,
@@ -373,9 +418,12 @@ LustroError lustro_hash128_many_fixed(const uint8_t *data_ptr,
                                       uint8_t *out_ptr);
 
 /**
- * Hashes `n` variable-length messages.
+ * Hashes `n` variable-length messages into 256-bit digests.
  * `message_ptrs[i]` must reference `message_lens[i]` bytes.
- * A null pointer is allowed when `message_lens[i] == 0`.
+ * A null pointer is allowed when `message_lens[i] == 0`. `n == 0` returns `Ok` and reads
+ * nothing. Returns `InvalidLength` for a size or message length that exceeds isize::MAX,
+ * `InvalidPointer` for a null or misaligned table, a null `out_ptr`, a null message pointer
+ * with a nonzero length, or an output that overlaps a table or a message.
  *
  * # Safety
  * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
@@ -385,15 +433,17 @@ LustroError lustro_hash128_many_fixed(const uint8_t *data_ptr,
  * `out_ptr` must be valid for `n * 32` writable bytes when that size is
  * representable.
  * The output region must not overlap either table or any nonempty message.
+ * The tables and the message bytes must stay valid and unmodified by any thread until the
+ * function returns; they are read on the thread pool.
  */
 LustroError lustro_hash256_many_var(const uint8_t *const *message_ptrs,
-                                    uintptr_t n,
                                     const uintptr_t *message_lens,
+                                    uintptr_t n,
                                     uint8_t *out_ptr);
 
 /**
  * Hashes `n` variable-length messages into 128-bit digests.
- * Same pointer conventions as `lustro_hash256_many_var`.
+ * Same pointer conventions and statuses as `lustro_hash256_many_var`.
  *
  * # Safety
  * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
@@ -403,10 +453,12 @@ LustroError lustro_hash256_many_var(const uint8_t *const *message_ptrs,
  * `out_ptr` must be valid for `n * 16` writable bytes when that size is
  * representable.
  * The output region must not overlap either table or any nonempty message.
+ * The tables and the message bytes must stay valid and unmodified by any thread until the
+ * function returns; they are read on the thread pool.
  */
 LustroError lustro_hash128_many_var(const uint8_t *const *message_ptrs,
-                                    uintptr_t n,
                                     const uintptr_t *message_lens,
+                                    uintptr_t n,
                                     uint8_t *out_ptr);
 
 /**
@@ -502,7 +554,7 @@ LustroError lustro_prng_next_u128(struct LustroPrng *ctx,
 LustroError lustro_prng_next_block(struct LustroPrng *ctx, uint8_t *out);
 
 /**
- * Fills `out` with `out_len` random bytes.
+ * Fills `out` with the next `out_len` bytes of the stream.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -661,30 +713,34 @@ LustroError lustro_prng_derive_path(const uint8_t *seed,
 
 /**
  * Exports the current PRNG snapshot into `out`.
- * `out` must provide at least 56 writable bytes.
+ * `out_len` must be 56 (`LUSTRO_SNAPSHOT_LEN`), otherwise `InvalidLength`.
  * The snapshot holds the full stream state: whoever has it can reproduce the rest of the
  * stream and its forks. Keep it as private as the seed.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroPrng` context that
  * is not mutably accessed or freed during the call.
- * `out` must be valid for 56 writable bytes and must not overlap the context.
+ * `out` must be valid for `out_len` writable bytes and must not overlap the context.
  */
-LustroError lustro_prng_export_snapshot(const struct LustroPrng *ctx, uint8_t *out);
+LustroError lustro_prng_export_snapshot(const struct LustroPrng *ctx,
+                                        uint8_t *out,
+                                        uintptr_t out_len);
 
 /**
- * Restores a PRNG context from a 56-byte snapshot.
+ * Restores a PRNG context from `len` snapshot bytes.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
- * for a null or misaligned `out_ctx`, or for a null `bytes`; `UnsupportedVersion`, `InvalidKind`
- * or `InvalidCursor` for a rejected snapshot. The length is fixed at 56 bytes, so `InvalidLength`
- * is not reported.
+ * for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`
+ * when `len` is not 56 (`LUSTRO_SNAPSHOT_LEN`); `UnsupportedVersion`, `InvalidKind`,
+ * `InvalidReserved` or `InvalidCursor` for a rejected snapshot.
  *
  * # Safety
- * If `bytes` is non-null, it must be valid for 56 readable bytes.
+ * `bytes` must be valid for `len` readable bytes when `len > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
  * and must not overlap any input buffer.
  */
-LustroError lustro_prng_import_snapshot(const uint8_t *bytes, struct LustroPrng **out_ctx);
+LustroError lustro_prng_import_snapshot(const uint8_t *bytes,
+                                        uintptr_t len,
+                                        struct LustroPrng **out_ctx);
 
 /**
  * Creates a PRNG batch from `n` stream identifiers.
@@ -938,7 +994,8 @@ uintptr_t lustro_prng_batch_snapshot_size(const struct LustroPrngBatch *ctx);
 
 /**
  * Exports the current batch snapshot.
- * `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`.
+ * `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`, otherwise `InvalidLength`.
+ * Writes straight into `out` and allocates nothing, so there is no `OutOfMemory`.
  * The snapshot holds every lane's state: whoever has it can reproduce the rest of each
  * stream and its forks. Keep it as private as the seed.
  *
@@ -946,7 +1003,7 @@ uintptr_t lustro_prng_batch_snapshot_size(const struct LustroPrngBatch *ctx);
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
  * that is not mutably accessed or freed during the call.
  * `out` must be valid for `out_len` writable bytes and must not overlap
- * the context. `out_len` must equal the expected snapshot size.
+ * the context.
  */
 LustroError lustro_prng_batch_export_snapshot(const struct LustroPrngBatch *ctx,
                                               uint8_t *out,
@@ -956,7 +1013,8 @@ LustroError lustro_prng_batch_export_snapshot(const struct LustroPrngBatch *ctx,
  * Restores a PRNG batch from `len` snapshot bytes.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`,
- * `UnsupportedVersion` or `InvalidKind` for a rejected snapshot.
+ * `UnsupportedVersion`, `InvalidKind` or `InvalidReserved` for a rejected snapshot;
+ * `OutOfMemory` if the lane buffer cannot be allocated.
  *
  * # Safety
  * `bytes` must be valid for `len` bytes when `len > 0`.
@@ -1038,7 +1096,7 @@ LustroError lustro_xof_next_u128(struct LustroXof *ctx,
 LustroError lustro_xof_next_block(struct LustroXof *ctx, uint8_t *out);
 
 /**
- * Fills `out` with `out_len` output bytes.
+ * Fills `out` with the next `out_len` bytes of the stream.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXof` context and
@@ -1198,30 +1256,34 @@ LustroError lustro_xof_derive_path(const uint8_t *message,
 
 /**
  * Exports the current XOF snapshot into `out`.
- * `out` must provide at least 56 writable bytes.
+ * `out_len` must be 56 (`LUSTRO_SNAPSHOT_LEN`), otherwise `InvalidLength`.
  * The snapshot holds the full stream state: whoever has it can reproduce the rest of the
- * stream and its forks. Keep it as private as the seed.
+ * stream and its forks. Keep it as private as the message.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXof` context that
  * is not mutably accessed or freed during the call.
- * `out` must be valid for 56 writable bytes and must not overlap the context.
+ * `out` must be valid for `out_len` writable bytes and must not overlap the context.
  */
-LustroError lustro_xof_export_snapshot(const struct LustroXof *ctx, uint8_t *out);
+LustroError lustro_xof_export_snapshot(const struct LustroXof *ctx,
+                                       uint8_t *out,
+                                       uintptr_t out_len);
 
 /**
- * Restores an XOF context from a 56-byte snapshot.
+ * Restores an XOF context from `len` snapshot bytes.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
- * for a null or misaligned `out_ctx`, or for a null `bytes`; `UnsupportedVersion`, `InvalidKind`
- * or `InvalidCursor` for a rejected snapshot. The length is fixed at 56 bytes, so `InvalidLength`
- * is not reported.
+ * for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`
+ * when `len` is not 56 (`LUSTRO_SNAPSHOT_LEN`); `UnsupportedVersion`, `InvalidKind`,
+ * `InvalidReserved` or `InvalidCursor` for a rejected snapshot.
  *
  * # Safety
- * If `bytes` is non-null, it must be valid for 56 readable bytes.
+ * `bytes` must be valid for `len` readable bytes when `len > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
  * and must not overlap any input buffer.
  */
-LustroError lustro_xof_import_snapshot(const uint8_t *bytes, struct LustroXof **out_ctx);
+LustroError lustro_xof_import_snapshot(const uint8_t *bytes,
+                                       uintptr_t len,
+                                       struct LustroXof **out_ctx);
 
 /**
  * Starts a `lustro_xof_new` of a message of exactly `total_len` bytes, given in pieces
@@ -1310,13 +1372,17 @@ LustroError lustro_xof_absorber_clone(const struct LustroXofAbsorber *ctx,
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null or misaligned pointer/length array (when
  * `n > 0`) or a null message pointer with a nonzero length, `InvalidLength` for a length too large
- * to address, `OutOfMemory` if the message table or the lane buffer cannot be allocated.
+ * to address, `OutOfMemory` if the message table, the lane buffer or the digest buffer cannot be
+ * allocated.
+ * Fixes the runtime settings (see `lustro_configure`) when `n > 0`.
  *
  * # Safety
  * When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
  * `n` readable elements.
  * Each `message_ptrs[i]` must be valid for `message_lens[i]` readable bytes
  * when `message_lens[i] > 0`.
+ * The tables and the message bytes must stay valid and unmodified by any thread until the
+ * function returns; they are read on the thread pool.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
  * and must not overlap any input buffer.
  */
@@ -1498,6 +1564,8 @@ LustroError lustro_xof_batch_fork_many(const struct LustroXofBatch *ctx,
  * `message_lens[i]` bytes if `message_lens[i] > 0`.
  * `path_hi` and `path_lo` must each be valid for `n_path` elements when
  * `n_path > 0`.
+ * The tables and the message bytes must stay valid and unmodified by any thread until the
+ * function returns.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
  * and must not overlap any input buffer.
  */
@@ -1539,15 +1607,16 @@ uintptr_t lustro_xof_batch_snapshot_size(const struct LustroXofBatch *ctx);
 
 /**
  * Exports the current batch snapshot.
- * `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`.
+ * `out_len` must equal `lustro_xof_batch_snapshot_size(ctx)`, otherwise `InvalidLength`.
+ * Writes straight into `out` and allocates nothing, so there is no `OutOfMemory`.
  * The snapshot holds every lane's state: whoever has it can reproduce the rest of each
- * stream and its forks. Keep it as private as the seed.
+ * stream and its forks. Keep it as private as the messages.
  *
  * # Safety
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
  * that is not mutably accessed or freed during the call.
  * `out` must be valid for `out_len` writable bytes and must not overlap
- * the context. `out_len` must equal the expected snapshot size.
+ * the context.
  */
 LustroError lustro_xof_batch_export_snapshot(const struct LustroXofBatch *ctx,
                                              uint8_t *out,
@@ -1557,7 +1626,8 @@ LustroError lustro_xof_batch_export_snapshot(const struct LustroXofBatch *ctx,
  * Restores an XOF batch from `len` snapshot bytes.
  * Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
  * for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`,
- * `UnsupportedVersion` or `InvalidKind` for a rejected snapshot.
+ * `UnsupportedVersion`, `InvalidKind` or `InvalidReserved` for a rejected snapshot;
+ * `OutOfMemory` if the lane buffer cannot be allocated.
  *
  * # Safety
  * `bytes` must be valid for `len` bytes if len > 0.

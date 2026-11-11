@@ -21,7 +21,7 @@ impl Avx2Cap {
     }
 }
 
-// Execution backend for stream lanes.
+// Execution backend of stream and hash batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Backend {
     Scalar,

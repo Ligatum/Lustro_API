@@ -10,8 +10,6 @@ mod pool;
 pub(crate) use backend::*;
 pub(crate) use config::*;
 pub(crate) use params::*;
-#[cfg(feature = "python")]
-pub(crate) use pool::for_chunks_mut;
 #[cfg(feature = "ffi")]
 pub(crate) use pool::map_ranges;
 use pool::pool_usable;
@@ -19,7 +17,7 @@ use pool::pool_usable;
 use pool::*;
 
 // ==========================================
-// INTERNAL STATE API
+// HASH DISPATCH API
 // ==========================================
 
 // Dispatches 256-bit hashing of `out.len()` messages of `message_len` bytes each, stored
@@ -143,23 +141,194 @@ pub(crate) fn dispatch_hash128_var_raw_into(
     execute_hash_var_blocks(plan, messages, domain, out, hash128_into);
 }
 
-// 256-bit / 128-bit digests of block-wise messages; see `dispatch_hash_blocks_parallel`.
+// Messages `data[offsets[i]..offsets[i + 1]]`, for the Python offsets API. `offsets` has
+// `len + 1` entries, never decreasing, the last at most `data.len()`; a caller that breaks
+// this gets a panic from the slicing, not a bad read.
 #[cfg(feature = "python")]
-pub(crate) fn dispatch_hash256_blocks_parallel<M: MessageBlocks>(
-    messages: M,
-    domain: u128,
-    out: &mut [[u8; 32]],
-) -> bool {
-    dispatch_hash_blocks_parallel(messages, domain, out, hash256_into)
+#[derive(Clone, Copy)]
+pub(crate) struct OffsetMessages<'a> {
+    data: &'a [u8],
+    offsets: &'a [usize],
 }
 
 #[cfg(feature = "python")]
-pub(crate) fn dispatch_hash128_blocks_parallel<M: MessageBlocks>(
-    messages: M,
+impl<'a> OffsetMessages<'a> {
+    // `offsets` must not be empty.
+    pub(crate) fn new(data: &'a [u8], offsets: &'a [usize]) -> Self {
+        assert!(!offsets.is_empty(), "OffsetMessages: no offsets");
+        Self { data, offsets }
+    }
+
+    // Bytes covered by the messages, saturating.
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.offsets[self.offsets.len() - 1].saturating_sub(self.offsets[0])
+    }
+}
+
+#[cfg(feature = "python")]
+impl MessageBlocks for OffsetMessages<'_> {
+    fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    fn range(&self, start: usize, end: usize) -> Self {
+        Self {
+            data: self.data,
+            offsets: &self.offsets[start..=end],
+        }
+    }
+
+    fn for_each_block(&self, mut f: impl FnMut(usize, &[&[u8]])) {
+        let mut block: [&[u8]; BLOCK] = [&[]; BLOCK];
+        let mut at = 0;
+        for ends in self.offsets[1..].chunks(BLOCK) {
+            let starts = &self.offsets[at..];
+            for ((slot, &s), &e) in block.iter_mut().zip(starts).zip(ends) {
+                *slot = &self.data[s..e];
+            }
+            f(at, &block[..ends.len()]);
+            at += ends.len();
+        }
+    }
+}
+
+// Dispatches 256-bit hashing of `messages` directly into `out`.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash256_offsets_into(
+    messages: OffsetMessages<'_>,
+    domain: u128,
+    out: &mut [[u8; 32]],
+) {
+    assert_eq!(
+        messages.len(),
+        out.len(),
+        "dispatch_hash256_offsets_into: length mismatch"
+    );
+    let plan = plan_hash_var_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        messages.len(),
+        messages.total_bytes(),
+    );
+    execute_hash_var_blocks(plan, messages, domain, out, hash256_into);
+}
+
+// 128-bit digests; see `dispatch_hash256_offsets_into`.
+#[cfg(feature = "python")]
+pub(crate) fn dispatch_hash128_offsets_into(
+    messages: OffsetMessages<'_>,
     domain: u128,
     out: &mut [[u8; 16]],
-) -> bool {
-    dispatch_hash_blocks_parallel(messages, domain, out, hash128_into)
+) {
+    assert_eq!(
+        messages.len(),
+        out.len(),
+        "dispatch_hash128_offsets_into: length mismatch"
+    );
+    let plan = plan_hash_var_with(
+        Caps::detect(),
+        runtime_config().overrides(),
+        messages.len(),
+        messages.total_bytes(),
+    );
+    execute_hash_var_blocks(plan, messages, domain, out, hash128_into);
+}
+
+// Outcome of `hash256_var_pipelined` / `hash128_var_pipelined`.
+#[cfg(feature = "python")]
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pipelined {
+    // Nothing was read or written: the plan for this many messages is not parallel, or the
+    // pool is not available.
+    NotRun,
+    // `out` holds all digests.
+    Done,
+    // `read` returned None; `out` may be partly written.
+    Stopped,
+}
+
+// Hashes `out.len()` messages that `read(start, end)` returns range by range on the calling
+// thread, while the pool hashes the ranges already returned. `read` is called only here, in
+// order, once per range; the workers see only the returned slices. Each range is hashed on
+// one worker with the backend of the plan. The plan is made with `TOTAL_LEN_CAP` bytes,
+// since the lengths are not known before the read.
+#[cfg(feature = "python")]
+pub(crate) fn hash256_var_pipelined<'a>(
+    out: &mut [[u8; 32]],
+    domain: u128,
+    read: impl FnMut(usize, usize) -> Option<&'a [&'a [u8]]>,
+) -> Pipelined {
+    hash_var_pipelined(out, domain, read, hash256_into)
+}
+
+// As `hash256_var_pipelined`, 128-bit digests.
+#[cfg(feature = "python")]
+pub(crate) fn hash128_var_pipelined<'a>(
+    out: &mut [[u8; 16]],
+    domain: u128,
+    read: impl FnMut(usize, usize) -> Option<&'a [&'a [u8]]>,
+) -> Pipelined {
+    hash_var_pipelined(out, domain, read, hash128_into)
+}
+
+#[cfg(feature = "python")]
+#[cfg_attr(not(feature = "parallel"), allow(unused_variables, unused_mut))]
+fn hash_var_pipelined<'a, const N: usize>(
+    out: &mut [[u8; N]],
+    domain: u128,
+    mut read: impl FnMut(usize, usize) -> Option<&'a [&'a [u8]]>,
+    absorb_into: fn(&[u8], u128, &mut [u8; N]),
+) -> Pipelined {
+    #[cfg(feature = "parallel")]
+    {
+        let n = out.len();
+        let plan = plan_hash_var_with(
+            Caps::detect(),
+            runtime_config().overrides(),
+            n,
+            TOTAL_LEN_CAP,
+        );
+        if plan.parallel != HashParallel::Rayon {
+            return Pipelined::NotRun;
+        }
+        let Some(pool) = get_or_init_pool() else {
+            return Pipelined::NotRun;
+        };
+        let range = pipeline_range(n, pool.current_num_threads());
+        let one = HashBatchPlan {
+            backend: plan.backend,
+            parallel: HashParallel::Single,
+        };
+        pool.in_place_scope_fifo(move |s| {
+            for (k, o) in out.chunks_mut(range).enumerate() {
+                let start = k * range;
+                let Some(m) = read(start, start + o.len()) else {
+                    return Pipelined::Stopped;
+                };
+                assert_eq!(
+                    m.len(),
+                    o.len(),
+                    "hash_var_pipelined: range length mismatch"
+                );
+                s.spawn_fifo(move |_| execute_hash_var(one, m, domain, o, absorb_into));
+            }
+            Pipelined::Done
+        })
+    }
+    #[cfg(not(feature = "parallel"))]
+    Pipelined::NotRun
+}
+
+// Messages per range of `hash_var_pipelined`: about 16 ranges per worker, so the last range
+// read leaves little hashing after the read ends. At least 256, so that a batch just above
+// `PIPELINE_MIN` is still split.
+#[cfg(all(feature = "python", feature = "parallel"))]
+fn pipeline_range(count: usize, threads: usize) -> usize {
+    count
+        .div_ceil(threads.max(1).saturating_mul(16))
+        .next_multiple_of(64)
+        .clamp(256, 16384)
 }
 
 #[inline(always)]
@@ -605,36 +774,6 @@ fn execute_hash_var_avx2_blocks<M: MessageBlocks, const N: usize>(
     }
 }
 
-// Hashes block-wise messages in parallel when the plan for this many messages says so.
-// Returns false without touching `out` when it does not. The plan is made with
-// `TOTAL_LEN_CAP` bytes, which reaches the byte threshold of every parameter set, so only
-// a message count below 2 (below `HASH_AVX2_VAR_MIN_MT_MESSAGES` on AVX2) keeps it on the
-// calling thread. The Python caller sets the real size floor (`PAR_LOAD_MIN`).
-#[cfg(feature = "python")]
-pub(crate) fn dispatch_hash_blocks_parallel<M: MessageBlocks, const N: usize>(
-    messages: M,
-    domain: u128,
-    out: &mut [[u8; N]],
-    absorb_into: impl Fn(&[u8], u128, &mut [u8; N]) + Sync,
-) -> bool {
-    assert_eq!(
-        messages.len(),
-        out.len(),
-        "dispatch_hash_blocks_parallel: length mismatch"
-    );
-    let plan = plan_hash_var_with(
-        Caps::detect(),
-        runtime_config().overrides(),
-        messages.len(),
-        TOTAL_LEN_CAP,
-    );
-    if plan.parallel != HashParallel::Rayon {
-        return false;
-    }
-    execute_hash_var_blocks(plan, messages, domain, out, absorb_into);
-    true
-}
-
 // Scalar hashing of messages with a common length; same split as `execute_hash`.
 // `data.len()` must equal `out.len() * message_len`.
 fn execute_hash_scalar_fixed<const N: usize>(
@@ -765,7 +904,7 @@ const SCALAR_BLOCK_STEPS: usize = 8;
 // block keeps its state in locals within a step block.
 //
 // SAFETY: `out` must be valid for `n * steps` blocks, `first + lanes.len() <= n`,
-// and no other thread may write to this lane range.
+// and no other thread may access the blocks of this lane range.
 #[inline(always)]
 unsafe fn process_lanes_scalar(
     lanes: &mut [StreamLane],
@@ -925,7 +1064,7 @@ fn runtime_info_with(
     pool_usable: bool,
     logical: usize,
 ) -> crate::types::RuntimeInfo {
-    // Backend of the largest batch, within `LUSTRO_DISABLE_SIMD`.
+    // Backend of the largest batch, within the SIMD setting.
     let backend = backend_for(caps, config.overrides(), usize::MAX);
     #[cfg(feature = "parallel")]
     let threads = if config.disable_mt { 0 } else { config.workers };
@@ -942,19 +1081,9 @@ fn runtime_info_with(
     }
 }
 
-// Settings of the current CPU and runtime config. Reads the config like any dispatch.
+// Settings of the current CPU and runtime config. Fixes nothing: unfixed settings come
+// from the environment now.
 pub(crate) fn runtime_info() -> crate::types::RuntimeInfo {
-    runtime_info_with(
-        Caps::detect(),
-        runtime_config(),
-        true,
-        pool_usable(),
-        logical_cpus(),
-    )
-}
-
-// As `runtime_info`, but fixes nothing: unfixed settings come from the environment now.
-pub(crate) fn runtime_preview() -> crate::types::RuntimeInfo {
     let (config, fixed) = runtime_config_peek();
     runtime_info_with(Caps::detect(), config, fixed, pool_usable(), logical_cpus())
 }

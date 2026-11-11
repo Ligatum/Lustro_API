@@ -5,8 +5,7 @@
 use super::{alloc_error, copy_buffer_apart, gil_enabled, BYTES_EXPECTED};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PySequence, PyString};
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::{Cell, RefCell};
 
 // Messages of a batch argument. `slices` point into `bytes` objects and into `copies`;
 // they are 'static only inside this type and are handed out with the lifetime of `self`.
@@ -103,48 +102,6 @@ impl<'py> MessageSeq<'py> {
         self.load_inner(true, apart)
     }
 
-    // Hashes an exact `list` or `tuple` of at least `PAR_LOAD_MIN` messages into `out` with
-    // the items read by the threads that hash them, so no table of slices is built and each
-    // item is touched once. `run` is given the messages and `out` and returns false when it
-    // did not hash anything. Returns true when `out` holds all digests. False means that
-    // nothing was hashed, or that an item is not an exact `bytes`: `out` may then be partly
-    // written, and the caller must hash the messages by another path. That path must not
-    // read the other items from `out` (see `load_borrowed`, `apart`), and any error it
-    // raises (not only TypeError) leaves `out` as it is, possibly partly written.
-    //
-    // SAFETY: the GIL is held by the caller and stays held, and `out` does not overlap any
-    // exact `bytes` item. No Python code runs in here (`gil_enabled` is read at init).
-    pub(crate) unsafe fn hash_fused<T>(
-        &self,
-        out: &mut [T],
-        run: impl FnOnce(ListMessages, &mut [T]) -> bool,
-    ) -> bool {
-        use pyo3::ffi;
-        // Before the size is read: this must not run Python code once `out` is borrowed.
-        if !gil_enabled(self.0.py()) {
-            return false;
-        }
-        let obj = self.0.as_ptr();
-        let (is_list, n) = if ffi::PyList_CheckExact(obj) != 0 {
-            (true, ffi::PyList_Size(obj) as usize)
-        } else if ffi::PyTuple_CheckExact(obj) != 0 {
-            (false, ffi::PyTuple_Size(obj) as usize)
-        } else {
-            return false;
-        };
-        if n != out.len() || n < PAR_LOAD_MIN {
-            return false;
-        }
-        let bad = AtomicBool::new(false);
-        let messages = ListMessages {
-            seq: ItemSource { obj, is_list },
-            start: 0,
-            end: n,
-            bad: &bad,
-        };
-        run(messages, out) && !bad.load(Ordering::Relaxed)
-    }
-
     fn load_inner(&self, hold: bool, apart: Option<(usize, usize)>) -> PyResult<Messages<'py>> {
         if let Some(messages) = self.load_exact(hold)? {
             return Ok(messages);
@@ -192,7 +149,9 @@ impl<'py> MessageSeq<'py> {
     }
 
     // One pass over an exact `list` or `tuple` of exact `bytes`; None for anything else.
-    // No Python code runs: the type checks and the size/item macros only read the objects.
+    // No Python code runs: the type checks and the size/item calls only read the objects.
+    // With `hold` no reference is taken on the items (see `load_borrowed`). The items are
+    // read on this thread only: the C API calls need the GIL on the calling thread.
     fn load_exact(&self, hold: bool) -> PyResult<Option<Messages<'py>>> {
         use pyo3::ffi;
         let py = self.0.py();
@@ -216,72 +175,131 @@ impl<'py> MessageSeq<'py> {
             _refs: Vec::new(),
             _copies: Vec::new(),
         };
-        if hold {
-            let seq = ItemSource { obj, is_list };
-            let bad = AtomicBool::new(false);
-            let spare = &mut messages.slices.spare_capacity_mut()[..n];
-            crate::dispatch::for_chunks_mut(spare, PAR_LOAD_MIN, |start, chunk| {
-                for (k, slot) in chunk.iter_mut().enumerate() {
-                    // SAFETY: `start + k < n`. The calling thread holds the GIL and waits
-                    // for this call, no Python code runs, so the sequence and its items do
-                    // not change while other threads read them.
-                    match unsafe { seq.bytes_at(start + k) } {
-                        Some(s) => {
-                            slot.write(s);
-                        }
-                        None => {
-                            bad.store(true, Ordering::Relaxed);
-                            slot.write(&[]);
-                        }
-                    }
-                }
-            });
-            if bad.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            // SAFETY: all `n` slots were written above.
-            unsafe { messages.slices.set_len(n) };
-            return Ok(Some(messages));
+        if !hold {
+            messages
+                ._refs
+                .try_reserve_exact(n)
+                .map_err(|_| alloc_error())?;
         }
-        messages
-            ._refs
-            .try_reserve_exact(n)
-            .map_err(|_| alloc_error())?;
         let seq = ItemSource { obj, is_list };
         for i in 0..n {
             // SAFETY: `i < n`, and nothing in this loop can run Python code, so the
             // container does not change; the item is a borrowed pointer.
             unsafe {
                 let item = seq.item(i);
-                match seq.bytes_at(i) {
+                match bytes_of(item) {
                     Some(s) => messages.slices.push(s),
                     None => return Ok(None),
                 }
-                messages
-                    ._refs
-                    .push(Bound::from_borrowed_ptr(py, item).cast_into_unchecked());
+                if !hold {
+                    messages
+                        ._refs
+                        .push(Bound::from_borrowed_ptr(py, item).cast_into_unchecked());
+                }
             }
         }
         Ok(Some(messages))
     }
 }
 
-// Fewest messages for which an in-place read of the items is split across the pool.
-const PAR_LOAD_MIN: usize = 16384;
+// Fewest messages for which `hash_var_pipelined` is tried.
+pub(crate) const PIPELINE_MIN: usize = 4096;
+
+// An exact `list` or `tuple` read range by range into a table of slices, for
+// `hash{256,128}_var_pipelined`. The items are read on the thread that holds the GIL; the
+// slices handed out stay valid while the sequence is alive and unchanged; `_keep` holds a
+// reference to it for as long as this value lives.
+pub(crate) struct ExactItems<'py> {
+    _keep: Bound<'py, PySequence>,
+    seq: ItemSource,
+    n: usize,
+    table: Vec<&'static [u8]>,
+    // Start of `table`'s buffer, taken once: handed out ranges are read by the workers while
+    // later ones are written.
+    base: *mut &'static [u8],
+    next: Cell<usize>,
+}
+
+impl<'py> MessageSeq<'py> {
+    // The items of an exact `list` or `tuple` of at least `min` items, for a range by range
+    // read; None for anything else. Nothing is read yet.
+    pub(crate) fn exact_items(&self, min: usize) -> PyResult<Option<ExactItems<'py>>> {
+        use pyo3::ffi;
+        let py = self.0.py();
+        if !gil_enabled(py) {
+            return Ok(None);
+        }
+        let obj = self.0.as_ptr();
+        // SAFETY: the GIL is held; `obj` is a live object.
+        let (is_list, n) = unsafe {
+            if ffi::PyList_CheckExact(obj) != 0 {
+                (true, ffi::PyList_Size(obj) as usize)
+            } else if ffi::PyTuple_CheckExact(obj) != 0 {
+                (false, ffi::PyTuple_Size(obj) as usize)
+            } else {
+                return Ok(None);
+            }
+        };
+        if n < min {
+            return Ok(None);
+        }
+        let mut table = messages_table(n)?;
+        let base = table.as_mut_ptr();
+        Ok(Some(ExactItems {
+            _keep: self.0.clone(),
+            seq: ItemSource { obj, is_list },
+            n,
+            table,
+            base,
+            next: Cell::new(0),
+        }))
+    }
+}
+
+impl ExactItems<'_> {
+    pub(crate) fn len(&self) -> usize {
+        self.n
+    }
+
+    // Reads items `start..end` into the table; None if one of them is not an exact `bytes`.
+    // Ranges must follow each other from 0.
+    //
+    // SAFETY: the GIL is held by this thread from `exact_items` until the last returned
+    // slice is no longer used, and no Python code runs in between, so the sequence and its
+    // items do not change.
+    pub(crate) unsafe fn read(&self, start: usize, end: usize) -> Option<&[&[u8]]> {
+        assert!(start == self.next.get() && start <= end && end <= self.n);
+        for i in start..end {
+            // Only the slots `start..end` are written; earlier ones may be read meanwhile.
+            self.base.add(i).write(self.seq.bytes_at(i)?);
+        }
+        self.next.set(end);
+        Some(std::slice::from_raw_parts(
+            self.base.add(start),
+            end - start,
+        ))
+    }
+}
+
+impl Drop for ExactItems<'_> {
+    fn drop(&mut self) {
+        // The table is kept for the next call; its length stays 0, so no slice outlives this.
+        let table = std::mem::take(&mut self.table);
+        if table.capacity() * std::mem::size_of::<&[u8]>() <= TABLE_KEEP {
+            let _ = TABLE.try_with(|t| *t.borrow_mut() = table);
+        }
+    }
+}
 
 // Items of an exact `list` or `tuple`, read by pointer.
-#[derive(Clone, Copy)]
 struct ItemSource {
     obj: *mut pyo3::ffi::PyObject,
     is_list: bool,
 }
 
-// SAFETY: only used for reads while the thread that holds the GIL waits (see `load_exact`).
-unsafe impl Sync for ItemSource {}
-
 impl ItemSource {
-    // SAFETY: GIL held by the calling thread (or by a thread waiting for this one), `i` is in
-    // range and the sequence is not modified.
+    // SAFETY: GIL held by the calling thread, `i` is in range and the sequence is not
+    // modified.
     unsafe fn item(&self, i: usize) -> *mut pyo3::ffi::PyObject {
         use pyo3::ffi;
         if self.is_list {
@@ -294,65 +312,24 @@ impl ItemSource {
     // The bytes of item `i` if it is an exact `bytes`. Same contract as `item`; the slice is
     // valid while the item is alive.
     unsafe fn bytes_at(&self, i: usize) -> Option<&'static [u8]> {
-        use pyo3::ffi;
-        let item = self.item(i);
-        if ffi::PyBytes_CheckExact(item) == 0 {
-            return None;
-        }
-        let data = ffi::PyBytes_AsString(item) as *const u8;
-        Some(std::slice::from_raw_parts(
-            data,
-            ffi::PyBytes_Size(item) as usize,
-        ))
+        bytes_of(self.item(i))
     }
 }
 
-// Messages `start..end` of an exact `list` or `tuple` of a `hash_fused` call, turned into
-// slices on the threads that hash them. `bad` is set when an item is not an exact `bytes`
-// (its slice is empty then).
-#[derive(Clone, Copy)]
-pub(crate) struct ListMessages {
-    seq: ItemSource,
-    start: usize,
-    end: usize,
-    bad: *const AtomicBool,
-}
-
-// SAFETY: only used inside `hash_fused`, where the thread that holds the GIL waits for the
-// workers: the sequence and its items are only read and `bad` outlives them.
-unsafe impl Sync for ListMessages {}
-
-impl crate::dispatch::MessageBlocks for ListMessages {
-    fn len(&self) -> usize {
-        self.end - self.start
+// The bytes of `item` if it is an exact `bytes`. GIL held; the slice is valid while the
+// item is alive.
+unsafe fn bytes_of(item: *mut pyo3::ffi::PyObject) -> Option<&'static [u8]> {
+    use pyo3::ffi;
+    if ffi::PyBytes_CheckExact(item) == 0 {
+        return None;
     }
-
-    fn range(&self, start: usize, end: usize) -> Self {
-        Self {
-            start: self.start + start,
-            end: self.start + end,
-            ..*self
-        }
+    let mut data = std::ptr::null_mut();
+    let mut len: ffi::Py_ssize_t = 0;
+    // Does not fail for an exact `bytes` when the length is asked for; if it did, the caller
+    // falls back to the path that reports the error.
+    if ffi::PyBytes_AsStringAndSize(item, &mut data, &mut len) != 0 {
+        ffi::PyErr_Clear();
+        return None;
     }
-
-    fn for_each_block(&self, mut f: impl FnMut(usize, &[&[u8]])) {
-        let mut block: [&[u8]; crate::dispatch::BLOCK] = [&[]; crate::dispatch::BLOCK];
-        let mut at = 0;
-        while self.start + at < self.end {
-            let count = (self.end - self.start - at).min(crate::dispatch::BLOCK);
-            for (k, slot) in block[..count].iter_mut().enumerate() {
-                // SAFETY: in range; see the `Sync` impl.
-                *slot = match unsafe { self.seq.bytes_at(self.start + at + k) } {
-                    Some(s) => s,
-                    None => {
-                        // SAFETY: `bad` outlives the workers.
-                        unsafe { (*self.bad).store(true, Ordering::Relaxed) };
-                        &[]
-                    }
-                };
-            }
-            f(at, &block[..count]);
-            at += count;
-        }
-    }
+    Some(std::slice::from_raw_parts(data as *const u8, len as usize))
 }

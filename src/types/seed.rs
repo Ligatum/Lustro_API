@@ -24,7 +24,7 @@ impl Seed256 {
         &self.0
     }
 
-    // Splits the seed into native state halves.
+    // The seed as the state halves `(s0, s1)`, each read little-endian.
     #[inline]
     pub(crate) fn to_state(self) -> (u128, u128) {
         (

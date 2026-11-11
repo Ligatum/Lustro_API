@@ -61,8 +61,8 @@ pub(super) const HASH_AVX2_VAR_PARAMS: HashParams = HashParams {
 const _: () = assert!(HASH_AVX2_VAR_PARAMS.tasks_per_thread > 0);
 
 // Fewest messages of a variable-length AVX2 batch that go to the pool: below it there are
-// fewer than 4 work items of one group, and the pool did not pay on the calling thread's
-// time (measured on 8 and 12 messages).
+// fewer than 4 work items of one group, and the pool was slower than the calling thread
+// (measured with 8 and 12 messages).
 #[cfg(target_arch = "x86_64")]
 pub(super) const HASH_AVX2_VAR_MIN_MT_MESSAGES: usize = 16;
 

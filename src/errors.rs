@@ -10,7 +10,8 @@ pub enum LustroError {
     Ok = 0,
     /// Length or size argument is invalid.
     InvalidLength = 1,
-    /// Required pointer is NULL or misaligned (hash functions and `lustro_hasher_*`: ranges overlap).
+    /// Required pointer is NULL or misaligned (hash functions, `lustro_hasher_*` and
+    /// `lustro_xof_absorber_*`: ranges overlap).
     InvalidPointer = 2,
     /// Reserved, not returned by V1 (`InvalidLength` is used instead).
     OutputTooSmall = 3,
@@ -35,6 +36,8 @@ pub enum LustroError {
     /// The system entropy source is unavailable (`lustro_seed_from_entropy`,
     /// `lustro_prng_from_entropy`).
     EntropyUnavailable = 13,
+    /// Snapshot reserved bytes are not zero.
+    InvalidReserved = 14,
 }
 
 impl LustroError {
@@ -55,6 +58,7 @@ impl LustroError {
             11 => Some(LustroError::AlreadyConfigured),
             12 => Some(LustroError::InvalidArgument),
             13 => Some(LustroError::EntropyUnavailable),
+            14 => Some(LustroError::InvalidReserved),
             _ => None,
         }
     }
@@ -82,6 +86,7 @@ impl LustroError {
             LustroError::AlreadyConfigured => "runtime settings are already fixed\0",
             LustroError::InvalidArgument => "invalid argument value\0",
             LustroError::EntropyUnavailable => "system entropy source unavailable\0",
+            LustroError::InvalidReserved => "snapshot reserved bytes are not zero\0",
         }
     }
 }
@@ -102,6 +107,7 @@ impl From<crate::types::SnapshotError> for LustroError {
             S::InvalidKind => LustroError::InvalidKind,
             S::InvalidCursor => LustroError::InvalidCursor,
             S::InvalidLength => LustroError::InvalidLength,
+            S::InvalidReserved => LustroError::InvalidReserved,
             S::Reserve => LustroError::OutOfMemory,
         }
     }

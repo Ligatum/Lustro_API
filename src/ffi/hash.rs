@@ -63,7 +63,9 @@ unsafe fn check_var_table(
     Ok(total)
 }
 
-/// Computes a 256-bit hash into `out`.
+/// Computes a 256-bit hash into `out`. Returns `InvalidLength` if `data_len` exceeds
+/// isize::MAX, `InvalidPointer` for a null `out`, a null `data` with `data_len > 0`, or
+/// overlapping input and output.
 ///
 /// # Safety
 /// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -99,7 +101,7 @@ pub unsafe extern "C" fn lustro_hash256(
     })
 }
 
-/// Computes a 128-bit hash into `out`.
+/// Computes a 128-bit hash into `out`. Same statuses as `lustro_hash256`.
 ///
 /// # Safety
 /// If `data_len > 0`, `data` must be valid for `data_len` readable bytes.
@@ -304,7 +306,10 @@ pub unsafe extern "C" fn lustro_hasher_clone(
 // FFI HASH BATCH API
 // ==========================================
 
-/// Hashes `n` fixed-length messages into `out_ptr`.
+/// Hashes `n` fixed-length messages into `out_ptr`. `n == 0` returns `Ok` and reads nothing.
+/// Returns `InvalidLength` if `n * message_len` or `n * 32` overflows or exceeds isize::MAX,
+/// `InvalidPointer` for a null `out_ptr`, a null `data_ptr` with a nonzero input size, or
+/// overlapping input and output.
 ///
 /// # Safety
 /// If `n * message_len` is nonzero and representable, `data_ptr` must be
@@ -312,6 +317,8 @@ pub unsafe extern "C" fn lustro_hasher_clone(
 /// If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
 /// for `n * 32` writable bytes.
 /// The input and output regions must not overlap.
+/// The input bytes must stay valid and unmodified by any thread until the function returns;
+/// they are read on the thread pool.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256_many_fixed(
     data_ptr: *const u8,
@@ -365,7 +372,8 @@ pub unsafe extern "C" fn lustro_hash256_many_fixed(
     })
 }
 
-/// Hashes `n` fixed-length messages into 128-bit digests.
+/// Hashes `n` fixed-length messages into 128-bit digests. Same statuses as
+/// `lustro_hash256_many_fixed`, with `n * 16` output bytes.
 ///
 /// # Safety
 /// If `n * message_len` is nonzero and representable, `data_ptr` must be
@@ -373,6 +381,8 @@ pub unsafe extern "C" fn lustro_hash256_many_fixed(
 /// If `n > 0` and the size calculation succeeds, `out_ptr` must be valid
 /// for `n * 16` writable bytes.
 /// The input and output regions must not overlap.
+/// The input bytes must stay valid and unmodified by any thread until the function returns;
+/// they are read on the thread pool.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128_many_fixed(
     data_ptr: *const u8,
@@ -426,9 +436,12 @@ pub unsafe extern "C" fn lustro_hash128_many_fixed(
     })
 }
 
-/// Hashes `n` variable-length messages.
+/// Hashes `n` variable-length messages into 256-bit digests.
 /// `message_ptrs[i]` must reference `message_lens[i]` bytes.
-/// A null pointer is allowed when `message_lens[i] == 0`.
+/// A null pointer is allowed when `message_lens[i] == 0`. `n == 0` returns `Ok` and reads
+/// nothing. Returns `InvalidLength` for a size or message length that exceeds isize::MAX,
+/// `InvalidPointer` for a null or misaligned table, a null `out_ptr`, a null message pointer
+/// with a nonzero length, or an output that overlaps a table or a message.
 ///
 /// # Safety
 /// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
@@ -438,11 +451,13 @@ pub unsafe extern "C" fn lustro_hash128_many_fixed(
 /// `out_ptr` must be valid for `n * 32` writable bytes when that size is
 /// representable.
 /// The output region must not overlap either table or any nonempty message.
+/// The tables and the message bytes must stay valid and unmodified by any thread until the
+/// function returns; they are read on the thread pool.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash256_many_var(
     message_ptrs: *const *const u8,
-    n: usize,
     message_lens: *const usize,
+    n: usize,
     out_ptr: *mut u8,
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -529,7 +544,7 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
 }
 
 /// Hashes `n` variable-length messages into 128-bit digests.
-/// Same pointer conventions as `lustro_hash256_many_var`.
+/// Same pointer conventions and statuses as `lustro_hash256_many_var`.
 ///
 /// # Safety
 /// When `n > 0`, `message_ptrs` and `message_lens` must each be valid for
@@ -539,11 +554,13 @@ pub unsafe extern "C" fn lustro_hash256_many_var(
 /// `out_ptr` must be valid for `n * 16` writable bytes when that size is
 /// representable.
 /// The output region must not overlap either table or any nonempty message.
+/// The tables and the message bytes must stay valid and unmodified by any thread until the
+/// function returns; they are read on the thread pool.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_hash128_many_var(
     message_ptrs: *const *const u8,
-    n: usize,
     message_lens: *const usize,
+    n: usize,
     out_ptr: *mut u8,
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {

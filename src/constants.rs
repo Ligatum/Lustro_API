@@ -1,6 +1,6 @@
 //! Lustro V1 — shared constants: IV, domain IDs.
 
-// Initialisation vectors: PHI_64 in both halves of IV_S0, the first 64 bits of the 128-bit
+// Initialization vectors: PHI_64 in both halves of IV_S0, the first 64 bits of the 128-bit
 // FNV offset basis in both halves of IV_S1.
 pub(crate) const IV_S0: u128 = 0x9E3779B97F4A7C159E3779B97F4A7C15_u128;
 pub(crate) const IV_S1: u128 = 0x6C62272E07BB01426C62272E07BB0142_u128;

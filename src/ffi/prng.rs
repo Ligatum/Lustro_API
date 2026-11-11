@@ -4,7 +4,7 @@
 use crate::errors::LustroError;
 use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
-use crate::types::{Seed256, StreamId};
+use crate::types::{Seed256, StreamId, LUSTRO_SNAPSHOT_LEN};
 
 use super::types::{buf_in, buf_out, bytes_in, ctx_array, fits_slice, ids_from_parts, slice_out};
 use super::{construct, guarded};
@@ -184,7 +184,7 @@ pub unsafe extern "C" fn lustro_prng_next_block(ctx: *mut LustroPrng, out: *mut 
     })
 }
 
-/// Fills `out` with `out_len` random bytes.
+/// Fills `out` with the next `out_len` bytes of the stream.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context and
@@ -447,24 +447,28 @@ pub unsafe extern "C" fn lustro_prng_derive_path(
 }
 
 /// Exports the current PRNG snapshot into `out`.
-/// `out` must provide at least 56 writable bytes.
+/// `out_len` must be 56 (`LUSTRO_SNAPSHOT_LEN`), otherwise `InvalidLength`.
 /// The snapshot holds the full stream state: whoever has it can reproduce the rest of the
 /// stream and its forks. Keep it as private as the seed.
 ///
 /// # Safety
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
 /// is not mutably accessed or freed during the call.
-/// `out` must be valid for 56 writable bytes and must not overlap the context.
+/// `out` must be valid for `out_len` writable bytes and must not overlap the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_export_snapshot(
     ctx: *const LustroPrng,
     out: *mut u8,
+    out_len: usize,
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() {
             return LustroError::InvalidPointer;
         }
-        let output = match buf_out(out, 56) {
+        if out_len != LUSTRO_SNAPSHOT_LEN {
+            return LustroError::InvalidLength;
+        }
+        let output = match buf_out(out, LUSTRO_SNAPSHOT_LEN) {
             Some(s) => s,
             None => return LustroError::InvalidPointer,
         };
@@ -476,25 +480,25 @@ pub unsafe extern "C" fn lustro_prng_export_snapshot(
     })
 }
 
-/// Restores a PRNG context from a 56-byte snapshot.
+/// Restores a PRNG context from `len` snapshot bytes.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
-/// for a null or misaligned `out_ctx`, or for a null `bytes`; `UnsupportedVersion`, `InvalidKind`
-/// or `InvalidCursor` for a rejected snapshot. The length is fixed at 56 bytes, so `InvalidLength`
-/// is not reported.
+/// for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`
+/// when `len` is not 56 (`LUSTRO_SNAPSHOT_LEN`); `UnsupportedVersion`, `InvalidKind`,
+/// `InvalidReserved` or `InvalidCursor` for a rejected snapshot.
 ///
 /// # Safety
-/// If `bytes` is non-null, it must be valid for 56 readable bytes.
+/// `bytes` must be valid for `len` readable bytes when `len > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
 /// and must not overlap any input buffer.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_import_snapshot(
     bytes: *const u8,
+    len: usize,
     out_ctx: *mut *mut LustroPrng,
 ) -> LustroError {
     construct(out_ctx, || {
-        let snapshot_bytes = buf_in(bytes, 56).ok_or(LustroError::InvalidPointer)?;
-        let array_ref: &[u8; 56] = snapshot_bytes.try_into().unwrap();
-        let snapshot = crate::types::LustroPrngSnapshot::from_le_bytes(array_ref)?;
+        let snapshot_bytes = bytes_in(bytes, len)?;
+        let snapshot = crate::types::LustroPrngSnapshot::try_from(snapshot_bytes)?;
         Ok(LustroPrng::import_snapshot(snapshot))
     })
 }
@@ -910,8 +914,8 @@ pub unsafe extern "C" fn lustro_prng_batch_snapshot_size(ctx: *const LustroPrngB
 }
 
 /// Exports the current batch snapshot.
-/// `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`. `OutOfMemory` if the
-/// intermediate buffers cannot be allocated; `out` is not written then.
+/// `out_len` must equal `lustro_prng_batch_snapshot_size(ctx)`, otherwise `InvalidLength`.
+/// Writes straight into `out` and allocates nothing, so there is no `OutOfMemory`.
 /// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
 /// stream and its forks. Keep it as private as the seed.
 ///
@@ -919,7 +923,7 @@ pub unsafe extern "C" fn lustro_prng_batch_snapshot_size(ctx: *const LustroPrngB
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
 /// `out` must be valid for `out_len` writable bytes and must not overlap
-/// the context. `out_len` must equal the expected snapshot size.
+/// the context.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
     ctx: *const LustroPrngBatch,
@@ -944,14 +948,7 @@ pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
             None => return LustroError::InvalidPointer,
         };
 
-        let bytes = match batch
-            .try_export_snapshot()
-            .and_then(|snapshot| snapshot.try_to_le_bytes())
-        {
-            Ok(b) => b,
-            Err(e) => return e.into(),
-        };
-        output.copy_from_slice(&bytes);
+        batch.write_snapshot_into(output);
         LustroError::Ok
     })
 }
@@ -959,8 +956,8 @@ pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
 /// Restores a PRNG batch from `len` snapshot bytes.
 /// Stores the new context in `*out_ctx` (null on failure) and returns the status: `InvalidPointer`
 /// for a null or misaligned `out_ctx`, or for a null `bytes` when `len > 0`; `InvalidLength`,
-/// `UnsupportedVersion` or `InvalidKind` for a rejected snapshot; `OutOfMemory` if the lane
-/// buffer cannot be allocated.
+/// `UnsupportedVersion`, `InvalidKind` or `InvalidReserved` for a rejected snapshot;
+/// `OutOfMemory` if the lane buffer cannot be allocated.
 ///
 /// # Safety
 /// `bytes` must be valid for `len` bytes when `len > 0`.

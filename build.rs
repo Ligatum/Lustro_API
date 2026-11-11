@@ -46,7 +46,7 @@ fn generate_header() {
          \tLUSTRO_ERROR_ALREADY_FINALISED   = 4,\n\
          \tLUSTRO_ERROR_VERIFICATION_FAILED = 5,\n\
          \tLUSTRO_ERROR_INTERNAL_PANIC      = 6,\n\
-         \t/* 7..10: reported by the constructors */\n\
+         \t/* 7..10: reported by the constructors (7 and 8 also by lustro_snapshot_kind) */\n\
          \tLUSTRO_ERROR_UNSUPPORTED_VERSION  = 7,\n\
          \tLUSTRO_ERROR_INVALID_KIND         = 8,\n\
          \tLUSTRO_ERROR_INVALID_CURSOR       = 9,\n\
@@ -55,7 +55,9 @@ fn generate_header() {
          \t * lustro_*_batch_from_streams; 13: the entropy functions */\n\
          \tLUSTRO_ERROR_ALREADY_CONFIGURED   = 11,\n\
          \tLUSTRO_ERROR_INVALID_ARGUMENT     = 12,\n\
-         \tLUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13\n\
+         \tLUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13,\n\
+         \t/* 14: snapshot import */\n\
+         \tLUSTRO_ERROR_INVALID_RESERVED     = 14\n\
          } LustroError;\n\
          \n\
          /*\n\

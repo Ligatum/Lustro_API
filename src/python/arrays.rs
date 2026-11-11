@@ -77,7 +77,7 @@ fn words_from_le(words: &mut [u64]) {
 // New uint64 array of shape `(n,)` with the next `n` stream words, as `next_u64()` returns them.
 // The size check, the NumPy check and the buffer allocation come before `fill`, so their
 // failures leave the state untouched. Array construction happens after `fill`.
-// The GIL is released while `fill` runs.
+// The GIL is released while `fill` runs, from 4096 bytes.
 pub(crate) fn u64_array<'py>(
     py: Python<'py>,
     n: usize,
@@ -94,7 +94,11 @@ pub(crate) fn u64_array<'py>(
         // SAFETY: the byte view covers exactly the memory of `words`; any bit pattern
         // is a valid u8 and u64.
         let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, n * 8) };
-        py.detach(|| fill(bytes));
+        if n * 8 < crate::python::DETACH_MIN {
+            fill(bytes);
+        } else {
+            py.detach(|| fill(bytes));
+        }
         words_from_le(&mut words);
     }
     Ok(PyArray1::from_vec(py, words))
@@ -111,12 +115,12 @@ pub(crate) fn blocks_array<'py>(
     fill: impl FnOnce(&mut [[u8; 32]]) + Send,
 ) -> PyResult<Bound<'py, PyArray3<u64>>> {
     let too_big =
-        || pyo3::exceptions::PyValueError::new_err("output size exceeds isize::MAX bytes");
+        || pyo3::exceptions::PyOverflowError::new_err("output size exceeds isize::MAX bytes");
     if steps > isize::MAX as usize {
         return Err(too_big());
     }
     let blocks = lanes.checked_mul(steps).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err("n_streams * steps overflows usize")
+        pyo3::exceptions::PyOverflowError::new_err("n_streams * steps overflows usize")
     })?;
     if blocks
         .checked_mul(32)
@@ -134,5 +138,15 @@ pub(crate) fn blocks_array<'py>(
         py.detach(|| fill(view));
         words_from_le(&mut words);
     }
-    PyArray1::from_vec(py, words).reshape([steps, lanes, 4])
+    // The element count matches the shape, so only a dimension NumPy cannot hold fails here
+    // (an empty batch with a very large `steps`).
+    PyArray1::from_vec(py, words)
+        .reshape([steps, lanes, 4])
+        .map_err(|e| {
+            if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) {
+                too_big()
+            } else {
+                e
+            }
+        })
 }

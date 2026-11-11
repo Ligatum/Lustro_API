@@ -61,36 +61,6 @@ pub(super) fn pool_usable() -> bool {
     }
 }
 
-// Runs `f(start, chunk)` over `items` in chunks on the Rayon pool when `items` has at least
-// `min_total` elements and the process settings allow threads; otherwise once on the calling
-// thread over the whole slice. `f` must not call into Python.
-#[cfg(feature = "python")]
-pub(crate) fn for_chunks_mut<T: Send>(
-    items: &mut [T],
-    min_total: usize,
-    f: impl Fn(usize, &mut [T]) + Sync,
-) {
-    #[cfg(feature = "parallel")]
-    if items.len() >= min_total && runtime_config().overrides().parallel != ParallelPref::Single {
-        if let Some(pool) = get_or_init_pool() {
-            let chunk = items
-                .len()
-                .div_ceil(pool.current_num_threads().max(1) * 4)
-                .max(1);
-            pool.install(|| {
-                items
-                    .par_chunks_mut(chunk)
-                    .enumerate()
-                    .for_each(|(i, c)| f(i * chunk, c));
-            });
-            return;
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    let _ = min_total;
-    f(0, items);
-}
-
 // Runs `f` over `0..n` in index-ordered ranges on the Rayon pool when `n` is at least
 // `min_total` and the process settings allow threads; otherwise once over the whole range
 // on the calling thread. The results come back in range order.

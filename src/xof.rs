@@ -207,7 +207,7 @@ impl LustroXof {
 
     /// Exports the current stream state.
     /// The snapshot holds the full stream state: whoever has it can reproduce the rest of the
-    /// stream and its forks. Keep it as private as the seed.
+    /// stream and its forks. Keep it as private as the message.
     #[must_use]
     pub fn export_snapshot(&self) -> LustroXofSnapshot {
         let (s0, s1, step, cursor) = self.state.to_parts();
@@ -233,9 +233,9 @@ impl LustroXof {
 /// use lustro::LustroXof;
 /// use std::io::Read;
 ///
-/// let mut rng = LustroXof::new(b"message");
+/// let mut xof = LustroXof::new(b"message");
 /// let mut bytes = Vec::new();
-/// rng.by_ref().take(100).read_to_end(&mut bytes).unwrap();
+/// xof.by_ref().take(100).read_to_end(&mut bytes).unwrap();
 /// assert_eq!(bytes.len(), 100);
 /// ```
 impl std::io::Read for LustroXof {
@@ -345,7 +345,8 @@ pub(crate) const ABSORB_PORTION: usize = 16384;
 
 impl LustroXofBatch {
     /// Creates a batch by independently absorbing each message.
-    /// Panics if the lane buffer cannot be allocated.
+    /// Fixes the runtime settings (see `configure`) unless `messages` is empty.
+    /// Panics if the lane or digest buffer cannot be allocated.
     pub fn new(messages: &[&[u8]]) -> Self {
         match Self::try_new(messages) {
             Ok(batch) => batch,
@@ -354,7 +355,8 @@ impl LustroXofBatch {
         }
     }
 
-    /// As `new`, returning `Err(BatchError::Reserve)` if reserving the lane buffer fails.
+    /// As `new`, returning `Err(BatchError::Reserve)` if reserving the lane or digest buffer
+    /// fails.
     pub fn try_new(messages: &[&[u8]]) -> Result<Self, BatchError> {
         let mut streams = Vec::new();
         streams
@@ -400,7 +402,7 @@ impl LustroXofBatch {
     }
 
     /// Fills `out` with `steps` blocks per stream.
-    /// Output is step-major: `out[step * len() + lane]`.
+    /// Output is step-major: `out[step * len() + lane]`. Panics if `out.len() != len() * steps`.
     pub fn fill_blocks(&mut self, out: &mut [[u8; 32]], steps: usize) {
         let expected = self
             .streams
@@ -627,7 +629,7 @@ impl LustroXofBatch {
     }
 
     /// As `clone`, returning `Err(BatchError::Reserve)` if reserving the lane buffer
-    /// fails. Never returns `BatchError::SizeOverflow`.
+    /// fails. Never returns another variant.
     pub fn try_clone(&self) -> Result<Self, BatchError> {
         let mut streams = Vec::new();
         streams
@@ -640,7 +642,7 @@ impl LustroXofBatch {
     /// Exports the current state of every lane.
     /// Batch snapshots are block-aligned and have no cursor.
     /// The snapshot holds every lane's state: whoever has it can reproduce the rest of each
-    /// stream and its forks. Keep it as private as the seed.
+    /// stream and its forks. Keep it as private as the messages.
     /// Panics if the lane buffer cannot be allocated.
     #[must_use]
     pub fn export_snapshot(&self) -> LustroXofBatchSnapshot {
@@ -660,6 +662,13 @@ impl LustroXofBatch {
             .map_err(BatchError::Reserve)?;
         lanes.extend_from_slice(&self.streams);
         Ok(LustroXofBatchSnapshot::new(lanes))
+    }
+
+    // Writes what `export_snapshot().to_le_bytes()` gives into `out`, with no allocation.
+    // `out.len()` must be `16 + len() * 48`.
+    #[cfg(any(feature = "ffi", feature = "python", test))]
+    pub(crate) fn write_snapshot_into(&self, out: &mut [u8]) {
+        crate::types::encode_batch_into(crate::types::SnapshotKind::XofBatch, &self.streams, out);
     }
 
     /// Restores a batch from a snapshot.

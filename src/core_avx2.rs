@@ -290,11 +290,11 @@ unsafe fn rotl_u128_43(x: U128x4) -> U128x4 {
 // VARIABLE 128-BIT ROTATION, r in 0..=127
 #[inline(always)]
 unsafe fn rotl_u128_var(x: U128x4, r: U64x4, consts: &SimdConsts) -> U128x4 {
-    // ── GROUP 1: r-dependent (Early Kill) ──
+    // r mod 64, and all ones in the lanes with r >= 64.
     let r_mod = _mm256_and_si256(r.0, consts.mask63);
     let mask = _mm256_cmpgt_epi64(r.0, consts.mask63);
 
-    // ── PATH A ──
+    // Rotation by r mod 64: high half...
     let tmp_hi = {
         let inv_a = _mm256_sub_epi64(consts.c64, r_mod);
 
@@ -304,7 +304,7 @@ unsafe fn rotl_u128_var(x: U128x4, r: U64x4, consts: &SimdConsts) -> U128x4 {
         _mm256_or_si256(hi_l, lo_r)
     };
 
-    // ── PATH B ──
+    // ...and low half.
     let tmp_lo = {
         let inv_b = _mm256_sub_epi64(consts.c64, r_mod);
 
@@ -314,11 +314,10 @@ unsafe fn rotl_u128_var(x: U128x4, r: U64x4, consts: &SimdConsts) -> U128x4 {
         _mm256_or_si256(lo_l, hi_r)
     };
 
-    // ── FINAL ──
+    // r >= 64: the halves swap.
     let final_hi = _mm256_blendv_epi8(tmp_hi, tmp_lo, mask);
     let final_lo = _mm256_blendv_epi8(tmp_lo, tmp_hi, mask);
 
-    // r >= 64: swap
     U128x4 {
         hi: U64x4(final_hi),
         lo: U64x4(final_lo),
@@ -451,7 +450,7 @@ unsafe fn idm_core(
 
 #[inline(always)]
 unsafe fn lane_prepare(s0_xor: U128x4, s1_xor: U128x4, consts: &SimdConsts) -> (U64x4, U64x4) {
-    // Build the first working stream.
+    // Working word v0.
     let v0 = {
         let t = add_u128(s0_xor, s1_xor, consts);
         let swapped = U128x4 { hi: t.lo, lo: t.hi };
@@ -461,7 +460,7 @@ unsafe fn lane_prepare(s0_xor: U128x4, s1_xor: U128x4, consts: &SimdConsts) -> (
         xor_u128(t, mix).lo
     };
 
-    // Build the second working stream.
+    // Working word v1.
     let v1 = {
         let rotated_s1 = rotl_u128_42(s1_xor);
         let t = xor_u128(s0_xor, rotated_s1);
@@ -487,7 +486,7 @@ unsafe fn lane_prepare(s0_xor: U128x4, s1_xor: U128x4, consts: &SimdConsts) -> (
 }
 
 // LANE KEY SCHEDULE
-// Derives per-lane rotation keys from the prepared working streams.
+// Rotation keys k0, k1 (odd, 1..=63) from the working words.
 
 #[inline(always)]
 unsafe fn lane_key_schedule(v0: U64x4, v1: U64x4, consts: &SimdConsts) -> (U64x4, U64x4) {
@@ -515,10 +514,8 @@ unsafe fn lane_key_schedule(v0: U64x4, v1: U64x4, consts: &SimdConsts) -> (U64x4
 }
 
 // LANE MIX ROTATE
-// Applies variable-rotation mixing using the
-// rotation keys produced by lane_key_schedule().
-//
-// The first stream updates v0. The updated v0 is then used to update v1.
+// Variable rotations by the keys of `lane_key_schedule`: v1 updates v0, then the new v0
+// updates v1.
 
 #[inline(always)]
 unsafe fn lane_mix_rotate(
@@ -544,7 +541,7 @@ unsafe fn lane_mix_rotate(
 }
 
 // LANE FINALIZE AND PROJECT
-// Finalizes the working streams and converts them into bounded rotation values.
+// Last mixing of the working words, then the rotations rot0 in 1..=127, rot1 in 1..=113.
 
 #[inline(always)]
 unsafe fn lane_finalize_and_project(v0: U64x4, v1: U64x4, consts: &SimdConsts) -> (U64x4, U64x4) {
@@ -552,7 +549,7 @@ unsafe fn lane_finalize_and_project(v0: U64x4, v1: U64x4, consts: &SimdConsts) -
     let v1_final = xor(v1, rotl64_imm::<40>(v0_step1));
     let v0_final = xor(v0_step1, U64x4(_mm256_srli_epi64(v0_step1.0, 29)));
 
-    // Projection 0: Derive a rotation value from finalized v0.
+    // rot0 = (v0 * 127) >> 64, plus 1.
     let rot0 = {
         let v = v0_final;
         let lo = _mm256_and_si256(v.0, consts.mask32);
@@ -564,7 +561,7 @@ unsafe fn lane_finalize_and_project(v0: U64x4, v1: U64x4, consts: &SimdConsts) -
         add(U64x4(_mm256_srli_epi64(acc, 32)), consts.one)
     };
 
-    // Projection 1: Derive a rotation value from finalized v1.
+    // rot1 = (v1 * 113) >> 64, plus 1.
     let rot1 = {
         let v = v1_final;
         let lo = _mm256_and_si256(v.0, consts.mask32);
@@ -580,7 +577,6 @@ unsafe fn lane_finalize_and_project(v0: U64x4, v1: U64x4, consts: &SimdConsts) -
 }
 
 // LANE APPLY ROTATION
-// Applies the final variable 128-bit rotation to the state.
 
 #[inline(always)]
 unsafe fn lane_apply_rotation(s_lane: U128x4, rot: U64x4, consts: &SimdConsts) -> U128x4 {
@@ -590,7 +586,7 @@ unsafe fn lane_apply_rotation(s_lane: U128x4, rot: U64x4, consts: &SimdConsts) -
 // ======================================================
 // LANE PROCESSING
 // ======================================================
-// Executes one complete lane update.
+// ERD round of 4 states (after IDM): perturbation, then the rotations it derives.
 
 #[inline(always)]
 unsafe fn process_lane(
@@ -599,7 +595,7 @@ unsafe fn process_lane(
     current_rc: U64x4,
     consts: &SimdConsts,
 ) {
-    // 1. In-place state perturbation (rc / rc_s1 short lifetime)
+    // Perturbation by the round constant.
     {
         let rc = U128x4 {
             hi: rotl64_imm::<17>(current_rc),
@@ -611,19 +607,12 @@ unsafe fn process_lane(
         *s1_lane = xor_u128(*s1_lane, rc_s1);
     }
 
-    // 2. State preparation
     let (v0, v1) = lane_prepare(*s0_lane, *s1_lane, consts);
-
-    // 3. Rotation-key generation
     let (k0, k1) = lane_key_schedule(v0, v1, consts);
-
-    // 4. Variable-rotation mixing
     let (v0, v1) = lane_mix_rotate(v0, v1, k0, k1, consts);
-
-    // 5. Finalization and projection
     let (rot0, rot1) = lane_finalize_and_project(v0, v1, consts);
 
-    // 6. State update through 128-bit rotation directly on perturbed state
+    // The rotations apply to the perturbed state.
     *s0_lane = lane_apply_rotation(*s0_lane, rot0, consts);
     *s1_lane = lane_apply_rotation(*s1_lane, rot1, consts);
 }
@@ -783,8 +772,8 @@ unsafe fn load_message_blocks(msgs: &[*const u8; 4], off: usize) -> (U128x4, U12
     rows_to_blocks(r(0), r(1), r(2), r(3))
 }
 
-// Last partial block of each message (`rem` bytes, 0..=31) as (b0, b1), padded and
-// folded like `finalize_terminator`.
+// Last partial block of each message (`rem` bytes, 0..=31) as (b0, b1), padded like
+// `terminator_block` (below 16 bytes the high half repeats the low half).
 #[inline(always)]
 unsafe fn load_message_tails(msgs: &[*const u8; 4], off: usize, rem: usize) -> (U128x4, U128x4) {
     let mut buf = [0u8; 128];
@@ -894,7 +883,7 @@ pub(crate) unsafe fn hash_fixed_x4<const N: usize>(
 // percentage of the lanes' steps (sum of blocks / (4 * longest)), else scalar.
 pub(crate) const MIN_GROUP_FILL_PCT: usize = 40;
 
-// Messages regrouped together by block count (at most 256: the order is kept as bytes).
+// Messages regrouped together by block count. At most 256, so an index fits the `u8` of `order`.
 const VAR_WINDOW: usize = 256;
 
 // Groups at the start of a window that decide whether it is regrouped.

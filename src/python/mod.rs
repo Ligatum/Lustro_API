@@ -1,6 +1,7 @@
 //! Lustro V1 PYTHON interface.
 
 use pyo3::prelude::*;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 pub mod hash;
@@ -38,19 +39,14 @@ pub fn lustro_api_version() -> u32 {
 /// fail to start; batches then run on the calling thread. Also `fixed`, `parallel_built`,
 /// `simd_available`, `pool_usable` (the pool is built and this process can use it; False
 /// also before the first parallel batch and in a child forked after the parent started the
-/// pool) and `logical_cpus`. This call fixes the settings; `runtime_preview()` does not.
+/// pool) and `logical_cpus`. This call fixes nothing: if the settings are not fixed yet,
+/// `fixed` is False and the values come from the environment as it is now; they can differ
+/// from the ones fixed later. Another thread can fix them meanwhile, so the result can be
+/// stale on return.
 /// See `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`.
 #[pyfunction]
 pub fn runtime_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     info_dict(py, crate::api::runtime_info())
-}
-
-/// As `runtime_info()`, but fixes nothing. If the settings are not fixed yet, `fixed` is
-/// False and the values come from the environment as it is now; they can differ from the
-/// ones fixed later. A snapshot: it can be stale on return.
-#[pyfunction]
-pub fn runtime_preview(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
-    info_dict(py, crate::api::runtime_preview())
 }
 
 fn info_dict(py: Python<'_>, info: crate::RuntimeInfo) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
@@ -69,9 +65,13 @@ fn info_dict(py: Python<'_>, info: crate::RuntimeInfo) -> PyResult<Bound<'_, pyo
 /// at the logical CPU count, 1 = no pool. `allow_simd=False` = scalar only. None
 /// follows the environment, a given value replaces it.
 ///
-/// Fixed once, by an earlier call, a batch call or `runtime_info()`. A later call returns
+/// Fixed once, by an earlier call or a batch call: a hash batch, `fill_blocks`/`blocks`, or
+/// `LustroXofBatch(...)` with at least one message. A later call returns
 /// None if the arguments give the same settings as the fixed ones, else raises
-/// `RuntimeError`.
+/// `ConfigError` (a subclass of `RuntimeError`).
+///
+/// The settings belong to the whole process. An application sets them early; a library that
+/// uses Lustro leaves this call to the application and reads them with `runtime_info()`.
 #[pyfunction]
 #[pyo3(signature = (threads=None, allow_simd=None))]
 pub fn configure(threads: Option<i64>, allow_simd: Option<bool>) -> PyResult<()> {
@@ -89,7 +89,23 @@ pub fn configure(threads: Option<i64>, allow_simd: Option<bool>) -> PyResult<()>
     if let Some(allow) = allow_simd {
         options = options.allow_simd(allow);
     }
-    crate::configure(options).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    crate::configure(options).map_err(|e| ConfigError::new_err(e.to_string()))
+}
+
+/// Kind of exported snapshot bytes: "prng", "xof", "prng_batch" or "xof_batch".
+/// Reads only the version and kind bytes, so a result does not mean `import_snapshot` will
+/// succeed. Raises SnapshotError for fewer than 2 bytes or an unknown version or kind.
+#[pyfunction]
+pub fn snapshot_kind(
+    #[pyo3(from_py_with = bytes_arg)] bytes: Cow<'_, [u8]>,
+) -> PyResult<&'static str> {
+    use crate::types::SnapshotKind as K;
+    Ok(match K::detect(&bytes).map_err(snapshot_error)? {
+        K::Prng => "prng",
+        K::Xof => "xof",
+        K::PrngBatch => "prng_batch",
+        K::XofBatch => "xof_batch",
+    })
 }
 
 // ==========================================
@@ -106,8 +122,14 @@ mod exceptions {
         pyo3::exceptions::PyValueError,
         "A snapshot could not be imported."
     );
+    pyo3::create_exception!(
+        lustro,
+        ConfigError,
+        pyo3::exceptions::PyRuntimeError,
+        "The runtime settings are already fixed with another effect."
+    );
 }
-pub use exceptions::SnapshotError;
+pub use exceptions::{ConfigError, SnapshotError};
 
 // Maps SnapshotError to the Python SnapshotError (message from Display).
 pub(crate) fn snapshot_error(err: crate::types::SnapshotError) -> pyo3::PyErr {
@@ -127,8 +149,18 @@ pub(crate) fn try_bytes<'py>(
     py: Python<'py>,
     data: &[u8],
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    pyo3::types::PyBytes::new_with(py, data.len(), |out| {
-        out.copy_from_slice(data);
+    try_bytes_with(py, data.len(), |out| out.copy_from_slice(data))
+}
+
+// As `try_bytes`, with the content produced by `fill` after the allocation succeeded, so a
+// failed allocation leaves whatever `fill` would advance untouched.
+pub(crate) fn try_bytes_with<'py>(
+    py: Python<'py>,
+    len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+    pyo3::types::PyBytes::new_with(py, len, |out| {
+        fill(out);
         Ok(())
     })
     .map_err(|e| {
@@ -179,7 +211,8 @@ pub(crate) fn batch_error(e: crate::types::BatchError) -> pyo3::PyErr {
     use crate::types::BatchError as B;
     match e {
         B::Reserve(_) => alloc_error(),
-        B::SizeOverflow | B::LengthMismatch { .. } | B::PartialBlock { .. } => {
+        B::SizeOverflow => pyo3::exceptions::PyOverflowError::new_err(e.to_string()),
+        B::LengthMismatch { .. } | B::PartialBlock { .. } => {
             pyo3::exceptions::PyValueError::new_err(e.to_string())
         }
     }
@@ -210,13 +243,21 @@ pub(crate) fn u128_arg(obj: &Bound<'_, PyAny>) -> PyResult<u128> {
 
 // List of u128 ids (`from_py_with`), same rules per item as `u128_arg`.
 pub(crate) fn ids_arg(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u128>> {
-    seq_items(obj)?.iter().map(u128_arg).collect()
+    let items = seq_items(obj)?;
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(items.len())
+        .map_err(|_| alloc_error())?;
+    for item in &items {
+        ids.push(u128_arg(item)?);
+    }
+    Ok(ids)
 }
 
 // Items of a sequence argument, accepted as by PyO3's `Vec` extraction (`PySequence_Check`,
 // a `str` is TypeError) but read one by one. PyO3 reserves `len()` items first, so a wrong
 // or huge `__len__` ends in a panic (capacity overflow) or an abort (failed allocation).
 // A plain loop, not `collect`: the iterator's `size_hint` calls `__length_hint__`/`__len__`.
+// Room is reserved with `try_reserve`, so a failed allocation is a MemoryError.
 pub(crate) fn seq_items<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py, PyAny>>> {
     if obj.is_instance_of::<pyo3::types::PyString>() {
         return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -230,6 +271,7 @@ pub(crate) fn seq_items<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Vec<Bound<'py,
     }
     let mut items = Vec::new();
     for item in obj.try_iter()? {
+        items.try_reserve(1).map_err(|_| alloc_error())?;
         items.push(item?);
     }
     Ok(items)

@@ -44,6 +44,8 @@ pub(crate) unsafe fn construct<T>(
 #[cfg(panic = "abort")]
 compile_error!("lustro FFI requires panic = \"unwind\"");
 
+/// Returns the native API version. It does not follow the crate version or the snapshot
+/// format version.
 #[no_mangle]
 pub extern "C" fn lustro_api_version() -> u32 {
     crate::api::LUSTRO_API_VERSION
@@ -51,8 +53,7 @@ pub extern "C" fn lustro_api_version() -> u32 {
 
 /// Returns the configured pool size for parallel batches, not the number of active workers.
 /// `0` means parallelism is disabled by settings or the crate was built without `parallel`.
-/// This call does not start the pool, but it fixes the settings like `lustro_runtime_info`
-/// (a later `lustro_configure` with other values returns `AlreadyConfigured`). If
+/// This call does not start the pool and fixes nothing, like `lustro_runtime_info`. If
 /// initialization fails, or this process inherited a pool-owner PID from its parent
 /// through `fork`, batches fall back to the calling thread.
 #[no_mangle]
@@ -61,7 +62,7 @@ pub extern "C" fn lustro_runtime_threads() -> usize {
 }
 
 /// Returns the backend for batches of streams and hashes as a static NUL-terminated
-/// string ("scalar" or "avx2"). Never NULL; do not free. Fixes the settings like
+/// string ("scalar" or "avx2"). Never NULL; do not free. Fixes nothing, like
 /// `lustro_runtime_info`.
 #[no_mangle]
 pub extern "C" fn lustro_runtime_backend() -> *const c_char {
@@ -74,10 +75,10 @@ pub extern "C" fn lustro_runtime_backend() -> *const c_char {
     })
 }
 
-/// Execution settings of this process, as returned by `lustro_runtime_info` and
-/// `lustro_runtime_preview`. Same fields as `RuntimeInfo` in Rust. Flags are 0 or 1.
-/// The caller passes `sizeof` of this struct to those functions, so that fields added
-/// later do not overflow a struct built from an older header.
+/// Execution settings of this process, as returned by `lustro_runtime_info`. Same fields as
+/// `RuntimeInfo` in Rust. Flags are 0 or 1. The caller passes `sizeof` of this struct to
+/// that function, so that fields added later do not overflow a struct built from an older
+/// header.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LustroRuntimeInfo {
@@ -89,8 +90,7 @@ pub struct LustroRuntimeInfo {
     /// Backend for batches: "scalar" or "avx2". Static NUL-terminated string, never NULL,
     /// do not free.
     pub backend: *const c_char,
-    /// 1 if the settings are fixed. Always 1 from `lustro_runtime_info`; 0 is possible
-    /// only from `lustro_runtime_preview`.
+    /// 1 if the settings are fixed (by `lustro_configure` or a batch call); 0 before that.
     pub fixed: u8,
     /// 1 if built with the `parallel` feature.
     pub parallel_built: u8,
@@ -155,8 +155,9 @@ unsafe fn write_info(
 }
 
 /// Stores the execution settings of this process in `*out`. Like `runtime_info()` in Rust,
-/// this fixes the settings if they are not fixed yet (see `lustro_configure`), so `fixed`
-/// is 1. Does not start the pool.
+/// this fixes nothing: settings not yet fixed come from the environment as it is now
+/// (`fixed` is 0) and may differ from the ones fixed later (see `lustro_configure`). Another
+/// thread can fix them meanwhile, so the result can be stale on return. Does not start the pool.
 ///
 /// `out_size` is `sizeof(LustroRuntimeInfo)`. Only the fields that fit in it are written,
 /// so a library newer than the header leaves the extra fields alone. Returns
@@ -171,20 +172,6 @@ pub unsafe extern "C" fn lustro_runtime_info(
     out_size: usize,
 ) -> LustroError {
     write_info(out, out_size, crate::api::runtime_info)
-}
-
-/// As `lustro_runtime_info`, but fixes nothing. Settings not yet fixed come from the
-/// environment as it is now (`fixed` is 0) and may differ from the ones fixed later.
-/// A snapshot: it can be stale on return. Does not start the pool.
-///
-/// # Safety
-/// If `out` is non-null, it must be valid for writing `out_size` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn lustro_runtime_preview(
-    out: *mut LustroRuntimeInfo,
-    out_size: usize,
-) -> LustroError {
-    write_info(out, out_size, crate::api::runtime_preview)
 }
 
 /// `simd` for `lustro_configure`: follow `LUSTRO_DISABLE_SIMD`.
@@ -213,9 +200,13 @@ pub(crate) fn options_from_c(threads: usize, simd: i32) -> Result<RuntimeOptions
 /// 1 = no pool, larger values are capped at the logical CPU count. `simd`: one of
 /// `LUSTRO_SIMD_*`. A value given here replaces the matching environment variables.
 ///
-/// Fixed once, by an earlier call, a batch call or `lustro_runtime_*`. A later call returns
-/// `Ok` if the arguments give the same settings as the fixed ones, else
-/// `AlreadyConfigured`. Unknown `simd` returns `InvalidArgument` and changes nothing.
+/// Fixed once, by an earlier call or a batch call: a hash batch, `*_batch_fill_blocks`, or
+/// `lustro_xof_batch_new` with `n > 0`. A later call returns `Ok` if the
+/// arguments give the same settings as the fixed ones, else `AlreadyConfigured`. Unknown
+/// `simd` returns `InvalidArgument` and changes nothing.
+///
+/// The settings belong to the whole process. An application sets them early; a library that
+/// uses Lustro leaves this call to the application and reads them with `lustro_runtime_info`.
 #[no_mangle]
 pub extern "C" fn lustro_configure(threads: usize, simd: i32) -> LustroError {
     guarded(LustroError::InternalPanic, || {
@@ -229,6 +220,54 @@ pub extern "C" fn lustro_configure(threads: usize, simd: i32) -> LustroError {
     })
 }
 
+/// `*out_kind` of `lustro_snapshot_kind`: single PRNG stream.
+pub const LUSTRO_SNAPSHOT_KIND_PRNG: u8 = 1;
+/// `*out_kind` of `lustro_snapshot_kind`: single XOF stream.
+pub const LUSTRO_SNAPSHOT_KIND_XOF: u8 = 2;
+/// `*out_kind` of `lustro_snapshot_kind`: PRNG batch.
+pub const LUSTRO_SNAPSHOT_KIND_PRNG_BATCH: u8 = 3;
+/// `*out_kind` of `lustro_snapshot_kind`: XOF batch.
+pub const LUSTRO_SNAPSHOT_KIND_XOF_BATCH: u8 = 4;
+
+/// Stores the kind of exported snapshot bytes in `*out_kind` (`LUSTRO_SNAPSHOT_KIND_*`).
+/// Reads only the version and kind bytes, so `Ok` does not mean the import will succeed.
+/// Returns `InvalidPointer` for a null `out_kind` or a null `bytes` when `len > 0`,
+/// `InvalidLength` if `len < 2`, `UnsupportedVersion` or `InvalidKind` for an unknown byte.
+/// Nothing is written on error.
+///
+/// # Safety
+/// `bytes` must be valid for `len` bytes when `len > 0`. If `out_kind` is non-null, it must
+/// be valid for writing one byte and must not overlap `bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn lustro_snapshot_kind(
+    bytes: *const u8,
+    len: usize,
+    out_kind: *mut u8,
+) -> LustroError {
+    guarded(LustroError::InternalPanic, || {
+        if out_kind.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        let bytes = match types::bytes_in(bytes, len) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        use crate::types::SnapshotKind as K;
+        match K::detect(bytes) {
+            Ok(kind) => {
+                *out_kind = match kind {
+                    K::Prng => LUSTRO_SNAPSHOT_KIND_PRNG,
+                    K::Xof => LUSTRO_SNAPSHOT_KIND_XOF,
+                    K::PrngBatch => LUSTRO_SNAPSHOT_KIND_PRNG_BATCH,
+                    K::XofBatch => LUSTRO_SNAPSHOT_KIND_XOF_BATCH,
+                };
+                LustroError::Ok
+            }
+            Err(e) => e.into(),
+        }
+    })
+}
+
 /// Returns a static NUL-terminated description of an error code.
 /// Unknown codes give "unknown error code". Never NULL; do not free.
 #[no_mangle]
@@ -238,4 +277,3 @@ pub extern "C" fn lustro_strerror(code: i32) -> *const c_char {
         None => b"unknown error code\0".as_ptr() as *const c_char,
     }
 }
-

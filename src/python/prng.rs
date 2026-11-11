@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
-use crate::python::{bytes_arg, ids_arg, u128_arg};
+use crate::python::{bytes_arg, ids_arg, skip_chunked, u128_arg, DETACH_MIN, SKIP_CHUNK_BLOCKS};
 use crate::types::{Seed256, StreamId};
 
 // ==========================================
@@ -75,20 +75,36 @@ impl LustroPrngPy {
     }
 
     /// Next full 32-byte block. Unread bytes of the current block are discarded.
-    pub fn next_block<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.next_block())
+    pub fn next_block<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        crate::python::try_bytes_with(py, 32, |out| out.copy_from_slice(&self.inner.next_block()))
     }
 
     /// Skips `n` bytes, as `fill(n)` would, without building them. Costs O(n); the GIL is
-    /// released. `n` must fit in 64 bits (OverflowError otherwise, also for negative).
-    pub fn advance_bytes(&mut self, py: Python<'_>, n: u64) {
-        py.detach(|| self.inner.advance_bytes(n));
+    /// released from 4096 bytes, and Ctrl-C is checked about every 32 MiB, leaving the stream
+    /// unchanged. `n` must fit in 64 bits (OverflowError otherwise, also for negative).
+    pub fn advance_bytes(&mut self, py: Python<'_>, n: u64) -> PyResult<()> {
+        skip_chunked(
+            py,
+            &mut self.inner,
+            n,
+            DETACH_MIN as u64,
+            SKIP_CHUNK_BLOCKS * 32,
+            |s, k| s.advance_bytes(k),
+        )
     }
 
     /// Skips `n` blocks, as `n` calls of `next_block()` would. Costs O(n); the GIL is
-    /// released. `n` must fit in 64 bits (OverflowError otherwise, also for negative).
-    pub fn advance_blocks(&mut self, py: Python<'_>, n: u64) {
-        py.detach(|| self.inner.advance_blocks(n));
+    /// released from 128 blocks, and Ctrl-C is checked about every 2^20 blocks, leaving the
+    /// stream unchanged. `n` must fit in 64 bits (OverflowError otherwise, also for negative).
+    pub fn advance_blocks(&mut self, py: Python<'_>, n: u64) -> PyResult<()> {
+        skip_chunked(
+            py,
+            &mut self.inner,
+            n,
+            DETACH_MIN as u64 / 32,
+            SKIP_CHUNK_BLOCKS,
+            |s, k| s.advance_blocks(k),
+        )
     }
 
     /// Bytes taken from the start of the stream. Bytes discarded by `next_block()` and
@@ -98,7 +114,7 @@ impl LustroPrngPy {
         self.inner.position()
     }
 
-    /// Returns the next `size` bytes of the stream. The GIL is released while generating.
+    /// Returns the next `size` bytes of the stream. The GIL is released for 4096 bytes or more.
     ///
     /// Raises OverflowError if `size` exceeds isize::MAX, MemoryError if the
     /// buffer cannot be allocated.
@@ -109,7 +125,11 @@ impl LustroPrngPy {
             ));
         }
         PyBytes::new_with(py, size, |buf| {
-            py.detach(|| self.inner.fill_bytes(buf));
+            if size < DETACH_MIN {
+                self.inner.fill_bytes(buf);
+            } else {
+                py.detach(|| self.inner.fill_bytes(buf));
+            }
             Ok(())
         })
         .map_err(|e| {
@@ -122,7 +142,7 @@ impl LustroPrngPy {
     }
 
     /// Returns the next `n` values of `next_u64()` as a new writable uint64 array of
-    /// shape `(n,)`. The GIL is released while generating.
+    /// shape `(n,)`. The GIL is released for 4096 bytes or more.
     ///
     /// Raises OverflowError if `8 * n` exceeds isize::MAX, MemoryError if the output
     /// buffer cannot be allocated. The state is unchanged in these cases. The array object
@@ -181,7 +201,7 @@ impl LustroPrngPy {
         slf: &Bound<'py, Self>,
     ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
         let restore = slf.get_type().getattr("import_snapshot")?;
-        let bytes = slf.try_borrow()?.export_snapshot(slf.py());
+        let bytes = slf.try_borrow()?.export_snapshot(slf.py())?;
         Ok((restore, (bytes,)))
     }
 
@@ -276,13 +296,14 @@ impl LustroPrngPy {
     /// Exports the current state as 56 bytes. The snapshot holds the full stream state:
     /// whoever has it can reproduce the rest of the stream and its forks. Keep it as private
     /// as the seed.
-    pub fn export_snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    pub fn export_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let snapshot = self.inner.export_snapshot();
-        PyBytes::new(py, &snapshot.to_le_bytes())
+        crate::python::try_bytes(py, &snapshot.to_le_bytes())
     }
 
     /// Restores a generator from `export_snapshot()` bytes.
-    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or cursor.
+    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or cursor, or for
+    /// reserved bytes that are not zero.
     #[staticmethod]
     pub fn import_snapshot(
         #[pyo3(from_py_with = bytes_arg)] bytes: Cow<'_, [u8]>,
@@ -384,7 +405,8 @@ impl LustroPrngBatchPy {
         })
     }
 
-    /// One lane per stream of `streams` (a sequence of LustroPrng), in order. Lane `i`
+    /// One lane per stream of `streams` (a sequence of LustroPrng, or a batch, which gives a
+    /// copy of it), in order. Lane `i`
     /// continues `streams[i]` at its next block; the streams are not changed.
     /// ValueError if a stream is inside a block (part of its current block unread),
     /// TypeError for an item that is not a LustroPrng, RuntimeError if a stream is in use
@@ -392,10 +414,12 @@ impl LustroPrngBatchPy {
     #[staticmethod]
     pub fn from_streams(streams: &Bound<'_, PyAny>) -> PyResult<Self> {
         let items = crate::python::seq_items(streams)?;
-        let refs = items
-            .iter()
-            .map(|item| Ok(item.cast::<LustroPrngPy>()?.try_borrow()?))
-            .collect::<PyResult<Vec<_>>>()?;
+        let mut refs = Vec::new();
+        refs.try_reserve_exact(items.len())
+            .map_err(|_| crate::python::alloc_error())?;
+        for item in &items {
+            refs.push(item.cast::<LustroPrngPy>()?.try_borrow()?);
+        }
         let inner = LustroPrngBatch::try_from_stream_refs(refs.iter().map(|r| &r.inner))
             .map_err(crate::python::batch_error)?;
         Ok(Self {
@@ -479,16 +503,18 @@ impl LustroPrngBatchPy {
     /// Advances every lane by `steps` stream steps and returns the blocks as a new
     /// writable uint64 array of shape `(steps, len(self), 4)`, laid out as
     /// `fill_blocks()` writes it. The internal buffer is not used. The GIL is released
-    /// while generating.
+    /// while generating. Without `steps` (or with `None`) it uses `suggested_steps()`.
     ///
-    /// Raises ValueError if the output size overflows, MemoryError if the output
+    /// Raises OverflowError if the output size overflows, MemoryError if the output
     /// buffer cannot be allocated. The state is unchanged in these cases. The array object
     /// is created after generation, so a failure there does move the state.
+    #[pyo3(signature = (steps=None))]
     pub fn blocks<'py>(
         &mut self,
         py: Python<'py>,
-        steps: usize,
+        steps: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray3<u64>>> {
+        let steps = steps.unwrap_or_else(|| self.inner.suggested_steps());
         let lanes = self.inner.len();
         crate::python::blocks_array(py, lanes, steps, |out| self.inner.fill_blocks(out, steps))
     }
@@ -549,7 +575,7 @@ impl LustroPrngBatchPy {
         }
 
         let needed = n.checked_mul(steps).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("n_streams * steps overflows usize")
+            pyo3::exceptions::PyOverflowError::new_err("n_streams * steps overflows usize")
         })?;
 
         // Empty output: nothing to write. NumPy reports zero strides here.
@@ -642,11 +668,11 @@ impl LustroPrngBatchPy {
     }
 
     /// Derives `len(ids)` children per lane. Parent-major order:
-    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result. ValueError if
+    /// child `j` of lane `i` is lane `i * len(ids) + j` of the result. OverflowError if
     /// `len(self) * len(ids)` overflows, MemoryError if the lanes cannot be allocated.
     pub fn fork_many(&self, #[pyo3(from_py_with = ids_arg)] ids: Vec<u128>) -> PyResult<Self> {
         self.inner.len().checked_mul(ids.len()).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("fork_many: len() * len(ids) overflows")
+            pyo3::exceptions::PyOverflowError::new_err("fork_many: len() * len(ids) overflows")
         })?;
         let stream_ids: Vec<StreamId> = ids.into_iter().map(StreamId).collect();
         let inner = self
@@ -705,19 +731,16 @@ impl LustroPrngBatchPy {
 
     /// Exports the current state as `16 + len(self) * 48` bytes. The snapshot holds every
     /// lane's state: whoever has it can reproduce the rest of each stream and its forks. Keep
-    /// it as private as the seed. Raises MemoryError if the buffers cannot be allocated.
+    /// it as private as the seed. Raises MemoryError if the bytes cannot be allocated.
     pub fn export_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self
-            .inner
-            .try_export_snapshot()
-            .and_then(|snapshot| snapshot.try_to_le_bytes())
-            .map_err(crate::python::batch_error)?;
-        crate::python::try_bytes(py, &bytes)
+        let len = crate::types::batch_snapshot_encoded_len(self.inner.len())
+            .ok_or_else(crate::python::alloc_error)?;
+        crate::python::try_bytes_with(py, len, |out| self.inner.write_snapshot_into(out))
     }
 
     /// Restores a batch from `export_snapshot()` bytes.
-    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or lane count,
-    /// MemoryError if the lanes cannot be allocated.
+    /// Raises SnapshotError (a ValueError) for a wrong length, version, kind or lane count, or
+    /// for reserved bytes that are not zero; MemoryError if the lanes cannot be allocated.
     #[staticmethod]
     pub fn import_snapshot(
         #[pyo3(from_py_with = bytes_arg)] bytes: Cow<'_, [u8]>,

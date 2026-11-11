@@ -139,7 +139,7 @@ impl Hash128 {
         &self.0
     }
 
-    // Constructs Hash128 from native state.
+    // `s0` as 16 little-endian bytes.
     #[inline]
     pub(crate) fn from_state(s0: u128) -> Self {
         Self(s0.to_le_bytes())
@@ -227,7 +227,7 @@ impl Hash256 {
         Hash128(out)
     }
 
-    // Constructs Hash256 from native state.
+    // `s0 || s1` as 32 little-endian bytes.
     #[inline]
     pub(crate) fn from_state(s0: u128, s1: u128) -> Self {
         let mut out = [0u8; 32];

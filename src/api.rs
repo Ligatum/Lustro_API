@@ -13,34 +13,33 @@ pub fn lustro_api_version() -> u32 {
     LUSTRO_API_VERSION
 }
 
-/// Returns the execution settings of this process.
+/// Returns the execution settings of this process. Fixes nothing.
 ///
 /// The values follow the environment (`LUSTRO_DISABLE_MT`, `LUSTRO_DISABLE_SIMD`,
-/// `LUSTRO_NUM_THREADS`), which is read once at the first use of the dispatcher;
-/// this call counts as a use (see [`runtime_preview`] for a look that does not). `threads` is the configured pool size, not a count of
-/// running workers: the pool is not started here and may fail to start, and batches then
-/// run on the calling thread. A child forked after its parent first used the pool also
-/// runs on the calling thread; one forked before that may start its own pool.
+/// `LUSTRO_NUM_THREADS`), which is read once, by [`configure`] or at the first batch call.
+/// Until then `fixed` is `false` and the values come from the environment as it is now; they
+/// may differ from the ones fixed later. Another thread can fix them meanwhile, so the result
+/// can be stale on return. `threads` is
+/// the configured pool size, not a count of running workers: the pool is not started here and
+/// may fail to start, and batches then run on the calling thread. A child forked after its
+/// parent first used the pool also runs on the calling thread; one forked before that may
+/// start its own pool.
 pub fn runtime_info() -> crate::types::RuntimeInfo {
     crate::dispatch::runtime_info()
-}
-
-/// As [`runtime_info`], but fixes nothing. Settings not yet fixed come from the environment
-/// as it is now (`fixed` is `false`) and may differ from the ones fixed later; once fixed,
-/// the result is the same as from `runtime_info`. A snapshot: it can be stale on return.
-/// Does not start the pool.
-pub fn runtime_preview() -> crate::types::RuntimeInfo {
-    crate::dispatch::runtime_preview()
 }
 
 /// Sets the execution settings of this process before first use. A field that is set
 /// replaces the matching environment variables, an unset one follows them.
 ///
-/// Fixed once, by an earlier call, a batch call or `runtime_info()`. A later call returns
+/// Fixed once, by an earlier call or a batch call: a hash batch, `fill_blocks`/`blocks`, or
+/// `LustroXofBatch::new` with at least one message. A later call returns
 /// `Ok` if the requested settings give the same result as the fixed ones (also when
 /// the first use fixed them, and for a `threads` above the CPU count), else
 /// [`ConfigError::AlreadyConfigured`]. When calls race, one wins and the others are
 /// compared with it.
+///
+/// The settings belong to the whole process. An application sets them early; a library that
+/// uses Lustro leaves this call to the application and reads them with [`runtime_info`].
 ///
 /// `threads` is a pool limit. Without `parallel` the options are accepted and
 /// `runtime_info().threads` stays 0.
@@ -117,7 +116,7 @@ pub(crate) fn derive_path_lane(
 // ==========================================
 
 // Absorbs 32-byte blocks with feed-forward.
-// Partial input is terminated with 0x80 and zero-padded.
+// The partial last block is padded as in `terminator_block`.
 #[inline]
 pub(crate) fn absorb_with_domain(data: &[u8], domain: u128) -> (u128, u128) {
     let (mut s0, mut s1) = absorb_init(data.len() as u64, domain);
@@ -177,7 +176,7 @@ fn finalize_terminator(s0: u128, s1: u128, remainder: &[u8]) -> (u128, u128) {
 }
 
 // Final block as (b0, b1): the remainder, then 0x80, then zeros. For a remainder shorter
-// than 16 bytes the low half is folded into the high half. Built from overlapping reads
+// than 16 bytes the high half repeats the low half. Built from overlapping reads
 // instead of a copy into a buffer.
 #[inline]
 fn terminator_block(r: &[u8]) -> (u128, u128) {
@@ -236,24 +235,6 @@ pub(crate) fn absorb_hash128_var_into(messages: &[&[u8]], domain: u128, out: &mu
     crate::dispatch::dispatch_hash128_var_into(messages, domain, out);
 }
 
-#[cfg(feature = "python")]
-pub(crate) fn absorb_hash256_blocks_parallel<M: crate::dispatch::MessageBlocks>(
-    messages: M,
-    domain: u128,
-    out: &mut [[u8; 32]],
-) -> bool {
-    crate::dispatch::dispatch_hash256_blocks_parallel(messages, domain, out)
-}
-
-#[cfg(feature = "python")]
-pub(crate) fn absorb_hash128_blocks_parallel<M: crate::dispatch::MessageBlocks>(
-    messages: M,
-    domain: u128,
-    out: &mut [[u8; 16]],
-) -> bool {
-    crate::dispatch::dispatch_hash128_blocks_parallel(messages, domain, out)
-}
-
 #[cfg(feature = "ffi")]
 pub(crate) fn absorb_hash256_var_raw_into(
     messages: crate::dispatch::RawMessages<'_>,
@@ -275,7 +256,7 @@ pub(crate) fn absorb_hash128_var_raw_into(
 }
 
 // ==========================================
-// INTERNAL PRNG API
+// INTERNAL STREAM API
 // ==========================================
 
 // Error of `read_to_end` / `read_to_string` on a stream: they would read until memory runs out.

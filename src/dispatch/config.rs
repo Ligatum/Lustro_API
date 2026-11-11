@@ -33,8 +33,8 @@ pub(super) fn env_flag(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> b
 }
 
 // Process-wide settings, fixed once: by `configure()`, or else read from the environment
-// at the first use of the dispatcher (batch calls, `runtime_info()`). Later changes to the
-// environment have no effect. `suggested_steps()` and `runtime_preview()` only look
+// at the first use of the dispatcher (batch calls). Later changes to the
+// environment have no effect. `suggested_steps()` and `runtime_info()` only look
 // (`peek_in`) and fix nothing.
 // They select how batches run; for the same inputs and `steps` the output bytes do not
 // depend on them. `suggested_steps()` follows the backend, so `LUSTRO_DISABLE_SIMD` can

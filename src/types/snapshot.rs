@@ -17,6 +17,7 @@ const SNAPSHOT_VERSION: u8 = 1;
 /// Identifies the generator family encoded in a snapshot.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum SnapshotKind {
     /// Single PRNG stream.
     Prng = 0x01,
@@ -26,6 +27,29 @@ pub enum SnapshotKind {
     PrngBatch = 0x03,
     /// XOF batch.
     XofBatch = 0x04,
+}
+
+impl SnapshotKind {
+    /// Reads the kind of exported snapshot bytes from their header.
+    /// Checks only the version and kind bytes, so `Ok` does not mean the import will succeed.
+    /// `InvalidLength` for fewer than 2 bytes, `UnsupportedVersion` or `InvalidKind` for an
+    /// unknown byte.
+    pub fn detect(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let (version, kind) = match bytes {
+            [version, kind, ..] => (*version, *kind),
+            _ => return Err(SnapshotError::InvalidLength),
+        };
+        if version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion);
+        }
+        match kind {
+            0x01 => Ok(SnapshotKind::Prng),
+            0x02 => Ok(SnapshotKind::Xof),
+            0x03 => Ok(SnapshotKind::PrngBatch),
+            0x04 => Ok(SnapshotKind::XofBatch),
+            _ => Err(SnapshotError::InvalidKind),
+        }
+    }
 }
 
 /// Why a snapshot could not be decoded.
@@ -40,6 +64,8 @@ pub enum SnapshotError {
     InvalidCursor,
     /// Length does not match the format.
     InvalidLength,
+    /// Reserved bytes are not zero.
+    InvalidReserved,
     /// Reserving the decoded lane buffer failed (`try_from_le_bytes` of a batch snapshot).
     Reserve,
 }
@@ -51,6 +77,7 @@ impl core::fmt::Display for SnapshotError {
             SnapshotError::InvalidKind => write!(f, "snapshot kind does not match this type"),
             SnapshotError::InvalidCursor => write!(f, "invalid snapshot cursor value"),
             SnapshotError::InvalidLength => write!(f, "invalid snapshot length"),
+            SnapshotError::InvalidReserved => write!(f, "snapshot reserved bytes are not zero"),
             SnapshotError::Reserve => write!(f, "snapshot buffer reservation failed"),
         }
     }
@@ -77,7 +104,7 @@ fn encode_single_snapshot(
     bytes[24..40].copy_from_slice(&s1.to_le_bytes());
     bytes[40..48].copy_from_slice(&step.to_le_bytes());
     bytes[48] = cursor;
-    // bytes[49..56] reserved for future extensions.
+    // bytes[49..56] reserved, zero.
     bytes
 }
 
@@ -91,6 +118,10 @@ fn decode_single_snapshot(
     }
     if bytes[1] != expected_kind as u8 {
         return Err(SnapshotError::InvalidKind);
+    }
+    // A later format version may use the reserved bytes; version 1 keeps them zero.
+    if bytes[2..8].iter().chain(&bytes[49..56]).any(|&b| b != 0) {
+        return Err(SnapshotError::InvalidReserved);
     }
     let cursor = bytes[48];
     if cursor == 0 || cursor > 32 {
@@ -240,7 +271,7 @@ const BATCH_HEADER_LEN: usize = LUSTRO_BATCH_SNAPSHOT_HEADER_LEN;
 const BATCH_LANE_LEN: usize = LUSTRO_BATCH_SNAPSHOT_LANE_LEN;
 
 // Returns the encoded batch snapshot length, or `None` on overflow.
-#[cfg(feature = "ffi")]
+#[cfg(any(feature = "ffi", feature = "python", test))]
 #[inline]
 pub(crate) fn batch_snapshot_encoded_len(lane_count: usize) -> Option<usize> {
     lane_count
@@ -264,7 +295,20 @@ fn encode_batch_lane(bytes: &mut [u8], s0: u128, s1: u128, step: u64) {
     bytes[0..16].copy_from_slice(&s0.to_le_bytes());
     bytes[16..32].copy_from_slice(&s1.to_le_bytes());
     bytes[32..40].copy_from_slice(&step.to_le_bytes());
-    // bytes[40..48] reserved for future extensions.
+    bytes[40..48].fill(0); // reserved
+}
+
+// Writes the snapshot of `lanes` into `out`, which must have exactly the encoded length. Every
+// byte is written, the reserved ones as zero, so `out` may hold anything beforehand. Same bytes
+// as `to_le_bytes` of the batch snapshot, without an intermediate buffer.
+#[cfg(any(feature = "ffi", feature = "python", test))]
+pub(crate) fn encode_batch_into(kind: SnapshotKind, lanes: &[StreamLane], out: &mut [u8]) {
+    assert_eq!(out.len(), BATCH_HEADER_LEN + lanes.len() * BATCH_LANE_LEN);
+    let (header, body) = out.split_at_mut(BATCH_HEADER_LEN);
+    header.copy_from_slice(&encode_batch_header(kind, lanes.len() as u64));
+    for (chunk, lane) in body.chunks_exact_mut(BATCH_LANE_LEN).zip(lanes) {
+        encode_batch_lane(chunk, lane.s0, lane.s1, lane.step);
+    }
 }
 
 #[inline]
@@ -276,7 +320,8 @@ fn decode_batch_lane(bytes: &[u8]) -> StreamLane {
     StreamLane { s0, s1, step }
 }
 
-// Validates the header and exact encoded length.
+// Validates the header, the exact encoded length and the reserved bytes, before anything
+// is allocated.
 #[inline]
 fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64, SnapshotError> {
     if bytes.len() < BATCH_HEADER_LEN {
@@ -287,6 +332,9 @@ fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64,
     }
     if bytes[1] != expected_kind as u8 {
         return Err(SnapshotError::InvalidKind);
+    }
+    if bytes[2..8].iter().any(|&b| b != 0) {
+        return Err(SnapshotError::InvalidReserved);
     }
     let lane_count = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
 
@@ -299,6 +347,12 @@ fn decode_batch_header(bytes: &[u8], expected_kind: SnapshotKind) -> Result<u64,
         .ok_or(SnapshotError::InvalidLength)?;
     if bytes.len() != expected_len {
         return Err(SnapshotError::InvalidLength);
+    }
+    if bytes[BATCH_HEADER_LEN..]
+        .chunks_exact(BATCH_LANE_LEN)
+        .any(|lane| lane[40..].iter().any(|&b| b != 0))
+    {
+        return Err(SnapshotError::InvalidReserved);
     }
 
     Ok(lane_count)

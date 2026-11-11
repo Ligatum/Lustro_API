@@ -1,15 +1,20 @@
 """
-Lustro speed test, normalized per engine round. One script, three targets:
+Lustro speed test, normalized per engine round. One script, three targets (python has four variants):
   rust    the native API, examples/speed.rs run as a separate process per measurement
   python  the `lustro` module (NumPy), GIL held for the whole call (release_gil=False),
           input read in place, output written in place into a preallocated buffer
+  python-rel  the same calls with the default release_gil=True
+  python-flat  as python, but HASH_VAR passes one buffer and an offsets array
+          (hash256_many_offsets_into) instead of a list of bytes
+  python-flat-rel  the same calls as python-flat with the default release_gil=True
   c       lustro.dll through ctypes
 Same sections, tables and row labels for all, so the outputs can be compared line by line.
 Same inputs too: HASH_VAR lengths are generated here and handed to every target.
 Stream batch calls use the `steps` suggested by the library for the given N.
 Multi-stream sections run one single stream per process and report the aggregate.
-Usage: [rust|python|c] [section 0-10] [variant 1-5, or auto, scalar, st, compare, simd]
-Without arguments the script asks. With arguments and no target, rust is used.
+Usage: [rust|python|python-rel|python-flat|python-flat-rel|c] [section 0-10] [variant 1-5, or auto, scalar, st, compare, simd]
+Without arguments the script asks (target, for python also its variant). With arguments and no target,
+rust is used; the word python alone means the GIL held variant.
 lustro.dll is searched only in <script directory>/target/release and
 <script directory>/target/release-ffi (newest loadable build with the C API).
 The Rust worker is <script directory>/target/release/examples/speed;
@@ -85,11 +90,31 @@ def hash_rounds_for_len(msg_len: int) -> int:
 
 HW_THREADS = os.cpu_count() or 1
 
-TARGETS = ("rust", "python", "c")
-TARGET_WORDS = {"rust": "rust", "python": "python", "py": "python", "c": "c"}
+TARGETS = ("rust", "python", "python-rel", "python-flat", "python-flat-rel", "c")
+# Interactive menus: the python entry opens a second menu with its variants.
+MENU_TARGETS = ("rust", "python", "c")
+PYTHON_VARIANTS = ("python-flat", "python-flat-rel", "python", "python-rel")
+MENU_HELP = {
+    "python": "lustro module, variant is chosen next",
+}
+TARGET_WORDS = {
+    "rust": "rust",
+    "python": "python",
+    "py": "python",
+    "c": "c",
+    "python-rel": "python-rel",
+    "pyrel": "python-rel",
+    "python-flat": "python-flat",
+    "pyflat": "python-flat",
+    "python-flat-rel": "python-flat-rel",
+    "pyflatrel": "python-flat-rel",
+}
 TARGET_HELP = {
     "rust": "native Rust API, examples/speed.rs in a separate process",
     "python": "lustro module, GIL held during the calls (release_gil=False)",
+    "python-rel": "lustro module, default release_gil=True",
+    "python-flat": "lustro module, GIL held, HASH_VAR from one buffer and offsets",
+    "python-flat-rel": "lustro module, default release_gil=True, HASH_VAR from one buffer and offsets",
     "c": "lustro.dll through ctypes",
 }
 DEFAULT_TARGET = TARGETS[0]
@@ -397,7 +422,7 @@ def load_lib():
     lib.lustro_hash256_many_fixed.argtypes = [U8P, SizeT, SizeT, U8P]
 
     lib.lustro_hash256_many_var.restype = ctypes.c_int32
-    lib.lustro_hash256_many_var.argtypes = [ctypes.POINTER(U8P), SizeT, ctypes.POINTER(SizeT), U8P]
+    lib.lustro_hash256_many_var.argtypes = [ctypes.POINTER(U8P), ctypes.POINTER(SizeT), SizeT, U8P]
 
     # Single stream: new(..., &ctx) / fill(ctx, out, out_len) / free.
     lib.lustro_prng_new.restype = ctypes.c_int32
@@ -454,8 +479,12 @@ def open_single(lib, kind):
 
 
 # =========================================================
-# PYTHON BINDING (target "python")
+# PYTHON BINDING (targets "python", "python-rel", "python-flat", "python-flat-rel")
 # =========================================================
+def py_release_gil(target):
+    return target in ("python-rel", "python-flat-rel")
+
+
 def load_py():
     """Imports lustro and NumPy inside the worker, after its environment is set."""
     import numpy as np
@@ -543,9 +572,10 @@ def setup_hash_fixed(target, n, msg_len):
     lustro, np = load_py()
     data = np.frombuffer(raw, np.uint8).reshape(n, msg_len)
     out = np.empty((n, 32), np.uint8)
+    release = py_release_gil(target)
 
     def call():
-        lustro.hash256_many_fixed_into(data, out, release_gil=False)
+        lustro.hash256_many_fixed_into(data, out, release_gil=release)
 
     call()
     if bytes(out[0]) != lustro.hash256(raw[:msg_len]):
@@ -590,7 +620,7 @@ def setup_hash_var(target, lens):
         out_ptr = ctypes.cast(out, U8P)
 
         def call():
-            err = lib.lustro_hash256_many_var(ptrs, n, len_array, out_ptr)
+            err = lib.lustro_hash256_many_var(ptrs, len_array, n, out_ptr)
             if err != 0:
                 raise RuntimeError(f"lustro_hash256_many_var returned error {err}")
 
@@ -598,15 +628,31 @@ def setup_hash_var(target, lens):
         return call, lambda: None
 
     lustro, np = load_py()
+    if target in ("python-flat", "python-flat-rel"):
+        release = py_release_gil(target)
+        offsets = np.zeros(n + 1, np.int64)
+        np.cumsum(lens, out=offsets[1:])
+        out = np.empty((n, 32), np.uint8)
+
+        def call():
+            lustro.hash256_many_offsets_into(raw, offsets, out, release_gil=release)
+
+        call()
+        for k in (0, n - 1):
+            if bytes(out[k]) != lustro.hash256(raw[offsets[k]:offsets[k + 1]]):
+                raise RuntimeError(f"hash256_many_offsets_into: row {k} differs from hash256")
+        return call, lambda: None
+
     messages = []
     pos = 0
     for length in lens:
         messages.append(raw[pos:pos + length])
         pos += length
     out = np.empty((n, 32), np.uint8)
+    release = py_release_gil(target)
 
     def call():
-        lustro.hash256_many_var_into(messages, out, release_gil=False)
+        lustro.hash256_many_var_into(messages, out, release_gil=release)
 
     call()
     for k in (0, n - 1):
@@ -781,9 +827,10 @@ def setup_stream_batch(target, kind, n):
     if steps == 0:
         raise RuntimeError("suggested_steps returned 0")
     out = np.zeros((steps, n, 4), dtype=np.uint64)
+    release = py_release_gil(target)
 
     def call():
-        batch.fill_blocks(out, steps, release_gil=False)
+        batch.fill_blocks(out, steps, release_gil=release)
 
     return call, (lambda: None), steps, out.nbytes
 
@@ -1054,16 +1101,24 @@ def parse_variant(raw):
     return raw
 
 
-def parse_target(raw):
+def parse_target(raw, choices=MENU_TARGETS):
     raw = raw.strip().lower()
     if not raw:
-        return DEFAULT_TARGET
-    if raw.isdigit() and int(raw) in range(1, len(TARGETS) + 1):
-        return TARGETS[int(raw) - 1]
+        return choices[0]
+    if raw.isdigit() and int(raw) in range(1, len(choices) + 1):
+        return choices[int(raw) - 1]
     if raw in TARGET_WORDS:
         return TARGET_WORDS[raw]
-    print(f"ERROR: invalid target '{raw}', expected 1-{len(TARGETS)}, {', '.join(TARGETS)}")
+    print(f"ERROR: invalid target '{raw}', expected 1-{len(choices)}, {', '.join(choices)}")
     sys.exit(1)
+
+
+def ask_target(title, choices, help_of):
+    print(title)
+    for i, name in enumerate(choices, 1):
+        default = " (default)" if i == 1 else ""
+        print(f"  {i} - {name}: {help_of(name)}{default}")
+    return parse_target(input(f"Target [1-{len(choices)}, Enter = 1]: "), choices)
 
 
 def prompt_selection():
@@ -1077,11 +1132,13 @@ def prompt_selection():
     if words:
         target = TARGET_WORDS[words[0].lower()]
     elif interactive:
-        print("Select target:")
-        for i, name in enumerate(TARGETS, 1):
-            default = " (default)" if name == DEFAULT_TARGET else ""
-            print(f"  {i} - {name}: {TARGET_HELP[name]}{default}")
-        target = parse_target(input(f"Target [1-{len(TARGETS)}, Enter = 1]: "))
+        target = ask_target(
+            "Select target:", MENU_TARGETS, lambda n: MENU_HELP.get(n, TARGET_HELP[n])
+        )
+        if target == "python":
+            target = ask_target(
+                "Select python variant:", PYTHON_VARIANTS, lambda n: TARGET_HELP[n]
+            )
     else:
         target = DEFAULT_TARGET
 
@@ -1182,6 +1239,9 @@ def main():
     title = {
         "rust": "LUSTRO (RUST, native API) -- SPEED TEST (normalized per round)",
         "python": "LUSTRO (PYTHON, GIL held) -- SPEED TEST (normalized per round)",
+        "python-rel": "LUSTRO (PYTHON, GIL released) -- SPEED TEST (normalized per round)",
+        "python-flat": "LUSTRO (PYTHON, GIL held, flat HASH_VAR) -- SPEED TEST (normalized per round)",
+        "python-flat-rel": "LUSTRO (PYTHON, GIL released, flat HASH_VAR) -- SPEED TEST (normalized per round)",
         "c": "LUSTRO.DLL (C) -- SPEED TEST (normalized per round)",
     }[TARGET]
 
@@ -1222,6 +1282,17 @@ def main():
         "(N, msg_len) uint8 array, HASH_VAR hash256_many_var_into on a list of bytes, *_BATCH\n"
         "fill_blocks into a (steps, N, 4) uint64 array, *_FILL fill_into a bytearray.\n"
         "Small calls and single-stream rows (*_FILL) include Python call overhead.\n",
+        "python-rel": "Target python-rel: the same calls as target python with the default release_gil=True: the GIL is\n"
+        "released while the library works, so other Python threads can run. HASH_* copy the input\n"
+        "rows first, HASH_VAR reads the list on the calling thread before the GIL is released.\n"
+        "*_FILL rows are the same calls as for target python (fill_into has no release_gil).\n",
+        "python-flat": "Target python-flat: the same as target python (release_gil=False), except HASH_VAR: it calls\n"
+        "hash256_many_offsets_into on one bytes buffer and an int64 offsets array (built outside the\n"
+        "timing), with no per-message Python object. Other rows are the same calls as for target python.\n",
+        "python-flat-rel": "Target python-flat-rel: the same as target python-flat with the default release_gil=True. HASH_VAR\n"
+        "calls hash256_many_offsets_into on one bytes buffer and an int64 offsets array (built outside the\n"
+        "timing); the offsets are copied and the digests go through a scratch buffer into out. Other rows are\n"
+        "the same calls as for target python-rel.\n",
         "c": "Target c: ctypes calls into lustro.dll; input and output are preallocated ctypes buffers,\n"
         "HASH_VAR uses a prebuilt pointer/length table.\n"
         "Small calls and single-stream rows (*_FILL) include ctypes call overhead.\n",

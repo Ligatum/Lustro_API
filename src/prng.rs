@@ -383,7 +383,7 @@ impl LustroPrngBatch {
     }
 
     /// Fills `out` with `steps` blocks per stream.
-    /// Output is step-major: `out[step * len() + lane]`.
+    /// Output is step-major: `out[step * len() + lane]`. Panics if `out.len() != len() * steps`.
     pub fn fill_blocks(&mut self, out: &mut [[u8; 32]], steps: usize) {
         let expected = self
             .streams
@@ -621,7 +621,7 @@ impl LustroPrngBatch {
     }
 
     /// As `clone`, returning `Err(BatchError::Reserve)` if reserving the lane buffer
-    /// fails. Never returns `BatchError::SizeOverflow`.
+    /// fails. Never returns another variant.
     pub fn try_clone(&self) -> Result<Self, BatchError> {
         let mut streams = Vec::new();
         streams
@@ -654,6 +654,13 @@ impl LustroPrngBatch {
             .map_err(BatchError::Reserve)?;
         lanes.extend_from_slice(&self.streams);
         Ok(LustroPrngBatchSnapshot::new(lanes))
+    }
+
+    // Writes what `export_snapshot().to_le_bytes()` gives into `out`, with no allocation.
+    // `out.len()` must be `16 + len() * 48`.
+    #[cfg(any(feature = "ffi", feature = "python", test))]
+    pub(crate) fn write_snapshot_into(&self, out: &mut [u8]) {
+        crate::types::encode_batch_into(crate::types::SnapshotKind::PrngBatch, &self.streams, out);
     }
 
     /// Restores a batch from a snapshot.

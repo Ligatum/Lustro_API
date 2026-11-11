@@ -2,13 +2,20 @@
 
 use numpy::ndarray::ArrayView2;
 use numpy::{
-    PyArray2, PyArrayDescrMethods, PyArrayMethods, PyReadwriteArray2, PyUntypedArrayMethods,
+    Element, PyArray1, PyArray2, PyArrayDescrMethods, PyArrayMethods, PyReadwriteArray2,
+    PyUntypedArrayMethods,
 };
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::borrow::Cow;
 use std::cell::RefCell;
 
+use crate::constants::Domain;
+use crate::dispatch::{
+    dispatch_hash128_offsets_into, dispatch_hash256_offsets_into, hash128_var_pipelined,
+    hash256_var_pipelined, OffsetMessages, Pipelined,
+};
 use crate::hash::hash128 as hash128_impl;
 use crate::hash::hash128_many_fixed_into;
 use crate::hash::hash128_many_var_into;
@@ -16,9 +23,9 @@ use crate::hash::hash256 as hash256_impl;
 use crate::hash::hash256_many_fixed_into;
 use crate::hash::hash256_many_var_into;
 use crate::hash::LustroHasher;
-use crate::hash::{hash128_many_var_blocks, hash256_many_var_blocks};
 use crate::python::{
-    bytes_arg, messages_arg, require_numpy, ListMessages, MessageSeq, Messages, DETACH_MIN,
+    byte_view, bytes_arg, copy_buffer, messages_arg, require_numpy, ExactItems, MessageSeq,
+    Messages, DETACH_MIN, PIPELINE_MIN,
 };
 use crate::types::{Hash128, Hash256, HashError};
 
@@ -268,7 +275,7 @@ fn digests_into<T: Send, const W: usize>(
     let mut res = ResultBuf::take(n * W)?;
     {
         // SAFETY: T is a repr(transparent) wrapper over [u8; W], so align 1; the buffer
-        // holds at least n * W initialised bytes.
+        // holds at least n * W initialized bytes.
         let blocks: &mut [T] =
             unsafe { std::slice::from_raw_parts_mut(res.0.as_mut_ptr() as *mut T, n) };
         py.detach(|| run(blocks));
@@ -296,13 +303,13 @@ fn digests_into<T: Send, const W: usize>(
 pub fn hash256_py<'py>(
     py: Python<'py>,
     #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
-) -> Bound<'py, PyBytes> {
+) -> PyResult<Bound<'py, PyBytes>> {
     let result = if data.len() < DETACH_MIN {
         hash256_impl(&data)
     } else {
         py.detach(|| hash256_impl(&data))
     };
-    PyBytes::new(py, result.as_bytes())
+    crate::python::try_bytes(py, result.as_bytes())
 }
 
 /// 128-bit digest of `data` (bytes or a byte buffer of any length) as 16 bytes.
@@ -313,13 +320,13 @@ pub fn hash256_py<'py>(
 pub fn hash128_py<'py>(
     py: Python<'py>,
     #[pyo3(from_py_with = bytes_arg)] data: Cow<'_, [u8]>,
-) -> Bound<'py, PyBytes> {
+) -> PyResult<Bound<'py, PyBytes>> {
     let result = if data.len() < DETACH_MIN {
         hash128_impl(&data)
     } else {
         py.detach(|| hash128_impl(&data))
     };
-    PyBytes::new(py, result.as_bytes())
+    crate::python::try_bytes(py, result.as_bytes())
 }
 
 // ==========================================
@@ -382,7 +389,7 @@ impl LustroHasherPy {
             .inner
             .finalize()
             .map_err(|e| hash_error(e, self.inner.remaining(), None))?;
-        Ok(PyBytes::new(py, d.as_bytes()))
+        crate::python::try_bytes(py, d.as_bytes())
     }
 
     /// `digest()` as 64 lowercase hex digits.
@@ -442,6 +449,8 @@ pub fn hash256_many_py<'py>(
     // Use the non-panicking borrow API so conflicting NumPy borrows become Python errors.
     let data = data.try_readonly()?;
     let flat = copy_rows(data.as_array())?;
+    // The copy is hashed; the array is free for other threads while the GIL is released.
+    drop(data);
     let out = alloc_out::<32>(py, flat.n)?;
     digests256(py, out, true, |out| {
         hash256_many_fixed_into(&flat.buf, flat.len, out)
@@ -460,6 +469,8 @@ pub fn hash128_many_py<'py>(
     let data = rows_array(data)?;
     let data = data.try_readonly()?;
     let flat = copy_rows(data.as_array())?;
+    // The copy is hashed; the array is free for other threads while the GIL is released.
+    drop(data);
     let out = alloc_out::<16>(py, flat.n)?;
     digests128(py, out, true, |out| {
         hash128_many_fixed_into(&flat.buf, flat.len, out)
@@ -591,12 +602,48 @@ fn size_changed_error() -> PyErr {
     pyo3::exceptions::PyValueError::new_err("messages changed size while it was read")
 }
 
-// Fused read and hash of a big exact list or tuple straight into a fresh array; true when
-// the array is filled. See `MessageSeq::hash_fused`.
-fn fused_array<T, const W: usize>(
+// Pipelined read and hash of `items` into `out` (see `hash_var_pipelined`).
+fn pipe256(items: &ExactItems<'_>, out: &mut [Hash256]) -> Pipelined {
+    // SAFETY: Hash256 is repr(transparent) over [u8; 32].
+    let out =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], out.len()) };
+    // SAFETY: the callers hold the GIL throughout and run no Python code meanwhile.
+    hash256_var_pipelined(out, Domain::Hash as u128, |a, b| unsafe {
+        items.read(a, b)
+    })
+}
+
+fn pipe128(items: &ExactItems<'_>, out: &mut [Hash128]) -> Pipelined {
+    // SAFETY: Hash128 is repr(transparent) over [u8; 16].
+    let out =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 16], out.len()) };
+    // SAFETY: as in `pipe256`.
+    hash128_var_pipelined(out, Domain::Hash as u128, |a, b| unsafe {
+        items.read(a, b)
+    })
+}
+
+// With the GIL held: a big exact `list` or `tuple` of exact `bytes` is read on this thread
+// range by range while the pool hashes the ranges already read. True when `out` holds all
+// digests; false when this path does not apply or an item is not an exact `bytes`, and then
+// `out` may be partly written.
+fn pipelined<T>(
+    messages: &MessageSeq<'_>,
+    n: usize,
+    out: &mut [T],
+    pipe: fn(&ExactItems<'_>, &mut [T]) -> Pipelined,
+) -> PyResult<bool> {
+    match messages.exact_items(PIPELINE_MIN)? {
+        Some(items) if items.len() == n => Ok(pipe(&items, out) == Pipelined::Done),
+        _ => Ok(false),
+    }
+}
+
+// `pipelined` into a fresh array.
+fn pipelined_array<T, const W: usize>(
     out_arr: &Bound<'_, PyArray2<u8>>,
     messages: &MessageSeq<'_>,
-    fused: fn(ListMessages, &mut [T]) -> bool,
+    pipe: fn(&ExactItems<'_>, &mut [T]) -> Pipelined,
 ) -> PyResult<bool> {
     let n = out_arr.shape()[0];
     let mut out_rw = out_arr.readwrite();
@@ -609,8 +656,7 @@ fn fused_array<T, const W: usize>(
     // n * W bytes.
     let blocks: &mut [T] =
         unsafe { std::slice::from_raw_parts_mut(out_slice.as_mut_ptr() as *mut T, n) };
-    // SAFETY: the GIL is held throughout and the array is fresh, so it overlaps no item.
-    Ok(unsafe { messages.hash_fused(blocks, fused) })
+    pipelined(messages, n, blocks, pipe)
 }
 
 // Shared body of `hash{256,128}_many_var_into`.
@@ -620,18 +666,17 @@ fn var_into<T: Send, const W: usize>(
     out: &Bound<'_, PyAny>,
     release_gil: bool,
     hash: fn(&[&[u8]], &mut [T]),
-    fused: fn(ListMessages, &mut [T]) -> bool,
+    pipe: fn(&ExactItems<'_>, &mut [T]) -> Pipelined,
 ) -> PyResult<()> {
     require_numpy(py)?;
     let n = messages.len()?;
     let mut out = out_rows::<W>(out, n)?;
     if !release_gil {
-        let mut done = false;
+        let mut done = Ok(false);
         write_direct::<T, W>(&mut out, n, |blocks| {
-            // SAFETY: the GIL is held throughout; `out` is NumPy memory, the items are `bytes`.
-            done = unsafe { messages.hash_fused(blocks, fused) };
+            done = pipelined(&messages, n, blocks, pipe)
         })?;
-        if done {
+        if done? {
             return Ok(());
         }
     }
@@ -666,7 +711,7 @@ pub fn hash256_many_var_py<'py>(
     let n = messages.len()?;
     // Allocated before the messages are read, so nothing runs between the read and the hash.
     let mut out_arr = alloc_out::<32>(py, n)?;
-    if !release_gil && fused_array::<Hash256, 32>(&out_arr, &messages, hash256_many_var_blocks)? {
+    if !release_gil && pipelined_array::<Hash256, 32>(&out_arr, &messages, pipe256)? {
         return Ok(out_arr);
     }
     let messages = load_messages(&messages, release_gil, None)?;
@@ -692,7 +737,7 @@ pub fn hash128_many_var_py<'py>(
     require_numpy(py)?;
     let n = messages.len()?;
     let mut out_arr = alloc_out::<16>(py, n)?;
-    if !release_gil && fused_array::<Hash128, 16>(&out_arr, &messages, hash128_many_var_blocks)? {
+    if !release_gil && pipelined_array::<Hash128, 16>(&out_arr, &messages, pipe128)? {
         return Ok(out_arr);
     }
     let messages = load_messages(&messages, release_gil, None)?;
@@ -714,12 +759,13 @@ pub fn hash128_many_var_py<'py>(
 /// is held again. With `release_gil=False` the GIL stays held, the digests are written into
 /// `out` directly and the faster read of an exact `list` or `tuple` of exact `bytes`
 /// described at `hash256_many_var` applies; other Python threads wait for the call.
-/// In that mode a big exact `list` or `tuple` (16384 items or more) is hashed while its
-/// items are read, so `out` may be partly written when the call then fails for any reason:
-/// a TypeError for an item that is not a byte buffer, a ValueError for an item that shares
-/// memory with `out` (a `memoryview` of it, say), an error raised by an item's buffer
-/// export, MemoryError. With the default `release_gil=True` nothing is written before all
-/// items are read, and an item that shares memory with `out` is copied first and allowed.
+/// In that mode a big exact `list` or `tuple` (4096 items or more) is read in ranges on
+/// the calling thread while the ranges already read are hashed on the thread pool, so
+/// `out` may be partly written when the call then fails for any reason: a TypeError for
+/// an item that is not a byte buffer, a ValueError for an item that shares memory with
+/// `out` (a `memoryview` of it, say), an error raised by an item's buffer export,
+/// MemoryError. With the default `release_gil=True` nothing is written before all items
+/// are read, and an item that shares memory with `out` is copied first and allowed.
 #[pyfunction]
 #[pyo3(name = "hash256_many_var_into", signature = (messages, out, *, release_gil=true))]
 pub fn hash256_many_var_into_py<'py>(
@@ -734,7 +780,7 @@ pub fn hash256_many_var_into_py<'py>(
         out,
         release_gil,
         hash256_many_var_into,
-        hash256_many_var_blocks,
+        pipe256,
     )
 }
 
@@ -753,6 +799,340 @@ pub fn hash128_many_var_into_py<'py>(
         out,
         release_gil,
         hash128_many_var_into,
-        hash128_many_var_blocks,
+        pipe128,
     )
+}
+
+// ==========================================
+// OFFSETS API
+// ==========================================
+// Messages in one buffer: message `i` is `data[offsets[i]:offsets[i + 1]]`.
+
+thread_local! {
+    static OFFSETS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+// Checked copy of an offsets array, from the scratch of the calling thread. Never decreasing,
+// the last at most the length of `data`, at least one entry.
+struct OffsetsBuf(Vec<usize>);
+
+impl Drop for OffsetsBuf {
+    fn drop(&mut self) {
+        if self.0.capacity() * std::mem::size_of::<usize>() <= SCRATCH_KEEP {
+            let buf = std::mem::take(&mut self.0);
+            // Err only while the thread is exiting; the buffer is freed then.
+            let _ = OFFSETS.try_with(|s| *s.borrow_mut() = buf);
+        }
+    }
+}
+
+fn offsets_error(msg: String) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(msg)
+}
+
+// Entry to `usize` for a target where `usize` is narrower than 64 bits: an entry that does
+// not fit, a negative one included, becomes `usize::MAX`, so it fails the checks below.
+#[cfg(not(target_pointer_width = "64"))]
+#[inline(always)]
+fn widen<T: TryInto<usize>>(v: T) -> usize {
+    v.try_into().unwrap_or(usize::MAX)
+}
+
+// Offset entry types. `to_usize` wraps for a negative entry, which then fails the checks
+// below (it is far past any `data`); on a 32-bit target see `widen`.
+trait OffsetInt: Element + Copy {
+    fn to_usize(self) -> usize;
+    fn negative(self) -> bool;
+}
+
+macro_rules! offset_int {
+    ($t:ty, $neg:expr) => {
+        impl OffsetInt for $t {
+            #[inline(always)]
+            fn to_usize(self) -> usize {
+                #[cfg(target_pointer_width = "64")]
+                {
+                    self as usize
+                }
+                #[cfg(not(target_pointer_width = "64"))]
+                {
+                    widen(self)
+                }
+            }
+            #[inline(always)]
+            fn negative(self) -> bool {
+                $neg(self)
+            }
+        }
+    };
+}
+offset_int!(i64, |v: i64| v < 0);
+offset_int!(i32, |v: i32| v < 0);
+offset_int!(u64, |_| false);
+offset_int!(u32, |_| false);
+
+// Which entry breaks the rules, for the message; the fast check only says that one does.
+fn offsets_fault<T: OffsetInt>(entries: impl Iterator<Item = T>, data_len: usize) -> PyErr {
+    let mut prev = 0usize;
+    let mut last = 0usize;
+    let mut count = 0;
+    for (i, v) in entries.enumerate() {
+        if v.negative() {
+            return offsets_error(format!("offsets[{i}] is negative"));
+        }
+        let v = v.to_usize();
+        if v < prev {
+            return offsets_error(format!(
+                "offsets must not decrease (offsets[{i}] = {v} < {prev})"
+            ));
+        }
+        prev = v;
+        last = v;
+        count = i;
+    }
+    offsets_error(format!(
+        "offsets[{count}] = {last} is past the end of data ({data_len} bytes)"
+    ))
+}
+
+// Copy, because the array can be changed by other Python threads once the GIL is released
+// and the entries decide which bytes are read.
+fn collect_offsets<T: OffsetInt>(
+    offsets: &Bound<'_, PyArray1<T>>,
+    data_len: usize,
+) -> PyResult<OffsetsBuf> {
+    let ro = offsets.try_readonly()?;
+    let view = ro.as_array();
+    let len = view.len();
+    if len == 0 {
+        return Err(offsets_error(
+            "offsets must have at least one entry (len(messages) + 1)".to_string(),
+        ));
+    }
+    let mut buf = OffsetsBuf(
+        OFFSETS
+            .try_with(|s| std::mem::take(&mut *s.borrow_mut()))
+            .unwrap_or_default(),
+    );
+    buf.0.clear();
+    buf.0
+        .try_reserve_exact(len)
+        .map_err(|_| crate::python::alloc_error())?;
+    match view.as_slice() {
+        Some(s) => buf.0.extend(s.iter().map(|&v| v.to_usize())),
+        None => buf.0.extend(view.iter().map(|&v| v.to_usize())),
+    }
+    // Never decreasing and the last within `data`, so every entry is within `data`. A negative
+    // entry wraps to a value past `data` and fails here.
+    let mut ok = buf.0[len - 1] <= data_len;
+    for w in buf.0.windows(2) {
+        ok &= w[0] <= w[1];
+    }
+    if !ok {
+        return Err(offsets_fault(view.iter().copied(), data_len));
+    }
+    Ok(buf)
+}
+
+fn read_offsets(offsets: &Bound<'_, PyAny>, data_len: usize) -> PyResult<OffsetsBuf> {
+    if let Ok(a) = offsets.cast::<PyArray1<i64>>() {
+        return collect_offsets(a, data_len);
+    }
+    if let Ok(a) = offsets.cast::<PyArray1<u64>>() {
+        return collect_offsets(a, data_len);
+    }
+    if let Ok(a) = offsets.cast::<PyArray1<i32>>() {
+        return collect_offsets(a, data_len);
+    }
+    if let Ok(a) = offsets.cast::<PyArray1<u32>>() {
+        return collect_offsets(a, data_len);
+    }
+    Err(crate::python::array_type_error(
+        "offsets",
+        "a 1D numpy.ndarray of dtype int64, uint64, int32 or uint32",
+    ))
+}
+
+// `data` of an offsets call. With the GIL held the whole time a byte buffer is read in place;
+// otherwise it is copied, and only `bytes`, which cannot change, is borrowed.
+enum Input<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+    View(PyBuffer<u8>),
+}
+
+impl<'a> Input<'a> {
+    fn new(data: &'a Bound<'_, PyAny>, release_gil: bool) -> PyResult<Self> {
+        if let Ok(bytes) = data.cast::<PyBytes>() {
+            return Ok(Self::Borrowed(bytes.as_bytes()));
+        }
+        if release_gil {
+            copy_buffer(data).map(Self::Owned)
+        } else {
+            byte_view(data).map(Self::View)
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(b) => b,
+            Self::Owned(v) => v,
+            Self::View(v) if v.len_bytes() == 0 => &[],
+            // SAFETY: the view is C-contiguous and keeps the exporter alive, so `buf_ptr()`
+            // covers `len_bytes()` bytes while `self` lives; only used with the GIL held.
+            Self::View(v) => unsafe {
+                std::slice::from_raw_parts(v.buf_ptr() as *const u8, v.len_bytes())
+            },
+        }
+    }
+}
+
+fn offsets256(messages: OffsetMessages<'_>, out: &mut [Hash256]) {
+    // SAFETY: Hash256 is #[repr(transparent)] over [u8; 32].
+    let blocks: &mut [[u8; 32]] =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], out.len()) };
+    dispatch_hash256_offsets_into(messages, Domain::Hash as u128, blocks);
+}
+
+fn offsets128(messages: OffsetMessages<'_>, out: &mut [Hash128]) {
+    // SAFETY: Hash128 is #[repr(transparent)] over [u8; 16].
+    let blocks: &mut [[u8; 16]] =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 16], out.len()) };
+    dispatch_hash128_offsets_into(messages, Domain::Hash as u128, blocks);
+}
+
+// Shared body of `hash{256,128}_many_offsets`: digests into a new `(n, W)` array.
+fn offsets_new<'py, T: Send, const W: usize>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    offsets: &Bound<'py, PyAny>,
+    release_gil: bool,
+    hash: fn(OffsetMessages<'_>, &mut [T]),
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    require_numpy(py)?;
+    let input = Input::new(data, release_gil)?;
+    let offs = read_offsets(offsets, input.bytes().len())?;
+    let n = offs.0.len() - 1;
+    let out_arr = alloc_out::<W>(py, n)?;
+    {
+        let messages = OffsetMessages::new(input.bytes(), &offs.0);
+        let mut out_rw = out_arr.readwrite();
+        let dst = out_rw.as_slice_mut().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                "internal error: freshly allocated output array is not contiguous",
+            )
+        })?;
+        // SAFETY: T is a repr(transparent) wrapper over [u8; W], so align 1; `dst` holds
+        // n * W bytes.
+        let blocks: &mut [T] =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut T, n) };
+        if release_gil {
+            py.detach(|| hash(messages, blocks));
+        } else {
+            hash(messages, blocks);
+        }
+    }
+    Ok(out_arr)
+}
+
+// Shared body of `hash{256,128}_many_offsets_into`.
+fn offsets_into<T: Send, const W: usize>(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    offsets: &Bound<'_, PyAny>,
+    out: &Bound<'_, PyAny>,
+    release_gil: bool,
+    hash: fn(OffsetMessages<'_>, &mut [T]),
+) -> PyResult<()> {
+    require_numpy(py)?;
+    let input = Input::new(data, release_gil)?;
+    let offs = read_offsets(offsets, input.bytes().len())?;
+    let n = offs.0.len() - 1;
+    let mut out = out_rows::<W>(out, n)?;
+    let messages = OffsetMessages::new(input.bytes(), &offs.0);
+    if !release_gil {
+        // Separate wrappers over one buffer are not seen by the borrow check.
+        if matches!(input, Input::View(_))
+            && overlaps(
+                input.bytes().as_ptr() as usize,
+                input.bytes().len(),
+                out.data() as usize,
+                n * W,
+            )
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "data and out must not share memory",
+            ));
+        }
+        return write_direct::<T, W>(&mut out, n, |blocks| hash(messages, blocks));
+    }
+    digests_into::<T, W>(py, out, n, |o| hash(messages, o))
+}
+
+/// 256-bit digests of the messages `data[offsets[i]:offsets[i + 1]]`, for `i` in
+/// `range(len(offsets) - 1)`. Returns a uint8 array of shape `(len(offsets) - 1, 32)`.
+/// `data` is `bytes` or a C-contiguous byte buffer; `offsets` is a 1D numpy array of dtype
+/// int64, uint64, int32 or uint32 with at least one entry. TypeError for another type,
+/// ValueError for an entry that is negative, smaller than the one before or past the end of
+/// `data`. Bytes of `data` before `offsets[0]` and after `offsets[-1]` are not hashed (by
+/// default a buffer that is not `bytes` is still copied whole, see below).
+///
+/// By default the GIL is released while hashing; `bytes` is not copied, any other buffer is
+/// copied first, and `offsets` is always copied. With `release_gil=False` the GIL stays held,
+/// a byte buffer is read in place and other Python threads wait for the call.
+#[pyfunction]
+#[pyo3(name = "hash256_many_offsets", signature = (data, offsets, *, release_gil=true))]
+pub fn hash256_many_offsets_py<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    offsets: &Bound<'py, PyAny>,
+    release_gil: bool,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    offsets_new::<Hash256, 32>(py, data, offsets, release_gil, offsets256)
+}
+
+/// 128-bit digests of the messages `data[offsets[i]:offsets[i + 1]]`. Same input rules as
+/// `hash256_many_offsets`. Returns a uint8 array of shape `(len(offsets) - 1, 16)`.
+#[pyfunction]
+#[pyo3(name = "hash128_many_offsets", signature = (data, offsets, *, release_gil=true))]
+pub fn hash128_many_offsets_py<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    offsets: &Bound<'py, PyAny>,
+    release_gil: bool,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    offsets_new::<Hash128, 16>(py, data, offsets, release_gil, offsets128)
+}
+
+/// As `hash256_many_offsets`, writing the digests into `out`, a writable, C-contiguous
+/// uint8 array of shape `(len(offsets) - 1, 32)` (ValueError for another shape or a
+/// non-contiguous `out`, TypeError for another type, dtype or ndim). Returns None.
+///
+/// By default the digests are computed with the GIL released and copied into `out` once it
+/// is held again. With `release_gil=False` the GIL stays held, the digests are written into
+/// `out` directly and a `data` buffer that shares memory with `out` raises ValueError.
+#[pyfunction]
+#[pyo3(name = "hash256_many_offsets_into", signature = (data, offsets, out, *, release_gil=true))]
+pub fn hash256_many_offsets_into_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    offsets: &Bound<'_, PyAny>,
+    out: &Bound<'_, PyAny>,
+    release_gil: bool,
+) -> PyResult<()> {
+    offsets_into::<Hash256, 32>(py, data, offsets, out, release_gil, offsets256)
+}
+
+/// As `hash256_many_offsets_into`, with 128-bit digests: `out` has shape
+/// `(len(offsets) - 1, 16)`.
+#[pyfunction]
+#[pyo3(name = "hash128_many_offsets_into", signature = (data, offsets, out, *, release_gil=true))]
+pub fn hash128_many_offsets_into_py(
+    py: Python<'_>,
+    data: &Bound<'_, PyAny>,
+    offsets: &Bound<'_, PyAny>,
+    out: &Bound<'_, PyAny>,
+    release_gil: bool,
+) -> PyResult<()> {
+    offsets_into::<Hash128, 16>(py, data, offsets, out, release_gil, offsets128)
 }

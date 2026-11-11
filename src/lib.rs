@@ -9,7 +9,7 @@ mod core;
 #[cfg(target_arch = "x86_64")]
 mod core_avx2;
 mod dispatch;
-pub use api::{configure, lustro_api_version, runtime_info, runtime_preview};
+pub use api::{configure, lustro_api_version, runtime_info};
 pub use hash::{
     hash128, hash128_many_fixed, hash128_many_fixed_into, hash128_many_var, hash128_many_var_into,
     hash256, hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into,
@@ -57,7 +57,18 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash256_many_var_into_py, m)?)?;
     m.add_function(wrap_pyfunction!(python::hash::hash128_many_var_into_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash256_many_offsets_py, m)?)?;
+    m.add_function(wrap_pyfunction!(python::hash::hash128_many_offsets_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        python::hash::hash256_many_offsets_into_py,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        python::hash::hash128_many_offsets_into_py,
+        m
+    )?)?;
     m.add("SnapshotError", m.py().get_type::<python::SnapshotError>())?;
+    m.add("ConfigError", m.py().get_type::<python::ConfigError>())?;
     m.add_class::<python::hash::LustroHasherPy>()?;
     m.add_class::<python::prng::LustroPrngPy>()?;
     m.add_class::<python::prng::LustroPrngBatchPy>()?;
@@ -66,8 +77,8 @@ fn lustro_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<python::xof::LustroXofAbsorberPy>()?;
     m.add_function(wrap_pyfunction!(python::lustro_api_version, m)?)?;
     m.add_function(wrap_pyfunction!(python::runtime_info, m)?)?;
-    m.add_function(wrap_pyfunction!(python::runtime_preview, m)?)?;
     m.add_function(wrap_pyfunction!(python::configure, m)?)?;
+    m.add_function(wrap_pyfunction!(python::snapshot_kind, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("SEED_LEN", types::LUSTRO_SEED_LEN)?;
     m.add("BLOCK_LEN", types::LUSTRO_BLOCK_LEN)?;

@@ -97,7 +97,7 @@ pub(super) unsafe fn ids_from_parts(
 }
 
 /// Reconstructs `n` messages from parallel pointer/length arrays.
-/// `InvalidLength` if a length is not addressable; `InvalidPointer` on a null or misaligned
+/// `InvalidLength` if `n` or a length is not addressable; `InvalidPointer` on a null or misaligned
 /// array, or on a null message pointer with a nonzero length; `OutOfMemory` if the vector
 /// cannot be reserved.
 /// SAFETY: arrays must be valid for `n` elements if n > 0; each pointer for its length.
