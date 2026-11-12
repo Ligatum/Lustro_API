@@ -31,7 +31,8 @@ impl std::error::Error for DerivePathError {
 
 /// Why a batch operation failed in `try_new`, `try_new_range`, `try_from_streams`, `try_fork`,
 /// `try_fork_many`, `try_fork_range`, `try_fork_batch`, `try_fork_batch_range`, `try_clone`,
-/// `try_blocks`, `try_export_snapshot` or `try_to_le_bytes`.
+/// `try_blocks`, `try_export_snapshot`, `try_to_le_bytes`, `try_hash256_many_fixed`,
+/// `try_hash128_many_fixed`, `try_hash256_many_var` or `try_hash128_many_var`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BatchError {
@@ -45,6 +46,9 @@ pub enum BatchError {
     /// Stream `index` given to `try_from_streams` is inside a block: part of its current
     /// block is unread and a lane cannot hold it.
     PartialBlock { index: usize },
+    /// `message_len` given to `try_hash256_many_fixed` or `try_hash128_many_fixed` is 0, or
+    /// `data_len` is not a multiple of it.
+    InvalidMessageLen { data_len: usize, message_len: usize },
 }
 
 impl core::fmt::Display for BatchError {
@@ -58,6 +62,17 @@ impl core::fmt::Display for BatchError {
             BatchError::PartialBlock { index } => {
                 write!(f, "stream {index} is inside a block")
             }
+            BatchError::InvalidMessageLen {
+                data_len,
+                message_len: 0,
+            } => write!(f, "message_len is 0 (data of {data_len} bytes)"),
+            BatchError::InvalidMessageLen {
+                data_len,
+                message_len,
+            } => write!(
+                f,
+                "data of {data_len} bytes is not a multiple of message_len {message_len}"
+            ),
         }
     }
 }
@@ -67,7 +82,8 @@ impl std::error::Error for BatchError {
         match self {
             BatchError::SizeOverflow
             | BatchError::LengthMismatch { .. }
-            | BatchError::PartialBlock { .. } => None,
+            | BatchError::PartialBlock { .. }
+            | BatchError::InvalidMessageLen { .. } => None,
             BatchError::Reserve(e) => Some(e),
         }
     }

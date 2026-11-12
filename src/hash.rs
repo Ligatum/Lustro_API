@@ -2,7 +2,7 @@
 
 use crate::api::{absorb_block, absorb_init, absorb_tail, absorb_with_domain};
 use crate::constants::Domain;
-use crate::types::{Hash128, Hash256, HashError};
+use crate::types::{BatchError, Hash128, Hash256, HashError};
 
 // ==========================================
 // RUST HASH API
@@ -176,45 +176,101 @@ impl LustroHasher {
 /// back in `data`, and returns their 256-bit digests.
 ///
 /// Panics if `message_len` is 0 (the message count is undefined, use
-/// `hash256_many_fixed_into`) or if `data.len()` is not a multiple of `message_len`.
+/// `hash256_many_fixed_into`), if `data.len()` is not a multiple of `message_len`, or if the
+/// output cannot be allocated. `try_hash256_many_fixed` returns these as errors.
 pub fn hash256_many_fixed(data: &[u8], message_len: usize) -> Vec<Hash256> {
-    let mut out = vec![Hash256::default(); fixed_count("hash256_many_fixed", data, message_len)];
+    or_panic(
+        "hash256_many_fixed",
+        try_hash256_many_fixed(data, message_len),
+    )
+}
+
+/// As `hash256_many_fixed`, returning `Err(BatchError::InvalidMessageLen)` for a `message_len`
+/// of 0 or a `data.len()` that is not a multiple of it, and `Err(BatchError::Reserve)` if the
+/// output cannot be allocated.
+pub fn try_hash256_many_fixed(data: &[u8], message_len: usize) -> Result<Vec<Hash256>, BatchError> {
+    let mut out = try_digests(fixed_count(data, message_len)?)?;
     hash256_many_fixed_into(data, message_len, &mut out);
-    out
+    Ok(out)
 }
 
 /// As `hash256_many_fixed`, returning 128-bit digests.
 pub fn hash128_many_fixed(data: &[u8], message_len: usize) -> Vec<Hash128> {
-    let mut out = vec![Hash128::default(); fixed_count("hash128_many_fixed", data, message_len)];
-    hash128_many_fixed_into(data, message_len, &mut out);
-    out
+    or_panic(
+        "hash128_many_fixed",
+        try_hash128_many_fixed(data, message_len),
+    )
 }
 
-// Message count of `data` split into `message_len` pieces; panics as documented above.
-fn fixed_count(name: &str, data: &[u8], message_len: usize) -> usize {
-    assert!(
-        message_len != 0,
-        "{name}: message_len must not be 0, use the _into variant"
-    );
-    assert!(
-        data.len().is_multiple_of(message_len),
-        "{name}: data.len() must be a multiple of message_len"
-    );
-    data.len() / message_len
+/// As `try_hash256_many_fixed`, returning 128-bit digests.
+pub fn try_hash128_many_fixed(data: &[u8], message_len: usize) -> Result<Vec<Hash128>, BatchError> {
+    let mut out = try_digests(fixed_count(data, message_len)?)?;
+    hash128_many_fixed_into(data, message_len, &mut out);
+    Ok(out)
+}
+
+// Message count of `data` split into `message_len` pieces.
+fn fixed_count(data: &[u8], message_len: usize) -> Result<usize, BatchError> {
+    if message_len == 0 || !data.len().is_multiple_of(message_len) {
+        return Err(BatchError::InvalidMessageLen {
+            data_len: data.len(),
+            message_len,
+        });
+    }
+    Ok(data.len() / message_len)
+}
+
+// `n` default digests; the reservation can fail.
+fn try_digests<T: Clone + Default>(n: usize) -> Result<Vec<T>, BatchError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).map_err(BatchError::Reserve)?;
+    out.resize(n, T::default());
+    Ok(out)
+}
+
+// Panic form of the `try_hash*_many_*` functions.
+fn or_panic<T>(name: &str, result: Result<Vec<T>, BatchError>) -> Vec<T> {
+    match result {
+        Ok(out) => out,
+        Err(BatchError::InvalidMessageLen { message_len: 0, .. }) => {
+            panic!("{name}: message_len must not be 0, use the _into variant")
+        }
+        Err(BatchError::InvalidMessageLen { .. }) => {
+            panic!("{name}: data.len() must be a multiple of message_len")
+        }
+        Err(BatchError::Reserve(e)) => panic!("{name}: output allocation failed: {e:?}"),
+        Err(e) => panic!("{name}: {e}"),
+    }
 }
 
 /// Hashes N independent messages of any lengths and returns N 256-bit digests.
+///
+/// Panics if the output cannot be allocated; `try_hash256_many_var` returns that as an error.
 pub fn hash256_many_var(messages: &[&[u8]]) -> Vec<Hash256> {
-    let mut out = vec![Hash256::default(); messages.len()];
+    or_panic("hash256_many_var", try_hash256_many_var(messages))
+}
+
+/// As `hash256_many_var`, returning `Err(BatchError::Reserve)` if the output cannot be
+/// allocated.
+pub fn try_hash256_many_var(messages: &[&[u8]]) -> Result<Vec<Hash256>, BatchError> {
+    let mut out = try_digests(messages.len())?;
     hash256_many_var_into(messages, &mut out);
-    out
+    Ok(out)
 }
 
 /// Hashes N independent messages of any lengths and returns N 128-bit digests.
+///
+/// Panics if the output cannot be allocated; `try_hash128_many_var` returns that as an error.
 pub fn hash128_many_var(messages: &[&[u8]]) -> Vec<Hash128> {
-    let mut out = vec![Hash128::default(); messages.len()];
+    or_panic("hash128_many_var", try_hash128_many_var(messages))
+}
+
+/// As `hash128_many_var`, returning `Err(BatchError::Reserve)` if the output cannot be
+/// allocated.
+pub fn try_hash128_many_var(messages: &[&[u8]]) -> Result<Vec<Hash128>, BatchError> {
+    let mut out = try_digests(messages.len())?;
     hash128_many_var_into(messages, &mut out);
-    out
+    Ok(out)
 }
 
 /// Hashes `out.len()` messages of `message_len` bytes each, stored back to back in

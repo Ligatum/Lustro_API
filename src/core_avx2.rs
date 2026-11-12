@@ -314,10 +314,11 @@ unsafe fn rotl_u128_var(x: U128x4, r: U64x4, consts: &SimdConsts) -> U128x4 {
         _mm256_or_si256(lo_l, hi_r)
     };
 
-    // r >= 64: the halves swap.
+    // ── FINAL ──
     let final_hi = _mm256_blendv_epi8(tmp_hi, tmp_lo, mask);
     let final_lo = _mm256_blendv_epi8(tmp_lo, tmp_hi, mask);
 
+    // r >= 64: swap
     U128x4 {
         hi: U64x4(final_hi),
         lo: U64x4(final_lo),

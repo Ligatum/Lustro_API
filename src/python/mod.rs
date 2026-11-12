@@ -212,7 +212,7 @@ pub(crate) fn batch_error(e: crate::types::BatchError) -> pyo3::PyErr {
     match e {
         B::Reserve(_) => alloc_error(),
         B::SizeOverflow => pyo3::exceptions::PyOverflowError::new_err(e.to_string()),
-        B::LengthMismatch { .. } | B::PartialBlock { .. } => {
+        B::LengthMismatch { .. } | B::PartialBlock { .. } | B::InvalidMessageLen { .. } => {
             pyo3::exceptions::PyValueError::new_err(e.to_string())
         }
     }

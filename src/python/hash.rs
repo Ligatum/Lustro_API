@@ -234,8 +234,10 @@ pub(crate) fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
 
 // `PyArray2::zeros` panics when NumPy fails, and `n` comes from user `__len__`. This calls
 // `PyArray_Zeros` directly and passes a failure on as the exception NumPy set (MemoryError).
+// A size that does not fit `isize` is an OverflowError, as for `blocks`.
 fn alloc_out<'py, const W: usize>(py: Python<'py>, n: usize) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let too_big = || crate::python::alloc_error();
+    let too_big =
+        || pyo3::exceptions::PyOverflowError::new_err("output size exceeds isize::MAX bytes");
     let bytes = n.checked_mul(W).ok_or_else(too_big)?;
     let mut dims = [
         numpy::npyffi::npy_intp::try_from(n).map_err(|_| too_big())?,

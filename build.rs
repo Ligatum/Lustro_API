@@ -14,8 +14,10 @@ fn generate_header() {
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    let mut config = cbindgen::Config::default();
-    config.language = cbindgen::Language::C;
+    let mut config = cbindgen::Config {
+        language: cbindgen::Language::C,
+        ..Default::default()
+    };
     config.pragma_once = false;
     config.no_includes = true;
 

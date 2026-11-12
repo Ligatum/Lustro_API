@@ -2,7 +2,6 @@
 
 **Edit: 27.10.26. I will be uploading a breaking change patch in the coming week or two at most. It'll be the only one before going out of beta. Lustro 1.0.1 will be the initial post-beta release.**
 **Edit: 04.11.26. I am aiming for the upgrades to be finished by 13.11.26. A health issue delayed me slightly.**
-**Edit: 11.11.26. Final breaking change patch prior to going out of beta is out just now. I'll be auditing the code in the coming days. I'm aiming for 13.11 to bump the version to 1.0.1 for the post beta release.**
 
 # Lustro API
 
@@ -1628,13 +1627,18 @@ These functions reserve memory for the lanes of a batch, for its output or for t
 `new`, `new_range`, `from_streams`, `fork`, `fork_range`, `fork_many`, `derive_path`, `clone`, `blocks` 
 and `export_snapshot` of `LustroPrngBatch` and `LustroXofBatch`; `fork_batch` and `fork_batch_range` 
 of `LustroPrng` and `LustroXof`; `to_le_bytes` and `from_le_bytes` of `LustroPrngBatchSnapshot` 
-and `LustroXofBatchSnapshot`. If a reservation fails:
+and `LustroXofBatchSnapshot`; the output vector of `hash256_many_fixed`, `hash128_many_fixed`, 
+`hash256_many_var` and `hash128_many_var`. If a reservation fails:
 
 - **Rust:** the function panics, and `clone()` aborts the process. Each has a `try_` variant that returns 
   an error instead: `try_new`, `try_new_range` (PRNG only), `try_from_streams`, `try_fork`, `try_fork_range`, 
   `try_fork_many`, `try_derive_path`, `try_clone`, `try_blocks`, `try_export_snapshot`, `try_fork_batch`, 
-  `try_fork_batch_range`, `try_to_le_bytes` and `try_from_le_bytes`. The error is `BatchError::Reserve`; 
-  `try_blocks` and `try_fork_many` can also return `BatchError::SizeOverflow` when `len() * steps` or 
+  `try_fork_batch_range`, `try_to_le_bytes`, `try_from_le_bytes`, `try_hash256_many_fixed`, 
+  `try_hash128_many_fixed`, `try_hash256_many_var` and `try_hash128_many_var`. The error is 
+  `BatchError::Reserve`; `try_hash256_many_fixed` and `try_hash128_many_fixed` also return 
+  `BatchError::InvalidMessageLen` for a `message_len` of 0 or a `data.len()` that is not a multiple of it 
+  (the plain versions panic then); `try_blocks` and `try_fork_many` can also return `BatchError::SizeOverflow` 
+  when `len() * steps` or
   `len() * ids.len()` overflows `usize` (the plain versions panic then too). `try_derive_path` returns 
   `DerivePathError::Reserve` and `try_from_le_bytes` (also through `TryFrom<&[u8]>`) returns `SnapshotError::Reserve`.
 - **Python:** `MemoryError`.
@@ -2023,9 +2027,11 @@ n = rng.readinto(buf)         # n == 1000, any writable C-contiguous buffer
 
 `read(size)` is the same as `fill(size)`; there is no `read()` without a size, because the stream has no end. 
 `readinto(buf)` accepts any writable, C-contiguous buffer, whatever its item type (for example `array('I')` or a 
-NumPy `uint32` array). It writes the stream as raw bytes, without conversion, and returns the number of bytes written. 
-`fill_into(buf)` takes byte buffers only. For buffers of 4096 bytes or more the GIL is released while the stream is written, 
-so no other thread may read or write the buffer until the call returns.
+NumPy `uint32` array), except one that holds Python objects, such as a NumPy `dtype=object` array (`TypeError`). It writes 
+the stream as raw bytes, without conversion, and returns the number of bytes written. `fill_into(buf)` takes byte buffers only. 
+For `fill_into` and `readinto`, a buffer of 4096 bytes or more is generated with the GIL released and copied into 
+`buf` with the GIL held, so other Python threads cannot change it while the stream writes. Native code that writes 
+to the buffer without the GIL is not covered.
 
 Seeds, messages, hash input and snapshots are given as `bytes`. `bytearray`, `memoryview`, `array('B')` and NumPy `uint8` 
 arrays are accepted too; they must be C-contiguous with byte items (`TypeError` otherwise) and are copied. `hash256_many_var`, 
@@ -2068,8 +2074,10 @@ and the package ships type stubs (`lustro.pyi`, `py.typed`).
 | `fill`, `read`, `fill_u64` | released for 4096 bytes or more, held below |
 | `blocks` | released while generating |
 | `advance_bytes`, `advance_blocks` | released for 4096 bytes (128 blocks) or more, held below; a pending Ctrl-C is raised between chunks of 2^20 blocks and leaves the stream unchanged |
-| `fill_into`, `readinto` | released for buffers of 4096 bytes or more, held below |
+| `fill_into`, `readinto` | released while generating 4096 bytes or more (the copy into `buf` holds it), held below |
 | `LustroXofBatch(...)`, `LustroXofBatch.derive_path` | released while the lanes are built |
+| `LustroXof(message)`, `LustroXof.derive_path` | released while absorbing 4096 bytes or more, held below |
+| Other batch calls that build or copy lanes: constructors, `new_range`, `fork*`, `from_streams`, `copy`, `iter(batch)`, snapshots, `LustroPrngBatch.derive_path` | held; the time grows with the lane count |
 | `LustroHasher.update`, `LustroXofAbsorber.update` | released for inputs of 4096 bytes or more, held below |
 
 By default (`release_gil=True`) other Python threads run during the call. What is copied depends on the call: input that 
@@ -2078,9 +2086,7 @@ digests in a scratch buffer and copy them into `out` after the GIL is taken back
 the digests straight into it. On large batches the copies cost time.
 
 For many messages of different lengths prefer `hash*_many_offsets` and `hash*_many_offsets_into` over `hash*_many_var`: 
-with them no Python object is read or counted per message, in both modes. With the default `release_gil=True` they copy 
-`offsets`; `hash*_many_offsets_into` also copies the digests from a scratch buffer into `out`, while `hash*_many_offsets` 
-writes them straight into its new array. A `bytes` `data` is not copied.
+no Python object is read or counted per message, in both modes.
 
 With `release_gil=False` the GIL stays held and, where the input allows, data is read in place and digests are written 
 straight into `out`. Other Python threads wait. The thread pool and AVX2 are used in both modes.
@@ -2109,6 +2115,10 @@ In this mode:
   it is hashed while it is read, so `out` may be partly written if the call then fails (`hash*_many_var` takes the same path but 
   writes into a new array, which is dropped on failure). By default nothing is written before all items are read.
 - `fill_blocks` writes in place on little-endian targets; elsewhere the flag has no effect.
+
+The hash batch functions keep up to four buffers per thread between calls: the copied rows, the digests of `*_into`, the copied 
+`offsets` and the table of message slices. Each is kept up to 32 MiB (a bigger one is freed when the call ends), so a thread 
+holds up to 128 MiB until it exits. The buffers are not cleared, so bytes of the last calls stay in them.
 
 ---
 

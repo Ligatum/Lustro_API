@@ -26,7 +26,7 @@ pub(crate) unsafe fn construct<T>(
     out_ctx: *mut *mut T,
     f: impl FnOnce() -> Result<T, LustroError> + UnwindSafe,
 ) -> LustroError {
-    if out_ctx.is_null() || (out_ctx as usize) % std::mem::align_of::<*mut T>() != 0 {
+    if out_ctx.is_null() || !(out_ctx as usize).is_multiple_of(std::mem::align_of::<*mut T>()) {
         return LustroError::InvalidPointer;
     }
     *out_ctx = std::ptr::null_mut();
@@ -127,7 +127,9 @@ unsafe fn write_info(
     get: fn() -> crate::types::RuntimeInfo,
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {
-        if out.is_null() || (out as usize) % std::mem::align_of::<LustroRuntimeInfo>() != 0 {
+        if out.is_null()
+            || !(out as usize).is_multiple_of(std::mem::align_of::<LustroRuntimeInfo>())
+        {
             return LustroError::InvalidPointer;
         }
         if out_size < RUNTIME_INFO_MIN_SIZE {
@@ -274,6 +276,6 @@ pub unsafe extern "C" fn lustro_snapshot_kind(
 pub extern "C" fn lustro_strerror(code: i32) -> *const c_char {
     match crate::errors::LustroError::from_code(code) {
         Some(e) => e.as_nul_str().as_ptr() as *const c_char,
-        None => b"unknown error code\0".as_ptr() as *const c_char,
+        None => c"unknown error code".as_ptr(),
     }
 }

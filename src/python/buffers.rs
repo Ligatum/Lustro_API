@@ -42,19 +42,46 @@ pub(crate) fn skip_chunked<T: Clone + Send>(
     Ok(())
 }
 
-// Address of a writable buffer for the thread that fills it while the GIL is released.
-struct SendPtr(*mut u8);
+// Largest piece generated per released GIL when writing into a caller's buffer.
+const STAGE_CHUNK: usize = 16 << 20;
 
-// SAFETY: the exporting object is kept alive and in place by the buffer view held by the
-// caller until the fill returns. The filling thread needs exclusive access to the memory,
-// reads included; the binding does not check that no other thread touches it.
-unsafe impl Send for SendPtr {}
+// Writes `len` bytes produced by `fill` to `dst`. Below `DETACH_MIN` the bytes are written
+// in place with the GIL held. Otherwise they are generated into a Rust buffer with the GIL
+// released and copied to `dst` with the GIL held, `STAGE_CHUNK` bytes at a time, so no
+// other Python thread can change `dst` while Rust borrows it. The staging buffer is
+// allocated before the first byte is generated: on MemoryError the stream has not moved.
+//
+// SAFETY: `dst` is valid for `len` writable bytes, kept alive and in place by a buffer
+// view held by the caller. Native code that writes to it without the GIL is not covered.
+unsafe fn write_into(
+    py: Python<'_>,
+    dst: *mut u8,
+    len: usize,
+    mut fill: impl FnMut(&mut [u8]) + Send,
+) -> PyResult<()> {
+    if len < DETACH_MIN {
+        fill(std::slice::from_raw_parts_mut(dst, len));
+        return Ok(());
+    }
+    let n = len.min(STAGE_CHUNK);
+    let mut stage: Vec<u8> = Vec::new();
+    stage.try_reserve_exact(n).map_err(|_| alloc_error())?;
+    stage.resize(n, 0);
+    let mut done = 0;
+    while done < len {
+        let take = (len - done).min(n);
+        py.detach(|| fill(&mut stage[..take]));
+        std::ptr::copy_nonoverlapping(stage.as_ptr(), dst.add(done), take);
+        done += take;
+    }
+    Ok(())
+}
 
-// Writes into a writable, C-contiguous byte buffer. From `DETACH_MIN` bytes the GIL is
-// released while writing; the held buffer view keeps the exporter alive and blocks resizing.
+// Writes into a writable, C-contiguous byte buffer, see `write_into`; the held buffer view
+// keeps the exporter alive and blocks resizing.
 pub(crate) fn fill_buffer(
     buf: &Bound<'_, pyo3::PyAny>,
-    fill: impl FnOnce(&mut [u8]) + Send,
+    fill: impl FnMut(&mut [u8]) + Send,
 ) -> PyResult<()> {
     let bad = || {
         pyo3::exceptions::PyTypeError::new_err(
@@ -70,18 +97,9 @@ pub(crate) fn fill_buffer(
     if len == 0 {
         return Ok(());
     }
-    let ptr = SendPtr(view.buf_ptr() as *mut u8);
-    // SAFETY: `view` is writable and C-contiguous, so `ptr` covers `len` consecutive bytes.
-    // `view` keeps the exporting object alive until `fill` returns.
-    if len < DETACH_MIN {
-        fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) });
-    } else {
-        buf.py().detach(move || {
-            let ptr = ptr;
-            fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) })
-        });
-    }
-    Ok(())
+    // SAFETY: `view` is writable and C-contiguous, so the pointer covers `len` consecutive
+    // bytes. `view` keeps the exporting object alive until `write_into` returns.
+    unsafe { write_into(buf.py(), view.buf_ptr() as *mut u8, len, fill) }
 }
 
 // Exported buffer, released when dropped. Dropped with the GIL held.
@@ -94,15 +112,36 @@ impl Drop for RawBuffer {
     }
 }
 
+// Whether an item format holds a Python object (`O`, also inside a struct format). A NULL
+// format means bytes. Field names of a struct format stand between colons and are skipped.
+//
+// SAFETY: `format` is NULL or points to a NUL-terminated string.
+unsafe fn has_object_items(format: *const std::os::raw::c_char) -> bool {
+    if format.is_null() {
+        return false;
+    }
+    let mut in_name = false;
+    for &c in std::ffi::CStr::from_ptr(format).to_bytes() {
+        match c {
+            b':' => in_name = !in_name,
+            b'O' if !in_name => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 // As `fill_buffer`, but for any writable, C-contiguous buffer, whatever its item format
-// (`bytearray`, `array('I')`, a numpy array of any dtype, ...). The stream bytes are written
-// as raw memory, without conversion, and the number of bytes written is returned. The GIL
-// is released from `DETACH_MIN` bytes. TypeError for an object without a buffer, a read-only
-// or non-contiguous one; TypeError, BufferError and ValueError of the exporter become this
-// TypeError, other exceptions are passed on.
+// (`bytearray`, `array('I')`, a numpy array of any dtype, ...), except one that holds Python
+// objects. The stream bytes are written as raw memory, without conversion, and the number
+// of bytes written is returned. Written as in `write_into`. TypeError for
+// an object without a buffer, a read-only, a non-contiguous or an object buffer (numpy
+// `dtype=object`): raw bytes over object pointers would corrupt the interpreter.
+// TypeError, BufferError and ValueError of the exporter become the same TypeError as for a
+// missing buffer, other exceptions are passed on.
 pub(crate) fn fill_raw_buffer(
     buf: &Bound<'_, pyo3::PyAny>,
-    fill: impl FnOnce(&mut [u8]) + Send,
+    fill: impl FnMut(&mut [u8]) + Send,
 ) -> PyResult<usize> {
     let py = buf.py();
     let bad = || {
@@ -112,8 +151,13 @@ pub(crate) fn fill_raw_buffer(
     };
     let mut view = std::mem::MaybeUninit::<pyo3::ffi::Py_buffer>::uninit();
     // SAFETY: `buf` is a live object and the GIL is held; on success `view` is initialized.
+    // `PyBUF_ND` is there because a memoryview refuses `PyBUF_FORMAT` without a shape request.
     let rc = unsafe {
-        pyo3::ffi::PyObject_GetBuffer(buf.as_ptr(), view.as_mut_ptr(), pyo3::ffi::PyBUF_WRITABLE)
+        pyo3::ffi::PyObject_GetBuffer(
+            buf.as_ptr(),
+            view.as_mut_ptr(),
+            pyo3::ffi::PyBUF_WRITABLE | pyo3::ffi::PyBUF_FORMAT | pyo3::ffi::PyBUF_ND,
+        )
     };
     if rc != 0 {
         let err = PyErr::fetch(py);
@@ -128,21 +172,19 @@ pub(crate) fn fill_raw_buffer(
     if unsafe { pyo3::ffi::PyBuffer_IsContiguous(&raw.0, b'C' as std::os::raw::c_char) } == 0 {
         return Err(bad());
     }
+    // SAFETY: `PyBUF_FORMAT` was requested, so `format` is NULL or a NUL-terminated string.
+    if unsafe { has_object_items(raw.0.format) } {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "buf must not hold Python objects",
+        ));
+    }
     let len = raw.0.len as usize;
     if len == 0 {
         return Ok(0);
     }
-    let ptr = SendPtr(raw.0.buf as *mut u8);
-    // SAFETY: the buffer was requested writable and is C-contiguous, so `ptr` covers `len`
-    // consecutive bytes. `raw` keeps the export alive until `fill` returns.
-    if len < DETACH_MIN {
-        fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) });
-    } else {
-        py.detach(move || {
-            let ptr = ptr;
-            fill(unsafe { std::slice::from_raw_parts_mut(ptr.0, len) })
-        });
-    }
+    // SAFETY: the buffer was requested writable and is C-contiguous, so the pointer covers
+    // `len` consecutive bytes. `raw` keeps the export alive until `write_into` returns.
+    unsafe { write_into(py, raw.0.buf as *mut u8, len, fill) }?;
     Ok(len)
 }
 

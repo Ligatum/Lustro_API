@@ -31,12 +31,16 @@ pub struct LustroXofPy {
 #[pymethods]
 impl LustroXofPy {
     /// `message` is bytes or a byte buffer of any length, including empty
-    /// (`bytes` is not copied, other buffers are).
+    /// (`bytes` is not copied, other buffers are). The GIL is released while absorbing
+    /// 4096 bytes or more.
     #[new]
-    pub fn new(#[pyo3(from_py_with = bytes_arg)] message: Cow<'_, [u8]>) -> Self {
-        Self {
-            inner: LustroXof::new(&message),
-        }
+    pub fn new(py: Python<'_>, #[pyo3(from_py_with = bytes_arg)] message: Cow<'_, [u8]>) -> Self {
+        let inner = if message.len() < DETACH_MIN {
+            LustroXof::new(&message)
+        } else {
+            py.detach(|| LustroXof::new(&message))
+        };
+        Self { inner }
     }
 
     /// Next 4 bytes of the stream as an unsigned integer.
@@ -137,9 +141,10 @@ impl LustroXofPy {
 
     /// Fills a writable, C-contiguous byte buffer (bytearray, writable memoryview,
     /// numpy uint8 array) in place with the next `len(buf)` bytes of the stream.
-    /// The GIL is released while writing 4096 bytes or more. Raises TypeError for any
-    /// other object, a read-only or non-contiguous buffer, or a buffer whose items are
-    /// not bytes (for other numpy dtypes pass `arr.view(numpy.uint8)`).
+    /// The GIL is released while generating 4096 bytes or more; the bytes are copied into
+    /// `buf` with the GIL held. Raises TypeError for any other object, a read-only or
+    /// non-contiguous buffer, or a buffer whose items are not bytes (for other numpy dtypes
+    /// pass `arr.view(numpy.uint8)`).
     pub fn fill_into(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<()> {
         crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
@@ -152,11 +157,12 @@ impl LustroXofPy {
 
     /// Fills a writable, C-contiguous buffer in place with the next bytes of the stream and
     /// returns the number of bytes written (`nbytes`, not the number of items). Accepts any
-    /// item format: the bytes are written as raw memory, without conversion, so for a numpy
-    /// array of another dtype the values are a reinterpretation of the stream bytes. The GIL
-    /// is released while writing 4096 bytes or more. Raises TypeError for an object without
-    /// a buffer, a read-only or a non-contiguous buffer. An empty buffer gives 0 and does
-    /// not move the stream.
+    /// item format except Python objects: the bytes are written as raw memory, without
+    /// conversion, so for a numpy array of another dtype the values are a reinterpretation of
+    /// the stream bytes. The GIL is released while generating 4096 bytes or more; the bytes
+    /// are copied into `buf` with the GIL held. Raises TypeError for an object without a
+    /// buffer, a read-only or a non-contiguous buffer, or one that holds Python objects
+    /// (numpy `dtype=object`). An empty buffer gives 0 and does not move the stream.
     pub fn readinto(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<usize> {
         crate::python::fill_raw_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
@@ -245,9 +251,11 @@ impl LustroXofPy {
 
     /// Derives an XOF from `message` along `path`:
     /// `LustroXof(message).fork(path[0]).fork(path[1])...`
-    /// `path` must not be empty (ValueError).
+    /// `path` must not be empty (ValueError). The GIL is released while absorbing 4096 bytes
+    /// or more.
     #[staticmethod]
     pub fn derive_path(
+        py: Python<'_>,
         #[pyo3(from_py_with = bytes_arg)] message: Cow<'_, [u8]>,
         #[pyo3(from_py_with = ids_arg)] path: Vec<u128>,
     ) -> PyResult<Self> {
@@ -257,9 +265,12 @@ impl LustroXofPy {
             ));
         }
         let ids: Vec<StreamId> = path.into_iter().map(StreamId).collect();
-        Ok(Self {
-            inner: LustroXof::derive_path(&message, &ids),
-        })
+        let inner = if message.len() < DETACH_MIN {
+            LustroXof::derive_path(&message, &ids)
+        } else {
+            py.detach(|| LustroXof::derive_path(&message, &ids))
+        };
+        Ok(Self { inner })
     }
 
     // State is not printed.
@@ -588,7 +599,7 @@ impl LustroXofBatchPy {
             crate::python::array_type_error("out", "a 3D numpy.ndarray of dtype uint64")
         })?;
         // Read before borrowing: `try_readwrite` itself does not touch the data.
-        let misaligned = (out.data() as usize) % std::mem::align_of::<u64>() != 0;
+        let misaligned = !(out.data() as usize).is_multiple_of(std::mem::align_of::<u64>());
         // Use the non-panicking mutable borrow API so read-only or conflicting borrows become Python errors.
         let mut out = out.try_readwrite()?;
         let n = self.inner.len();

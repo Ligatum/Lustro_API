@@ -13,7 +13,8 @@ pub use api::{configure, lustro_api_version, runtime_info};
 pub use hash::{
     hash128, hash128_many_fixed, hash128_many_fixed_into, hash128_many_var, hash128_many_var_into,
     hash256, hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into,
-    hash256_reader, LustroHasher,
+    hash256_reader, try_hash128_many_fixed, try_hash128_many_var, try_hash256_many_fixed,
+    try_hash256_many_var, LustroHasher,
 };
 pub use prng::{LustroPrng, LustroPrngBatch};
 #[cfg(feature = "entropy")]

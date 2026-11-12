@@ -157,9 +157,10 @@ impl LustroPrngPy {
 
     /// Fills a writable, C-contiguous byte buffer (bytearray, writable memoryview,
     /// numpy uint8 array) in place with the next `len(buf)` bytes of the stream.
-    /// The GIL is released while writing 4096 bytes or more. Raises TypeError for any
-    /// other object, a read-only or non-contiguous buffer, or a buffer whose items are
-    /// not bytes (for other numpy dtypes pass `arr.view(numpy.uint8)`).
+    /// The GIL is released while generating 4096 bytes or more; the bytes are copied into
+    /// `buf` with the GIL held. Raises TypeError for any other object, a read-only or
+    /// non-contiguous buffer, or a buffer whose items are not bytes (for other numpy dtypes
+    /// pass `arr.view(numpy.uint8)`).
     pub fn fill_into(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<()> {
         crate::python::fill_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
@@ -172,11 +173,12 @@ impl LustroPrngPy {
 
     /// Fills a writable, C-contiguous buffer in place with the next bytes of the stream and
     /// returns the number of bytes written (`nbytes`, not the number of items). Accepts any
-    /// item format: the bytes are written as raw memory, without conversion, so for a numpy
-    /// array of another dtype the values are a reinterpretation of the stream bytes. The GIL
-    /// is released while writing 4096 bytes or more. Raises TypeError for an object without
-    /// a buffer, a read-only or a non-contiguous buffer. An empty buffer gives 0 and does
-    /// not move the stream.
+    /// item format except Python objects: the bytes are written as raw memory, without
+    /// conversion, so for a numpy array of another dtype the values are a reinterpretation of
+    /// the stream bytes. The GIL is released while generating 4096 bytes or more; the bytes
+    /// are copied into `buf` with the GIL held. Raises TypeError for an object without a
+    /// buffer, a read-only or a non-contiguous buffer, or one that holds Python objects
+    /// (numpy `dtype=object`). An empty buffer gives 0 and does not move the stream.
     pub fn readinto(&mut self, buf: &Bound<'_, PyAny>) -> PyResult<usize> {
         crate::python::fill_raw_buffer(buf, |slice| self.inner.fill_bytes(slice))
     }
@@ -564,7 +566,7 @@ impl LustroPrngBatchPy {
             crate::python::array_type_error("out", "a 3D numpy.ndarray of dtype uint64")
         })?;
         // Read before borrowing: `try_readwrite` itself does not touch the data.
-        let misaligned = (out.data() as usize) % std::mem::align_of::<u64>() != 0;
+        let misaligned = !(out.data() as usize).is_multiple_of(std::mem::align_of::<u64>());
         // Use the non-panicking mutable borrow API so read-only or conflicting borrows become Python errors.
         let mut out = out.try_readwrite()?;
         let n = self.inner.len();

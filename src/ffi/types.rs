@@ -21,7 +21,7 @@ pub(super) unsafe fn slice_in<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T
     if len == 0 {
         return Some(&[]);
     }
-    if ptr.is_null() || (ptr as usize) % std::mem::align_of::<T>() != 0 {
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return None;
     }
     if !fits_slice::<T>(len) {
@@ -38,7 +38,7 @@ pub(super) unsafe fn slice_out<'a, T>(ptr: *mut T, len: usize) -> Option<&'a mut
     if len == 0 {
         return Some(&mut []);
     }
-    if ptr.is_null() || (ptr as usize) % std::mem::align_of::<T>() != 0 {
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return None;
     }
     if !fits_slice::<T>(len) {
@@ -135,7 +135,7 @@ pub(super) unsafe fn ctx_array<'a, T>(
     let ptrs = slice_in(ptrs, n).ok_or(LustroError::InvalidPointer)?;
     if ptrs
         .iter()
-        .any(|&p| p.is_null() || (p as usize) % std::mem::align_of::<T>() != 0)
+        .any(|&p| p.is_null() || !(p as usize).is_multiple_of(std::mem::align_of::<T>()))
     {
         return Err(LustroError::InvalidPointer);
     }
