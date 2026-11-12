@@ -39,7 +39,9 @@ fn generate_header() {
          extern \"C\" {\n\
          #endif\n\
          \n\
-         typedef enum {\n\
+         /* Fixed width, as in Rust (`#[repr(i32)]`); a C enum can be narrower, e.g. -fshort-enums. */\n\
+         typedef int32_t LustroError;\n\
+         enum {\n\
          \tLUSTRO_ERROR_OK                  = 0,\n\
          \tLUSTRO_ERROR_INVALID_LENGTH      = 1,\n\
          \tLUSTRO_ERROR_INVALID_POINTER     = 2,\n\
@@ -60,7 +62,7 @@ fn generate_header() {
          \tLUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13,\n\
          \t/* 14: snapshot import */\n\
          \tLUSTRO_ERROR_INVALID_RESERVED     = 14\n\
-         } LustroError;\n\
+         };\n\
          \n\
          /*\n\
          \x20* 128-bit values.\n\

@@ -394,7 +394,9 @@ a hash batch call, batch `fill_blocks()`/`blocks()`, or the creation of an XOF b
 (`LustroXofBatch::new`, Python `LustroXofBatch(...)`, C `lustro_xof_batch_new`). Creating a batch in any other 
 way does not fix them. `suggested_steps()`, `runtime_info()` and a single `hash256()` / `hash128()` call do not 
 fix them. A hash batch call with zero messages fixes them in Rust and Python; the C `*_many_*` functions with `n == 0` return 
-before the dispatcher and do not. When calls race, one of them wins.
+before the dispatcher and do not; the same holds for `*_batch_fill_blocks` with `n == 0` or `steps == 0`. The C
+`*_many_var` functions check the message table on the thread pool from 8192 messages, which fixes the settings even
+if the call then returns an error. When calls race, one of them wins.
 
 A later `configure()` returns `Ok` if it asks for the same effect as the fixed settings, and `AlreadyConfigured` 
 otherwise. Same effect: the same SIMD choice and, with `parallel`, the same pool size (`threads` above the CPU 
@@ -1110,7 +1112,10 @@ There are five categories:
   status is `Ok`. If `out_ctx` itself is `NULL` or misaligned, the function
   returns `InvalidPointer` and writes nothing. `out_ctx` must be valid for
   writing one pointer and must not overlap any input buffer or the memory of
-  `ctx`.
+  `ctx`. The exceptions are `lustro_hasher_clone`, `lustro_xof_absorber_clone`
+  and `lustro_xof_absorber_finalize`: they check the overlap with `ctx` first
+  and on overlap return `InvalidPointer` without writing `*out_ctx`. Callers
+  should initialize the pointer to `NULL` and check the status.
 
   | Status | Reported when |
   |---|---|
@@ -1130,14 +1135,14 @@ There are five categories:
 - **Value-returning functions** (`*_len`, `*_snapshot_size`, `*_suggested_steps`,
   `lustro_runtime_threads` → `uintptr_t`; `lustro_api_version` → `uint32_t`;
   `lustro_strerror`, `lustro_runtime_backend` → `const char*`): value returned
-  directly, no error path. `*_len`, `*_snapshot_size` and `*_suggested_steps`
-  return 0 for a `NULL` context (`*_suggested_steps` also after a caught panic);
+  directly, with no status; a caught panic gives a fallback value (below). `*_len`, `*_snapshot_size` and `*_suggested_steps`
+  return 0 for a `NULL` context (`*_suggested_steps` and `lustro_runtime_threads` also after a caught panic);
   a valid batch gets a `steps` of at least 1. For a length that does not mix up `NULL`
   and an empty batch, `*_batch_get_len(ctx, &len)` writes it through a pointer and returns
   `InvalidPointer` for a `NULL` `ctx` or `out_len`. `lustro_strerror(int32_t code)` returns a static
   NUL-terminated description, never `NULL` and not to be freed; an unknown `code`
   gives `"unknown error code"`. `lustro_runtime_backend()` returns `"scalar"` or
-  `"avx2"` under the same rules.
+  `"avx2"`, and `"unknown"` after a caught panic.
 
 - **`lustro_runtime_info(LustroRuntimeInfo *out, size_t out_size)`**
   stores the report of `runtime_info()` in `*out` and returns a
@@ -1251,7 +1256,8 @@ is determined by `n` may be `NULL`:
   `*_batch_fill_blocks` first checks `out_len == n_lanes × steps × 32`
   (so `out_len` must be 0 when the batch is empty or `steps == 0`), then
   returns `Ok` without dereferencing `out`; in that case only `out` may be
-  `NULL`. For `n > 0`, a required `NULL` pointer returns `InvalidPointer`.
+  `NULL`. It also returns before the dispatcher and does not fix the runtime
+  settings. For `n > 0`, a required `NULL` pointer returns `InvalidPointer`.
 - **Batch constructors and batch fork operations** (`*_batch_new`,
   `*_batch_new_range`, `*_batch_fork_many`, etc.): with the relevant count
   at 0 (`n`, `count`, or `k` for `*_batch_fork_many`), the function returns `Ok`
@@ -1366,7 +1372,9 @@ and do not depend on the host byte order.
 5. **FFI/Python panic handling.** All release builds use `panic = "unwind"`. 
    FFI functions that are panic-guarded catch internal unwinds and return their 
    documented failure value: `LustroError::InternalPanic` for error-returning 
-   functions, constructors included (`*out_ctx` stays `NULL`). Python bindings require
+   functions, constructors included (`*out_ctx` stays `NULL`). `InternalPanic` is not
+   transactional: after it the state of the context and of the output buffer is
+   unspecified, and the context should not be used again. Python bindings require
    `panic = "unwind"` so that Rust panics can be translated at the boundary;
    they surface as `pyo3_runtime.PanicException`, which derives from
    `BaseException`, not `Exception`.

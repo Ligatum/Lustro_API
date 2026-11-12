@@ -5,7 +5,9 @@
 extern "C" {
 #endif
 
-typedef enum {
+/* Fixed width, as in Rust (`#[repr(i32)]`); a C enum can be narrower, e.g. -fshort-enums. */
+typedef int32_t LustroError;
+enum {
 	LUSTRO_ERROR_OK                  = 0,
 	LUSTRO_ERROR_INVALID_LENGTH      = 1,
 	LUSTRO_ERROR_INVALID_POINTER     = 2,
@@ -26,7 +28,7 @@ typedef enum {
 	LUSTRO_ERROR_ENTROPY_UNAVAILABLE  = 13,
 	/* 14: snapshot import */
 	LUSTRO_ERROR_INVALID_RESERVED     = 14
-} LustroError;
+};
 
 /*
  * 128-bit values.
@@ -224,14 +226,15 @@ uint32_t lustro_api_version(void);
  * `0` means parallelism is disabled by settings or the crate was built without `parallel`.
  * This call does not start the pool and fixes nothing, like `lustro_runtime_info`. If
  * initialization fails, or this process inherited a pool-owner PID from its parent
- * through `fork`, batches fall back to the calling thread.
+ * through `fork`, batches fall back to the calling thread. Returns `0` also after a
+ * caught internal panic.
  */
 uintptr_t lustro_runtime_threads(void);
 
 /**
  * Returns the backend for batches of streams and hashes as a static NUL-terminated
  * string ("scalar" or "avx2"). Never NULL; do not free. Fixes nothing, like
- * `lustro_runtime_info`.
+ * `lustro_runtime_info`. Returns "unknown" after a caught internal panic.
  */
 const char *lustro_runtime_backend(void);
 
