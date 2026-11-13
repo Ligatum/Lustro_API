@@ -162,3 +162,11 @@ pub(super) fn ranges_overlap(
     let b_end = b_start.checked_add(b_len)?;
     Some(a_start < b_end && b_start < a_end)
 }
+
+/// Whether `[out, out + out_len)` is disjoint from the context object `*ctx` itself.
+/// Memory that the context owns on the heap (batch lanes) is not covered. Pointers are not
+/// validated: callers reject NULL separately.
+#[inline]
+pub(super) fn disjoint_from_ctx<T>(out: *const u8, out_len: usize, ctx: *const T) -> bool {
+    ranges_overlap(out, out_len, ctx as *const u8, std::mem::size_of::<T>()) == Some(false)
+}

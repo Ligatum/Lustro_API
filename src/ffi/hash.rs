@@ -286,7 +286,7 @@ pub unsafe extern "C" fn lustro_hasher_clone(
     ctx: *const LustroHasher,
     out_ctx: *mut *mut LustroHasher,
 ) -> LustroError {
-    // `construct` writes NULL to `*out_ctx` first, which would overwrite part of the source.
+    // An `out_ctx` inside the source is rejected, as documented.
     if !ctx.is_null() {
         let ctx_len = std::mem::size_of::<LustroHasher>();
         let slot = std::mem::size_of::<*mut LustroHasher>();

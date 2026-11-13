@@ -19,6 +19,7 @@ dynamic = ["version", "description"]
 numpy = ["numpy"]
 
 [project.urls]
-FAQ        = "https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md"
-Repository = "https://github.com/Ligatum/Lustro_API"
-Homepage   = "https://github.com/Ligatum/Lustro"
+FAQ           = "https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md"
+Repository    = "https://github.com/Ligatum/Lustro_API"
+Homepage      = "https://github.com/Ligatum/Lustro"
+Documentation = "https://github.com/Ligatum/Lustro_API/blob/main/ARCHITECTURE.md"

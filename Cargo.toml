@@ -1,6 +1,6 @@
 [package]
 name         = "lustro"
-version      = "1.0.0"
+version      = "1.0.1"
 edition      = "2021"
 rust-version = "1.90"
 description  = "Lustro V1 is a 256-bit deterministic, single-pass diffusion engine with HASH/PRNG/XOF capabilities, providing live state-forking (stream tree branching)"

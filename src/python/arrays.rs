@@ -1,8 +1,7 @@
 //! Python bindings: NumPy output helpers.
 //! New uint64 arrays for stream output and the block/word conversions.
 
-use super::alloc_error;
-use numpy::{PyArray1, PyArray3, PyArrayMethods};
+use numpy::{Ix1, Ix3, PyArray, PyArray1, PyArray3, PyArrayDescrMethods, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 
@@ -56,12 +55,26 @@ pub(crate) fn require_numpy(py: Python<'_>) -> PyResult<()> {
         })
 }
 
-// Zeroed words for a new array; MemoryError if they cannot be reserved.
-fn new_words(len: usize) -> PyResult<Vec<u64>> {
-    let mut words = Vec::new();
-    words.try_reserve_exact(len).map_err(|_| alloc_error())?;
-    words.resize(len, 0);
-    Ok(words)
+// New zeroed C-contiguous array of the given shape. `PyArray::zeros` panics when NumPy fails
+// and `PyArray::from_vec` does not check the allocation; this calls `PyArray_Zeros` directly
+// and passes a failure on as the exception NumPy set (MemoryError). The array owns its memory,
+// so the stream is written straight into it.
+fn zeroed<'py, T: numpy::Element, D: numpy::ndarray::Dimension>(
+    py: Python<'py>,
+    dims: &mut [numpy::npyffi::npy_intp],
+) -> PyResult<Bound<'py, PyArray<T, D>>> {
+    // SAFETY: the GIL is held; `dims` is valid for `dims.len()` entries; `PyArray_Zeros` takes
+    // over the dtype reference and returns a new reference or NULL with an exception set.
+    unsafe {
+        let ptr = numpy::npyffi::PY_ARRAY_API.PyArray_Zeros(
+            py,
+            dims.len() as std::os::raw::c_int,
+            dims.as_mut_ptr(),
+            T::get_dtype(py).into_dtype_ptr(),
+            0,
+        );
+        Ok(Bound::from_owned_ptr_or_err(py, ptr)?.cast_into_unchecked())
+    }
 }
 
 // Stream bytes are written into the words' memory as is; this turns them into values.
@@ -75,9 +88,9 @@ fn words_from_le(words: &mut [u64]) {
 }
 
 // New uint64 array of shape `(n,)` with the next `n` stream words, as `next_u64()` returns them.
-// The size check, the NumPy check and the buffer allocation come before `fill`, so their
-// failures leave the state untouched. Array construction happens after `fill`.
-// The GIL is released while `fill` runs, from 4096 bytes.
+// The size check, the NumPy check and the array allocation come before `fill`, so their
+// failures leave the state untouched. `fill` writes into the new array, which nothing else
+// references yet. The GIL is released while `fill` runs, from 4096 bytes.
 pub(crate) fn u64_array<'py>(
     py: Python<'py>,
     n: usize,
@@ -89,25 +102,28 @@ pub(crate) fn u64_array<'py>(
         ));
     }
     require_numpy(py)?;
-    let mut words = new_words(n)?;
+    let arr = zeroed::<u64, Ix1>(py, &mut [n as numpy::npyffi::npy_intp])?;
     if n != 0 {
-        // SAFETY: the byte view covers exactly the memory of `words`; any bit pattern
-        // is a valid u8 and u64.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, n * 8) };
+        let ptr = arr.data();
+        // SAFETY: a new C-contiguous array holds `n` consecutive aligned u64 and nothing else
+        // references it, so nothing reads or writes it while the GIL is released; any bit
+        // pattern is a valid u8 and u64.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, n * 8) };
         if n * 8 < crate::python::DETACH_MIN {
             fill(bytes);
         } else {
             py.detach(|| fill(bytes));
         }
-        words_from_le(&mut words);
+        // SAFETY: as above; `bytes` is no longer used.
+        words_from_le(unsafe { std::slice::from_raw_parts_mut(ptr, n) });
     }
-    Ok(PyArray1::from_vec(py, words))
+    Ok(arr)
 }
 
 // New uint64 array of shape `(steps, lanes, 4)` laid out as `fill_blocks()` writes it.
-// The size checks, the NumPy check and the buffer allocation come before `fill`, so their
-// failures leave the state untouched. Array construction and reshape happen after `fill`.
-// The GIL is released while `fill` runs.
+// The size checks, the NumPy check and the array allocation come before `fill`, so their
+// failures leave the state untouched. `fill` writes into the new array, which nothing else
+// references yet. The GIL is released while `fill` runs.
 pub(crate) fn blocks_array<'py>(
     py: Python<'py>,
     lanes: usize,
@@ -129,24 +145,26 @@ pub(crate) fn blocks_array<'py>(
         return Err(too_big());
     }
     require_numpy(py)?;
-    let mut words = new_words(blocks * 4)?;
+    let dim = |v: usize| numpy::npyffi::npy_intp::try_from(v).map_err(|_| too_big());
+    let mut dims = [dim(steps)?, dim(lanes)?, 4];
+    // Besides MemoryError, NumPy refuses a shape it cannot hold with ValueError (an empty batch
+    // with a very large `steps`).
+    let arr = zeroed::<u64, Ix3>(py, &mut dims).map_err(|e| {
+        if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) {
+            too_big()
+        } else {
+            e
+        }
+    })?;
     if blocks != 0 {
-        // SAFETY: `[u8; 32]` has alignment 1 and the view covers exactly the memory of
-        // `words` (4 words per block); any bit pattern is valid.
-        let view =
-            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut [u8; 32], blocks) };
+        let ptr = arr.data();
+        // SAFETY: a new C-contiguous array holds `blocks * 4` consecutive aligned u64 and nothing
+        // else references it, so nothing reads or writes it while the GIL is released;
+        // `[u8; 32]` has alignment 1 and any bit pattern is valid.
+        let view = unsafe { std::slice::from_raw_parts_mut(ptr as *mut [u8; 32], blocks) };
         py.detach(|| fill(view));
-        words_from_le(&mut words);
+        // SAFETY: as above; `view` is no longer used.
+        words_from_le(unsafe { std::slice::from_raw_parts_mut(ptr, blocks * 4) });
     }
-    // The element count matches the shape, so only a dimension NumPy cannot hold fails here
-    // (an empty batch with a very large `steps`).
-    PyArray1::from_vec(py, words)
-        .reshape([steps, lanes, 4])
-        .map_err(|e| {
-            if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) {
-                too_big()
-            } else {
-                e
-            }
-        })
+    Ok(arr)
 }

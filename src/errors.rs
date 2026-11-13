@@ -10,8 +10,9 @@ pub enum LustroError {
     Ok = 0,
     /// Length or size argument is invalid.
     InvalidLength = 1,
-    /// Required pointer is NULL or misaligned (hash functions, `lustro_hasher_*` and
-    /// `lustro_xof_absorber_*`: ranges overlap).
+    /// Required pointer is NULL or misaligned (hash functions, `lustro_hasher_*`,
+    /// `lustro_xof_absorber_*`, the `out` of the PRNG/XOF context functions, and the `out_ctx`
+    /// of the constructors that take a source context: ranges overlap).
     InvalidPointer = 2,
     /// Reserved, not returned by V1 (`InvalidLength` is used instead).
     OutputTooSmall = 3,

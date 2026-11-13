@@ -6,8 +6,10 @@ use crate::prng::LustroPrng;
 use crate::prng::LustroPrngBatch;
 use crate::types::{Seed256, StreamId, LUSTRO_SNAPSHOT_LEN};
 
-use super::types::{buf_in, buf_out, bytes_in, ctx_array, fits_slice, ids_from_parts, slice_out};
-use super::{construct, guarded};
+use super::types::{
+    buf_in, buf_out, bytes_in, ctx_array, disjoint_from_ctx, fits_slice, ids_from_parts, slice_out,
+};
+use super::{construct, construct_from, construct_from_streams, guarded};
 
 // ==========================================
 // FFI STREAM SINGLE API
@@ -106,6 +108,9 @@ pub unsafe extern "C" fn lustro_prng_next_u32(ctx: *mut LustroPrng, out: *mut u3
         if ctx.is_null() || out.is_null() {
             return LustroError::InvalidPointer;
         }
+        if !disjoint_from_ctx(out as *const u8, 4, ctx) {
+            return LustroError::InvalidPointer;
+        }
         let prng = &mut *ctx;
 
         let val = prng.next_u32();
@@ -127,6 +132,9 @@ pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u6
         if ctx.is_null() || out.is_null() {
             return LustroError::InvalidPointer;
         }
+        if !disjoint_from_ctx(out as *const u8, 8, ctx) {
+            return LustroError::InvalidPointer;
+        }
         let prng = &mut *ctx;
 
         let val = prng.next_u64();
@@ -146,6 +154,9 @@ pub unsafe extern "C" fn lustro_prng_next_u64(ctx: *mut LustroPrng, out: *mut u6
 pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !disjoint_from_ctx(out as *const u8, 16, ctx) {
             return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, 16) {
@@ -170,6 +181,9 @@ pub unsafe extern "C" fn lustro_prng_next_u128(ctx: *mut LustroPrng, out: *mut u
 pub unsafe extern "C" fn lustro_prng_next_block(ctx: *mut LustroPrng, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !disjoint_from_ctx(out as *const u8, 32, ctx) {
             return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, 32) {
@@ -203,6 +217,9 @@ pub unsafe extern "C" fn lustro_prng_fill(
         }
         if !fits_slice::<u8>(out_len) {
             return LustroError::InvalidLength;
+        }
+        if !disjoint_from_ctx(out as *const u8, out_len, ctx) {
+            return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, out_len) {
             Some(s) => s,
@@ -264,6 +281,9 @@ pub unsafe extern "C" fn lustro_prng_position(ctx: *const LustroPrng, out: *mut 
         if ctx.is_null() {
             return LustroError::InvalidPointer;
         }
+        if !disjoint_from_ctx(out as *const u8, 16, ctx) {
+            return LustroError::InvalidPointer;
+        }
         let output = match buf_out(out, 16) {
             Some(s) => s,
             None => return LustroError::InvalidPointer,
@@ -281,13 +301,14 @@ pub unsafe extern "C" fn lustro_prng_position(ctx: *const LustroPrng, out: *mut 
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_clone(
     ctx: *const LustroPrng,
     out_ctx: *mut *mut LustroPrng,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -305,7 +326,8 @@ pub unsafe extern "C" fn lustro_prng_clone(
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fork(
     ctx: *const LustroPrng,
@@ -313,7 +335,7 @@ pub unsafe extern "C" fn lustro_prng_fork(
     id_lo: u64,
     out_ctx: *mut *mut LustroPrng,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -334,7 +356,8 @@ pub unsafe extern "C" fn lustro_prng_fork(
 /// is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fork_batch(
     ctx: *const LustroPrng,
@@ -343,7 +366,7 @@ pub unsafe extern "C" fn lustro_prng_fork_batch(
     n: usize,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -362,7 +385,8 @@ pub unsafe extern "C" fn lustro_prng_fork_batch(
 /// If `ctx` is non-null, it must point to a live `LustroPrng` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fork_batch_range(
     ctx: *const LustroPrng,
@@ -371,7 +395,7 @@ pub unsafe extern "C" fn lustro_prng_fork_batch_range(
     count: usize,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -394,7 +418,8 @@ pub unsafe extern "C" fn lustro_prng_fork_batch_range(
 /// is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_fork_path(
     ctx: *const LustroPrng,
@@ -403,7 +428,7 @@ pub unsafe extern "C" fn lustro_prng_fork_path(
     n: usize,
     out_ctx: *mut *mut LustroPrng,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -467,6 +492,9 @@ pub unsafe extern "C" fn lustro_prng_export_snapshot(
         }
         if out_len != LUSTRO_SNAPSHOT_LEN {
             return LustroError::InvalidLength;
+        }
+        if !disjoint_from_ctx(out as *const u8, LUSTRO_SNAPSHOT_LEN, ctx) {
+            return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, LUSTRO_SNAPSHOT_LEN) {
             Some(s) => s,
@@ -587,13 +615,14 @@ pub unsafe extern "C" fn lustro_prng_batch_free(ctx: *mut LustroPrngBatch) {
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_clone(
     ctx: *const LustroPrngBatch,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -610,14 +639,15 @@ pub unsafe extern "C" fn lustro_prng_batch_clone(
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_lane(
     ctx: *const LustroPrngBatch,
     index: usize,
     out_ctx: *mut *mut LustroPrng,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -638,14 +668,15 @@ pub unsafe extern "C" fn lustro_prng_batch_lane(
 /// `LustroPrng` context that is not mutably accessed or freed during the call. The same context
 /// may appear more than once.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of the contexts.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of one of the
+/// contexts is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_from_streams(
     streams: *const *const LustroPrng,
     n: usize,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from_streams(streams, n, out_ctx, || {
         let streams = ctx_array(streams, n)?;
         LustroPrngBatch::try_from_stream_refs(streams.iter().map(|&p| &*p))
             .map_err(LustroError::from)
@@ -681,6 +712,9 @@ pub unsafe extern "C" fn lustro_prng_batch_get_len(
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() || out_len.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !disjoint_from_ctx(out_len as *const u8, std::mem::size_of::<usize>(), ctx) {
             return LustroError::InvalidPointer;
         }
         core::ptr::write_unaligned(out_len, (*ctx).len());
@@ -725,8 +759,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
         if ctx.is_null() {
             return LustroError::InvalidPointer;
         }
-        let batch = &mut *ctx;
-        let n = batch.len();
+        let n = (*ctx).len();
 
         let expected_len = match n.checked_mul(steps).and_then(|v| v.checked_mul(32)) {
             Some(v) => v,
@@ -746,6 +779,10 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
             return LustroError::InvalidLength;
         }
 
+        if !disjoint_from_ctx(out as *const u8, out_len, ctx) {
+            return LustroError::InvalidPointer;
+        }
+        let batch = &mut *ctx;
         let n_blocks = n * steps;
         // SAFETY: `out_len` was validated for `n * steps * 32` bytes.
         let out_blocks: &mut [[u8; 32]] = match slice_out(out as *mut [u8; 32], n_blocks) {
@@ -772,7 +809,8 @@ pub unsafe extern "C" fn lustro_prng_batch_fill_blocks(
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
 /// when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork(
     ctx: *const LustroPrngBatch,
@@ -781,7 +819,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
     n: usize,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -808,7 +846,8 @@ pub unsafe extern "C" fn lustro_prng_batch_fork(
 /// `ids_hi` and `ids_lo` must each be valid for `k` readable elements
 /// when `k > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     ctx: *const LustroPrngBatch,
@@ -817,7 +856,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_many(
     k: usize,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -879,7 +918,8 @@ pub unsafe extern "C" fn lustro_prng_batch_derive_path(
 /// If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_prng_batch_fork_range(
     ctx: *const LustroPrngBatch,
@@ -887,7 +927,7 @@ pub unsafe extern "C" fn lustro_prng_batch_fork_range(
     first_lo: u64,
     out_ctx: *mut *mut LustroPrngBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -942,6 +982,9 @@ pub unsafe extern "C" fn lustro_prng_batch_export_snapshot(
         };
         if out_len != expected_len {
             return LustroError::InvalidLength;
+        }
+        if !disjoint_from_ctx(out as *const u8, expected_len, ctx) {
+            return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, expected_len) {
             Some(s) => s,

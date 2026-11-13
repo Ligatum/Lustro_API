@@ -7,10 +7,10 @@ use crate::xof::LustroXofAbsorber;
 use crate::xof::LustroXofBatch;
 
 use super::types::{
-    buf_in, buf_out, bytes_in, ctx_array, fits_slice, ids_from_parts, messages_from_parts,
-    ranges_overlap, slice_out,
+    buf_in, buf_out, bytes_in, ctx_array, disjoint_from_ctx, fits_slice, ids_from_parts,
+    messages_from_parts, ranges_overlap, slice_out,
 };
-use super::{construct, guarded};
+use super::{construct, construct_from, construct_from_streams, guarded};
 
 // ==========================================
 // FFI XOF SINGLE API
@@ -66,6 +66,9 @@ pub unsafe extern "C" fn lustro_xof_next_u32(ctx: *mut LustroXof, out: *mut u32)
         if ctx.is_null() || out.is_null() {
             return LustroError::InvalidPointer;
         }
+        if !disjoint_from_ctx(out as *const u8, 4, ctx) {
+            return LustroError::InvalidPointer;
+        }
         let xof = &mut *ctx;
 
         let val = xof.next_u32();
@@ -87,6 +90,9 @@ pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64)
         if ctx.is_null() || out.is_null() {
             return LustroError::InvalidPointer;
         }
+        if !disjoint_from_ctx(out as *const u8, 8, ctx) {
+            return LustroError::InvalidPointer;
+        }
         let xof = &mut *ctx;
 
         let val = xof.next_u64();
@@ -106,6 +112,9 @@ pub unsafe extern "C" fn lustro_xof_next_u64(ctx: *mut LustroXof, out: *mut u64)
 pub unsafe extern "C" fn lustro_xof_next_u128(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !disjoint_from_ctx(out as *const u8, 16, ctx) {
             return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, 16) {
@@ -130,6 +139,9 @@ pub unsafe extern "C" fn lustro_xof_next_u128(ctx: *mut LustroXof, out: *mut u8)
 pub unsafe extern "C" fn lustro_xof_next_block(ctx: *mut LustroXof, out: *mut u8) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !disjoint_from_ctx(out as *const u8, 32, ctx) {
             return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, 32) {
@@ -163,6 +175,9 @@ pub unsafe extern "C" fn lustro_xof_fill(
         }
         if !fits_slice::<u8>(out_len) {
             return LustroError::InvalidLength;
+        }
+        if !disjoint_from_ctx(out as *const u8, out_len, ctx) {
+            return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, out_len) {
             Some(s) => s,
@@ -226,6 +241,9 @@ pub unsafe extern "C" fn lustro_xof_position(ctx: *const LustroXof, out: *mut u8
         if ctx.is_null() {
             return LustroError::InvalidPointer;
         }
+        if !disjoint_from_ctx(out as *const u8, 16, ctx) {
+            return LustroError::InvalidPointer;
+        }
         let output = match buf_out(out, 16) {
             Some(s) => s,
             None => return LustroError::InvalidPointer,
@@ -243,13 +261,14 @@ pub unsafe extern "C" fn lustro_xof_position(ctx: *const LustroXof, out: *mut u8
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_clone(
     ctx: *const LustroXof,
     out_ctx: *mut *mut LustroXof,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -267,7 +286,8 @@ pub unsafe extern "C" fn lustro_xof_clone(
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork(
     ctx: *const LustroXof,
@@ -275,7 +295,7 @@ pub unsafe extern "C" fn lustro_xof_fork(
     id_lo: u64,
     out_ctx: *mut *mut LustroXof,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -296,7 +316,8 @@ pub unsafe extern "C" fn lustro_xof_fork(
 /// is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork_batch(
     ctx: *const LustroXof,
@@ -305,7 +326,7 @@ pub unsafe extern "C" fn lustro_xof_fork_batch(
     n: usize,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -324,7 +345,8 @@ pub unsafe extern "C" fn lustro_xof_fork_batch(
 /// If `ctx` is non-null, it must point to a live `LustroXof` context that
 /// is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork_batch_range(
     ctx: *const LustroXof,
@@ -333,7 +355,7 @@ pub unsafe extern "C" fn lustro_xof_fork_batch_range(
     count: usize,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -356,7 +378,8 @@ pub unsafe extern "C" fn lustro_xof_fork_batch_range(
 /// is not mutably accessed or freed during the call.
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_fork_path(
     ctx: *const LustroXof,
@@ -365,7 +388,7 @@ pub unsafe extern "C" fn lustro_xof_fork_path(
     n: usize,
     out_ctx: *mut *mut LustroXof,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -429,6 +452,9 @@ pub unsafe extern "C" fn lustro_xof_export_snapshot(
         }
         if out_len != LUSTRO_SNAPSHOT_LEN {
             return LustroError::InvalidLength;
+        }
+        if !disjoint_from_ctx(out as *const u8, LUSTRO_SNAPSHOT_LEN, ctx) {
+            return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, LUSTRO_SNAPSHOT_LEN) {
             Some(s) => s,
@@ -554,7 +580,7 @@ pub unsafe extern "C" fn lustro_xof_absorber_finalize(
     ctx: *const LustroXofAbsorber,
     out_ctx: *mut *mut LustroXof,
 ) -> LustroError {
-    // `construct` writes NULL to `*out_ctx` first, which would overwrite part of the absorber.
+    // An `out_ctx` inside the absorber is rejected, as documented.
     if !ctx.is_null() {
         let ctx_len = std::mem::size_of::<LustroXofAbsorber>();
         let slot = std::mem::size_of::<*mut LustroXof>();
@@ -612,7 +638,7 @@ pub unsafe extern "C" fn lustro_xof_absorber_clone(
     ctx: *const LustroXofAbsorber,
     out_ctx: *mut *mut LustroXofAbsorber,
 ) -> LustroError {
-    // `construct` writes NULL to `*out_ctx` first, which would overwrite part of the source.
+    // An `out_ctx` inside the source is rejected, as documented.
     if !ctx.is_null() {
         let ctx_len = std::mem::size_of::<LustroXofAbsorber>();
         let slot = std::mem::size_of::<*mut LustroXofAbsorber>();
@@ -687,13 +713,14 @@ pub unsafe extern "C" fn lustro_xof_batch_free(ctx: *mut LustroXofBatch) {
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of one of the
+/// contexts is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_clone(
     ctx: *const LustroXofBatch,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -710,14 +737,15 @@ pub unsafe extern "C" fn lustro_xof_batch_clone(
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_lane(
     ctx: *const LustroXofBatch,
     index: usize,
     out_ctx: *mut *mut LustroXof,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -738,14 +766,15 @@ pub unsafe extern "C" fn lustro_xof_batch_lane(
 /// `LustroXof` context that is not mutably accessed or freed during the call. The same context
 /// may appear more than once.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of the contexts.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_from_streams(
     streams: *const *const LustroXof,
     n: usize,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from_streams(streams, n, out_ctx, || {
         let streams = ctx_array(streams, n)?;
         LustroXofBatch::try_from_stream_refs(streams.iter().map(|&p| &*p))
             .map_err(LustroError::from)
@@ -781,6 +810,9 @@ pub unsafe extern "C" fn lustro_xof_batch_get_len(
 ) -> LustroError {
     guarded(LustroError::InternalPanic, || {
         if ctx.is_null() || out_len.is_null() {
+            return LustroError::InvalidPointer;
+        }
+        if !disjoint_from_ctx(out_len as *const u8, std::mem::size_of::<usize>(), ctx) {
             return LustroError::InvalidPointer;
         }
         core::ptr::write_unaligned(out_len, (*ctx).len());
@@ -825,8 +857,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
         if ctx.is_null() {
             return LustroError::InvalidPointer;
         }
-        let batch = &mut *ctx;
-        let n = batch.len();
+        let n = (*ctx).len();
 
         let expected_len = match n.checked_mul(steps).and_then(|v| v.checked_mul(32)) {
             Some(v) => v,
@@ -846,6 +877,10 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
             return LustroError::InvalidLength;
         }
 
+        if !disjoint_from_ctx(out as *const u8, out_len, ctx) {
+            return LustroError::InvalidPointer;
+        }
+        let batch = &mut *ctx;
         let n_blocks = n * steps;
         // SAFETY: `out_len` was validated for `n_blocks * 32` bytes.
         let out_blocks: &mut [[u8; 32]] = match slice_out(out as *mut [u8; 32], n_blocks) {
@@ -872,7 +907,8 @@ pub unsafe extern "C" fn lustro_xof_batch_fill_blocks(
 /// `ids_hi` and `ids_lo` must each be valid for `n` readable elements
 /// when `n > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork(
     ctx: *const LustroXofBatch,
@@ -881,7 +917,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
     n: usize,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -908,7 +944,8 @@ pub unsafe extern "C" fn lustro_xof_batch_fork(
 /// `ids_hi` and `ids_lo` must each be valid for `k` readable elements
 /// when `k > 0`.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     ctx: *const LustroXofBatch,
@@ -917,7 +954,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_many(
     k: usize,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -980,7 +1017,8 @@ pub unsafe extern "C" fn lustro_xof_batch_derive_path(
 /// If `ctx` is non-null, it must point to a live `LustroXofBatch` context
 /// that is not mutably accessed or freed during the call.
 /// If `out_ctx` is non-null, it must be valid for writing one pointer
-/// and must not overlap any input buffer or the memory of `ctx`.
+/// and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+/// is `InvalidPointer`, and then `*out_ctx` is not written.
 #[no_mangle]
 pub unsafe extern "C" fn lustro_xof_batch_fork_range(
     ctx: *const LustroXofBatch,
@@ -988,7 +1026,7 @@ pub unsafe extern "C" fn lustro_xof_batch_fork_range(
     first_lo: u64,
     out_ctx: *mut *mut LustroXofBatch,
 ) -> LustroError {
-    construct(out_ctx, || {
+    construct_from(ctx, out_ctx, || {
         if ctx.is_null() {
             return Err(LustroError::InvalidPointer);
         }
@@ -1043,6 +1081,9 @@ pub unsafe extern "C" fn lustro_xof_batch_export_snapshot(
         };
         if out_len != expected_len {
             return LustroError::InvalidLength;
+        }
+        if !disjoint_from_ctx(out as *const u8, expected_len, ctx) {
+            return LustroError::InvalidPointer;
         }
         let output = match buf_out(out, expected_len) {
             Some(s) => s,

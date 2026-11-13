@@ -1,8 +1,8 @@
 """
 Lustro speed test, normalized per engine round. One script, three targets (python has four variants):
   rust    the native API, examples/speed.rs run as a separate process per measurement
-  python  the `lustro` module (NumPy), GIL held for the whole call (release_gil=False),
-          input read in place, output written in place into a preallocated buffer
+  python  the `lustro` module (NumPy), release_gil=False, input read in place,
+          output written in place into a preallocated buffer
   python-rel  the same calls with the default release_gil=True
   python-flat  as python, but HASH_VAR passes one buffer and an offsets array
           (hash256_many_offsets_into) instead of a list of bytes
@@ -1269,51 +1269,35 @@ def main():
         fn(mode)
 
     target_notes = {
-        "rust": "Target rust: the native API, called from examples/speed.rs; this script only starts it and\n"
-        "reads p50 / p95 back, the timing loop runs inside that process. Input and output are\n"
-        "preallocated: HASH_* hash256_many_fixed_into on contiguous bytes, HASH_VAR\n"
-        "hash256_many_var_into on a prebuilt slice table, *_BATCH fill_blocks into [[u8; 32]],\n"
-        "*_FILL fill_bytes into a Vec<u8>. Message bytes come from a fixed-seed generator; HASH_VAR\n"
-        "lengths are the ones the other targets use. The worker is a fresh process per row, as for\n"
-        "the other targets, and the *_MULTI rows start one worker per stream.\n"
-        "Small calls and single-stream rows (*_FILL) include only the call itself.\n",
-        "python": "Target python: every call runs with the GIL held (release_gil=False); other Python threads wait.\n"
-        "Input and output are preallocated and used in place: HASH_* hash256_many_fixed_into on an\n"
-        "(N, msg_len) uint8 array, HASH_VAR hash256_many_var_into on a list of bytes, *_BATCH\n"
-        "fill_blocks into a (steps, N, 4) uint64 array, *_FILL fill_into a bytearray.\n"
-        "Small calls and single-stream rows (*_FILL) include Python call overhead.\n",
-        "python-rel": "Target python-rel: the same calls as target python with the default release_gil=True: the GIL is\n"
-        "released while the library works, so other Python threads can run. HASH_* copy the input\n"
-        "rows first, HASH_VAR reads the list on the calling thread before the GIL is released.\n"
-        "*_FILL rows are the same calls as for target python (fill_into has no release_gil).\n",
-        "python-flat": "Target python-flat: the same as target python (release_gil=False), except HASH_VAR: it calls\n"
-        "hash256_many_offsets_into on one bytes buffer and an int64 offsets array (built outside the\n"
-        "timing), with no per-message Python object. Other rows are the same calls as for target python.\n",
-        "python-flat-rel": "Target python-flat-rel: the same as target python-flat with the default release_gil=True. HASH_VAR\n"
-        "calls hash256_many_offsets_into on one bytes buffer and an int64 offsets array (built outside the\n"
-        "timing); the offsets are copied and the digests go through a scratch buffer into out. Other rows are\n"
-        "the same calls as for target python-rel.\n",
-        "c": "Target c: ctypes calls into lustro.dll; input and output are preallocated ctypes buffers,\n"
-        "HASH_VAR uses a prebuilt pointer/length table.\n"
-        "Small calls and single-stream rows (*_FILL) include ctypes call overhead.\n",
+        "rust": "Target rust: examples/speed.rs, a fresh process per row; this script only reads p50 / p95\n"
+        "back. Buffers are preallocated, *_MULTI starts one worker per stream.\n",
+        "python": "Target python: release_gil=False, other Python threads wait during a call. Buffers are\n"
+        "preallocated and used in place. *_FILL (fill_into) has no release_gil and releases the\n"
+        "GIL for 4096 bytes or more regardless. Small calls include Python call overhead.\n",
+        "python-rel": "Target python-rel: as python with the default release_gil=True. HASH_* work on a copy of\n"
+        "the input. *_FILL rows are the same calls as for python.\n",
+        "python-flat": "Target python-flat: as python, except HASH_VAR: hash256_many_offsets_into on one bytes\n"
+        "buffer and an int64 offsets array (built outside the timing), no per-message object.\n",
+        "python-flat-rel": "Target python-flat-rel: as python-flat with release_gil=True. The offsets are copied and\n"
+        "the digests go through a scratch buffer into out. Other rows as for python-rel.\n",
+        "c": "Target c: ctypes calls, preallocated ctypes buffers, HASH_VAR from a prebuilt pointer/length\n"
+        "table. Small calls and *_FILL include ctypes call overhead.\n",
     }
     target_note = target_notes[TARGET]
     print("\n" + "=" * width)
     print(
         "ns/round is per engine round, comparable across tables.\n"
         "Data rate: input bytes for HASH rows, output bytes for stream rows.\n"
-        "Steps: value suggested by the library for that N.\n"
+        "Steps: suggested by the library for that N.\n"
         + target_note +
-        "Calls are timed back to back, so the thread pool stays active between them.\n"
-        "Variants: scalar = AVX2 off, st = Rayon off. Side by side: vs ST = p50 with Rayon off /\n"
-        "p50 of auto (compare), vs scalar = p50 with AVX2 off / p50 of auto (simd).\n"
-        "AVX2 is used for stream batches of 4 or more lanes and for hash batches (fixed and var)\n"
-        "of 4 or more messages; single streams are scalar.\n"
-        "HASH_VAR / VAR_L rows: lengths uniform in 0..2*mean; Rounds and Data rate follow the actual\n"
-        "lengths, ns/round is per actual round.\n"
-        "Multi-stream: ns/round agg = wall time per round over all procs, ns/round proc = mean\n"
-        "per proc, Scaling = agg / (procs * agg at 1 proc), Min/Max = slowest / fastest proc.\n"
-        "Procs are logical threads, SMT and clocks lower Scaling above the physical core count."
+        "Calls run back to back, so the thread pool stays active between them.\n"
+        "scalar = AVX2 off, st = Rayon off. vs ST = p50 (Rayon off) / p50 (auto), vs scalar =\n"
+        "p50 (AVX2 off) / p50 (auto). AVX2 is used for stream batches of 4+ lanes and hash batches\n"
+        "of 4+ messages; single streams are scalar.\n"
+        "HASH_VAR / VAR_L: lengths uniform in 0..2*mean, Rounds and Data rate follow the actual lengths.\n"
+        "Multi: ns/round agg = wall time per round over all procs, ns/round proc = mean per proc,\n"
+        "Scaling = agg / (procs * agg at 1 proc), Min/Max = slowest / fastest proc.\n"
+        "Procs are logical threads, SMT and clocks lower Scaling past the physical core count."
     )
     print("=" * width)
 

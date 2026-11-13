@@ -29,15 +29,64 @@ pub(crate) unsafe fn construct<T>(
     if out_ctx.is_null() || !(out_ctx as usize).is_multiple_of(std::mem::align_of::<*mut T>()) {
         return LustroError::InvalidPointer;
     }
-    *out_ctx = std::ptr::null_mut();
+    // `*out_ctx` is written only after `f` has finished reading its inputs, so an `out_ctx`
+    // that overlaps one of them cannot change what `f` sees.
     match catch_unwind(f) {
         Ok(Ok(v)) => {
             *out_ctx = Box::into_raw(Box::new(v));
             LustroError::Ok
         }
-        Ok(Err(e)) => e,
-        Err(_) => LustroError::InternalPanic,
+        Ok(Err(e)) => {
+            *out_ctx = std::ptr::null_mut();
+            e
+        }
+        Err(_) => {
+            *out_ctx = std::ptr::null_mut();
+            LustroError::InternalPanic
+        }
     }
+}
+
+// `construct` for a constructor with a source context. An `out_ctx` overlapping `*ctx` is
+// `InvalidPointer` and `*out_ctx` is not written. A null `ctx` is left to `f`.
+pub(crate) unsafe fn construct_from<S, T>(
+    ctx: *const S,
+    out_ctx: *mut *mut T,
+    f: impl FnOnce() -> Result<T, LustroError> + UnwindSafe,
+) -> LustroError {
+    if !ctx.is_null() && !slot_clear_of(out_ctx, ctx) {
+        return LustroError::InvalidPointer;
+    }
+    construct(out_ctx, f)
+}
+
+// As `construct_from` for `*_batch_from_streams`: every context in `streams` is checked.
+// A bad table is left to `f`.
+pub(crate) unsafe fn construct_from_streams<S, T>(
+    streams: *const *const S,
+    n: usize,
+    out_ctx: *mut *mut T,
+    f: impl FnOnce() -> Result<T, LustroError> + UnwindSafe,
+) -> LustroError {
+    if let Some(table) = types::slice_in(streams, n) {
+        if table
+            .iter()
+            .any(|&p| !p.is_null() && !slot_clear_of(out_ctx, p))
+        {
+            return LustroError::InvalidPointer;
+        }
+    }
+    construct(out_ctx, f)
+}
+
+// Whether the `out_ctx` slot is disjoint from the context object `*ctx` itself.
+unsafe fn slot_clear_of<S, T>(out_ctx: *mut *mut T, ctx: *const S) -> bool {
+    types::ranges_overlap(
+        out_ctx as *const u8,
+        std::mem::size_of::<*mut T>(),
+        ctx as *const u8,
+        std::mem::size_of::<S>(),
+    ) == Some(false)
 }
 
 // `catch_unwind` cannot catch aborting panics.

@@ -1,12 +1,22 @@
-**Please note the API is currently in its beta stage. I'm still working on a list of functionality updates.** <br>
-
-**Planned release from beta is 13.11.2026.**
-
 # Lustro API
+
+Lustro is a 256-bit, deterministic, single-pass diffusion engine with three uses: a hash, a PRNG and an XOF. A stream can be
+forked into child streams, copied, and saved with its exact position. Forking **does not** change the parent. A batch advances many 
+independent streams in one call and uses AVX2 and a thread pool when the CPU and the settings allow it. It is available as 
+a Rust crate, a Python module (with NumPy) and a C/C++ library.
+
+| | Hash | PRNG | XOF |
+|---|---|---|---|
+| Input | a message | a 32-byte seed and a 128-bit stream ID | a message of any length |
+| Output | a 16 or 32-byte digest | a byte stream | a byte stream |
+| One at a time | `hash128`, `hash256`, `LustroHasher` | `LustroPrng` | `LustroXof`, `LustroXofAbsorber` |
+| Many at once | `hash*_many_*` | `LustroPrngBatch` | `LustroXofBatch` |
 
 Questions? Please see the **[FAQ](https://github.com/Ligatum/Lustro/blob/MAIN/DOCS/FAQ.md)**.
 
 The core mechanism and the API implementation are currently considered non-cryptographic.
+
+[Build](#build) · [Hashing](#hashing) · [Streams](#streams) · [Batches](#batches) · [State and Runtime](#state-and-runtime) · [Language Notes](#language-notes) · [Reference](#reference)
 
 ## Get the Code
 
@@ -19,27 +29,33 @@ cd Lustro_API
 
 ```bash
 # Rust
-
 cargo build --release
 
-# rand_core traits for LustroPrng and LustroXof (Rust, also enables entropy)
-
+# Rust with the rand_core traits (also enables entropy)
 cargo build --release --features rand
 
 # Python 3.11-3.14
-
 pip install maturin numpy
 maturin develop --release
 
 # C/C++ FFI bindings
-
 cargo build --release --features ffi
-
 ```
 
+| Feature | Default | Adds |
+|---|---|---|
+| `parallel` | yes | thread pool for batches |
+| `entropy` | no | `from_entropy` constructors (system entropy source) |
+| `rand` | no | `rand_core` traits for `LustroPrng` and `LustroXof`; enables `entropy` |
+| `ffi` | no | C/C++ bindings and `lustro.h`; enables `entropy` |
+| `python` | no | Python module, built by `maturin`; enables `entropy` |
+
+The `ffi` build generates `lustro.h` in Cargo's output directory. To also write it into the source tree, set `LUSTRO_HEADER_DIR`,
+for example `LUSTRO_HEADER_DIR=include cargo build --release --features ffi`.
+
 In the release profiles (`panic = "unwind"`) the C FFI boundary catches internal panics and returns 
-`LustroError::InternalPanic`; the Python module raises them as `pyo3_runtime.PanicException` (a `BaseException`).
-Direct Rust calls panic as usual, for example on a length mismatch. `InternalPanic` is not transactional: after it
+`LUSTRO_ERROR_INTERNAL_PANIC`; the Python module raises them as `pyo3_runtime.PanicException` (a `BaseException`).
+Direct Rust calls panic as usual, for example on a length mismatch. `LUSTRO_ERROR_INTERNAL_PANIC` is not transactional: after it
 the state of the context and of the output buffer is unspecified, so do not retry on the same context.
 
 NumPy is needed only by the functions that take or return arrays (`hash*_many*`, `fill_blocks`, `blocks`, `fill_u64`); 
@@ -51,24 +67,46 @@ On free-threaded CPython builds, importing the module enables the GIL
 unless this behavior is explicitly overridden (`PYTHON_GIL=0` or `-X gil=0`).
 Running Lustro with the GIL disabled is not supported.
 
+---
+
+## Speed Test
+
+The repo also contains **Lustro_Speed_Tester.py**. It runs equivalent sections on native Rust, Python and C layers.
+
+```bash
+# rust target (built on request only, no other build includes it)
+cargo build --release --example speed
+```
+
+---
+
 ## Tested Platforms
 
 Tested platforms: Windows x86_64 (Python 3.11-3.14) and Linux x86_64 (Python 3.11-3.14). 32-bit: 
 the Rust and C layers were tested on i686-pc-windows-msvc, the Python layer only compiles there. 
 Not tested: macOS, aarch64 and other ARM targets, big-endian targets and free-threaded CPython.
 
-## Speed Test
+---
 
-The repo also contains **Lustro_Speed_Tester.py**. It runs equivalent sections on native Rust, Python and C layers.
+## C / C++ Conventions
 
-`````bash
-# rust target (built on request only, no other build includes it)
-cargo build --release --example speed
-`````
+The C / C++ examples in this README mostly omit status checks for brevity. In real code, check every returned `LustroError`
+(`lustro_strerror` returns a message).
+
+- **Constructors** return a `LustroError` and store the new context in their last argument (`out_ctx`). `*out_ctx` is `NULL`
+  after a failure and receives the context only when the status is `Ok`; the status tells why. A `NULL` or misaligned `out_ctx`
+  is rejected with `LUSTRO_ERROR_INVALID_POINTER` and nothing is written. The same status is returned, with nothing written,
+  by `lustro_hasher_clone`, `lustro_xof_absorber_clone`, `lustro_xof_absorber_finalize` and the PRNG/XOF
+  constructors that take a source context when `out_ctx` overlaps that context (details in `ARCHITECTURE.md`).
+  Set the pointer to `NULL` yourself and check the status.
+- **Freeing:** the `lustro_*_free` functions accept `NULL`.
+- **128-bit values:** a stream ID or a path element goes in as two `uint64_t`, `hi` first. `next_u128` and `position` return
+  16 bytes, little-endian. `lustro_u128_from_parts(hi, lo, out)` and `lustro_u128_to_parts(in, &hi, &lo)` from `lustro.h`
+  convert between the two forms.
 
 ---
 
-## Quick Start
+## Hashing
 
 ### Hash
 
@@ -89,8 +127,6 @@ digest = lustro.hash256(b"hello world")
 ```
 
 **C / C++**
-
-The C / C++ examples in this README mostly omit status checks for brevity. In real code, check every returned `LustroError`.
 
 ```c
 #include "lustro.h"
@@ -195,7 +231,88 @@ lustro_hasher_free(h);
 - **Copy:** `clone()` in Rust, `copy()` in Python and `lustro_hasher_clone` in C/C++ continue independently, for example to 
   hash several messages of the same length that share a prefix.
 
+### Batch Hash
+
+Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; 
+`*_many_var` takes messages of any length.
+
+**Rust**
+
+```rust
+use lustro::{
+    hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into, Hash256,
+};
+
+// Messages of one length, stored back to back.
+let data = [0u8; 3 * 16];
+let fixed = hash256_many_fixed(&data, 16);
+
+// The same, written into a slice you provide.
+let mut out = vec![Hash256::default(); 3];
+hash256_many_fixed_into(&data, 16, &mut out);
+
+// Messages of any length.
+let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
+let digests = hash256_many_var(&messages);
+
+// The same, written into a slice you provide.
+hash256_many_var_into(&messages, &mut out);
+```
+
+**Python**
+
+```python
+import numpy as np
+import lustro
+
+# Equal-length messages: one message per row of a 2D uint8 array.
+rows = np.zeros((3, 16), dtype=np.uint8)
+digests = lustro.hash256_many_fixed(rows)  # uint8 array, shape (3, 32)
+
+# Messages of any length: a sequence of bytes or byte buffers.
+digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
+
+# Into an array you provide, see "GIL and Throughput (Python)".
+out = np.empty((3, 32), dtype=np.uint8)
+lustro.hash256_many_fixed_into(rows, out)
+lustro.hash256_many_var_into([b"a", b"bc", b""], out)
+
+# Messages packed in one buffer: message i is data[offsets[i]:offsets[i + 1]].
+data = b"abc"
+offsets = np.array([0, 1, 3, 3], dtype=np.int64)  # three messages: b"a", b"bc", b""
+digests = lustro.hash256_many_offsets(data, offsets)  # shape (3, 32)
+lustro.hash256_many_offsets_into(data, offsets, out)
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+/* Equal-length messages, stored back to back. */
+uint8_t rows[3][16] = {{0}};
+uint8_t digests[3][LUSTRO_HASH256_LEN];
+lustro_hash256_many_fixed((const uint8_t *)rows, 3, 16, (uint8_t *)digests);
+
+/* Messages of any length. */
+const uint8_t *messages[] = {
+    (const uint8_t *)"a",
+    (const uint8_t *)"bc",
+    (const uint8_t *)""
+};
+uintptr_t lengths[] = {1, 2, 0};
+
+lustro_hash256_many_var(messages, lengths, 3, (uint8_t *)digests);
+```
+
+The names mean the same in Rust, Python and C/C++ for `*_many_fixed` and `*_many_var`; `*_many_offsets` exists in Python only. 
+`hash128_*` and `lustro_hash128_*` work the same way and return 16-byte digests.
+
+AVX2 and the thread pool are used as far as the CPU and the runtime settings allow; the digests do not depend on either.
+
 ---
+
+## Streams
 
 ### PRNG and XOF
 
@@ -277,13 +394,6 @@ lustro_xof_next_u64(xof, &value);
 
 lustro_xof_free(xof);
 ```
-
-Every constructor returns a `LustroError` and stores the new context in its last argument (`out_ctx`).
-`*out_ctx` is set to `NULL` before the constructor runs, so on failure it stays `NULL` and the status tells why
-(`lustro_strerror` returns a message). A `NULL` or misaligned `out_ctx` is rejected with `InvalidPointer` and nothing is written.
-The same status is returned, with nothing written, by `lustro_hasher_clone`, `lustro_xof_absorber_clone` and
-`lustro_xof_absorber_finalize` when `out_ctx` overlaps their `ctx`. Set the pointer to `NULL` yourself and check the status.
-The `lustro_*_free` functions accept `NULL`.
 
 ### Incremental XOF
 
@@ -379,6 +489,8 @@ The seed is not kept. To keep it, use `LustroPrng(os.urandom(32), 0)`.
 `lustro_prng_from_entropy` creates a PRNG directly (stream ID as `hi`, `lo`, the seed is not kept):
 
 ```c
+#include "lustro.h"
+
 LustroPrng *rng = NULL;
 LustroError err = lustro_prng_from_entropy(0, 0, &rng);
 if (err != LUSTRO_ERROR_OK) {
@@ -396,8 +508,6 @@ if (err == LUSTRO_ERROR_OK) {
 lustro_prng_free(kept);
 lustro_prng_free(rng);
 ```
-
----
 
 ### Typed Reads
 
@@ -496,8 +606,6 @@ In Rust, `LustroPrng` and `LustroXof` also implement `std::io::Read`: `read` fil
 like `fill_bytes`. The stream has no end, so `read_to_end` and `read_to_string` return an `InvalidInput` error and read nothing,
 and `io::copy` and `bytes()` without a limit never stop. Bound the read, for example with `take`.
 
----
-
 ### Clone
 
 Copy a stream with its exact state. The copy is independent: both continue with the same bytes, and neither affects the other. 
@@ -506,7 +614,6 @@ The clone keeps the position inside the current block as well.
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrng, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -517,21 +624,9 @@ let mut twin = rng.clone();
 assert_eq!(rng.next_u64(), twin.next_u64());
 ```
 
-```rust
-// XOF
-use lustro::LustroXof;
-
-let mut xof = LustroXof::new(b"hello world");
-xof.next_u64();
-
-let mut twin = xof.clone();
-assert_eq!(xof.next_u64(), twin.next_u64());
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrng
 
 rng = LustroPrng(bytes(32), 0)
@@ -541,21 +636,9 @@ twin = rng.copy()  # copy.copy() and copy.deepcopy() work too
 assert rng.next_u64() == twin.next_u64()
 ```
 
-```python
-# XOF
-from lustro import LustroXof
-
-xof = LustroXof(b"hello world")
-xof.next_u64()
-
-twin = xof.copy()
-assert xof.next_u64() == twin.next_u64()
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -569,21 +652,7 @@ lustro_prng_free(twin);
 lustro_prng_free(rng);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-LustroXof *xof = NULL;
-lustro_xof_new((const uint8_t *)"hello world", 11, &xof);
-
-LustroXof *twin = NULL;
-lustro_xof_clone(xof, &twin);
-
-lustro_xof_free(twin);
-lustro_xof_free(xof);
-```
-
----
+`LustroXof` is cloned the same way: `xof.clone()` (Rust), `xof.copy()` (Python), `lustro_xof_clone(xof, &twin)` (C/C++, freed with `lustro_xof_free`).
 
 ### Fork
 
@@ -593,7 +662,6 @@ parent's current block, not on the position inside it: forking after 1 byte or a
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrng, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -603,20 +671,9 @@ let mut child = rng.fork(StreamId(1));
 let value = child.next_u64();
 ```
 
-```rust
-// XOF
-use lustro::{LustroXof, StreamId};
-
-let xof = LustroXof::new(b"hello world");
-
-let mut child = xof.fork(StreamId(1));
-let value = child.next_u64();
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrng
 
 rng = LustroPrng(bytes(32), 0)
@@ -625,20 +682,9 @@ child = rng.fork(1)
 value = child.next_u64()
 ```
 
-```python
-# XOF
-from lustro import LustroXof
-
-xof = LustroXof(b"hello world")
-
-child = xof.fork(1)
-value = child.next_u64()
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -655,33 +701,13 @@ lustro_prng_free(child);
 lustro_prng_free(rng);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-LustroXof *xof = NULL;
-lustro_xof_new((const uint8_t *)"hello world", 11, &xof);
-
-LustroXof *child = NULL;
-lustro_xof_fork(xof, 0, 1, &child);  /* id as (hi, lo) */
-
-uint64_t value;
-lustro_xof_next_u64(child, &value);
-
-lustro_xof_free(child);
-lustro_xof_free(xof);
-```
-
-In C/C++ a 128-bit ID goes in as two `uint64_t`, `hi` first, and `next_u128` returns 16 bytes, little-endian. 
-`lustro_u128_from_parts(hi, lo, out)` and `lustro_u128_to_parts(in, &hi, &lo)` from `lustro.h` convert between the two forms.
+`LustroXof` forks the same way: `xof.fork(StreamId(1))` (Rust), `xof.fork(1)` (Python), `lustro_xof_fork(xof, 0, 1, &child)` (C/C++).
 
 The same parent state and identifier always give the same child. The child starts at its own first block and 
 does not inherit the parent's position.
 
 A 32-byte output block is the stream's state at that point, and `fork()` derives from that state. So once a PRNG 
 has generated a block, `fork(id)` equals `LustroPrng::new` with that block as the seed and the same identifier.
-
----
 
 ### Derive Path
 
@@ -690,41 +716,24 @@ Derive a stream directly from a seed (or message) and a path of identifiers, wit
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrng, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
 let rng = LustroPrng::derive_path(&seed, &[StreamId(12), StreamId(7), StreamId(99)]);
 ```
 
-```rust
-// XOF
-use lustro::{LustroXof, StreamId};
-
-let xof = LustroXof::derive_path(b"hello world", &[StreamId(12), StreamId(7), StreamId(99)]);
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrng
 
 seed = bytes(32)
 rng = LustroPrng.derive_path(seed, [12, 7, 99])
 ```
 
-```python
-# XOF
-from lustro import LustroXof
-
-xof = LustroXof.derive_path(b"hello world", [12, 7, 99])
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -738,18 +747,9 @@ lustro_prng_derive_path(seed, ids_hi, ids_lo, 3, &rng);
 lustro_prng_free(rng);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-uint64_t ids_hi[3] = {0, 0, 0};
-uint64_t ids_lo[3] = {12, 7, 99};
-
-LustroXof *xof = NULL;
-lustro_xof_derive_path((const uint8_t *)"hello world", 11, ids_hi, ids_lo, 3, &xof);
-
-lustro_xof_free(xof);
-```
+For an XOF the message takes the place of the seed: `LustroXof::derive_path(b"hello world", &[StreamId(12), StreamId(7), StreamId(99)])` (Rust),
+`LustroXof.derive_path(b"hello world", [12, 7, 99])` (Python) and
+`lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, 3, &xof)` (C/C++).
 
 For a PRNG, `derive_path(seed, path)` gives the same stream as `new` with the first
 identifier followed by `fork` for each remaining one, in a single call. For an XOF,
@@ -760,159 +760,7 @@ and C/C++ returns `LUSTRO_ERROR_INVALID_LENGTH`. The same holds for the batch ve
 
 ---
 
-### Fork into a Batch
-
-Derive many children of one stream in a single call. `fork_batch(ids)` returns a batch whose lane `i` is `fork(ids[i])`, 
-and `fork_batch_range(first, count)` uses the IDs `first`, `first + 1`, ... `fork_path(path)` returns `fork(path[0]).fork(path[1])...` 
-without the intermediate streams. All three start from the current state, like `fork`, and do not change the parent.
-
-**Rust**
-
-```rust
-use lustro::{LustroPrng, Seed256, StreamId};
-
-let seed = Seed256::from_bytes([0u8; 32]);
-let rng = LustroPrng::new(&seed, StreamId(0));
-
-let children = rng.fork_batch(&[StreamId(10), StreamId(20)]); // LustroPrngBatch, 2 lanes
-let numbered = rng.fork_batch_range(StreamId(100), 8);        // ids 100 to 107
-let leaf = rng.fork_path(&[StreamId(12), StreamId(7)]);       // rng.fork(12).fork(7)
-```
-
-**Python**
-
-```python
-from lustro import LustroPrng
-
-rng = LustroPrng(bytes(32), 0)
-
-children = rng.fork_batch([10, 20])        # LustroPrngBatch, 2 lanes
-numbered = rng.fork_batch_range(100, 8)    # ids 100 to 107
-leaf = rng.fork_path([12, 7])              # rng.fork(12).fork(7)
-```
-
-**C / C++**
-
-```c
-#include "lustro.h"
-
-uint8_t seed[LUSTRO_SEED_LEN] = {0};
-LustroPrng *rng = NULL;
-lustro_prng_new(seed, 0, 0, &rng);
-
-uint64_t ids_hi[2] = {0, 0};
-uint64_t ids_lo[2] = {10, 20};
-
-LustroPrngBatch *children = NULL;
-lustro_prng_fork_batch(rng, ids_hi, ids_lo, 2, &children);
-
-LustroPrngBatch *numbered = NULL;
-lustro_prng_fork_batch_range(rng, 0, 100, 8, &numbered);  /* first id as (hi, lo), then count */
-
-uint64_t path_hi[2] = {0, 0};
-uint64_t path_lo[2] = {12, 7};
-
-LustroPrng *leaf = NULL;
-lustro_prng_fork_path(rng, path_hi, path_lo, 2, &leaf);
-
-lustro_prng_free(leaf);
-lustro_prng_batch_free(numbered);
-lustro_prng_batch_free(children);
-lustro_prng_free(rng);
-```
-
-`LustroXof` has the same methods (`lustro_xof_fork_batch`, `lustro_xof_fork_batch_range` and `lustro_xof_fork_path` 
-in C/C++) and returns a `LustroXofBatch`.
-
-For a stream that has not produced output yet, `fork_path` gives what `derive_path` gives: `LustroPrng::new(&seed, 
-StreamId(5)).fork_path(path)` is `derive_path(&seed, [5] + path)`. It is for the cases `derive_path` does not cover: 
-a stream from `from_entropy()`, a lane of a batch, a restored snapshot, or a stream that has already produced output. 
-`path` must not be empty, with the same errors as `derive_path`.
-
----
-
 ## Batches
-
-### Batch Hash
-
-Hash many messages in one call. `*_many_fixed` takes messages of one length stored back to back in a single buffer; 
-`*_many_var` takes messages of any length.
-
-**Rust**
-
-```rust
-use lustro::{
-    hash256_many_fixed, hash256_many_fixed_into, hash256_many_var, hash256_many_var_into, Hash256,
-};
-
-// Messages of one length, stored back to back.
-let data = [0u8; 3 * 16];
-let fixed = hash256_many_fixed(&data, 16);
-
-// The same, written into a slice you provide.
-let mut out = vec![Hash256::default(); 3];
-hash256_many_fixed_into(&data, 16, &mut out);
-
-// Messages of any length.
-let messages = [b"a".as_ref(), b"bc".as_ref(), b"".as_ref()];
-let digests = hash256_many_var(&messages);
-
-// The same, written into a slice you provide.
-hash256_many_var_into(&messages, &mut out);
-```
-
-**Python**
-
-```python
-import numpy as np
-import lustro
-
-# Equal-length messages: one message per row of a 2D uint8 array.
-rows = np.zeros((3, 16), dtype=np.uint8)
-digests = lustro.hash256_many_fixed(rows)  # uint8 array, shape (3, 32)
-
-# Messages of any length: a sequence of bytes or byte buffers.
-digests = lustro.hash256_many_var([b"a", b"bc", b""])  # shape (3, 32)
-
-# Into an array you provide, see "GIL and Throughput (Python)".
-out = np.empty((3, 32), dtype=np.uint8)
-lustro.hash256_many_fixed_into(rows, out)
-lustro.hash256_many_var_into([b"a", b"bc", b""], out)
-
-# Messages packed in one buffer: message i is data[offsets[i]:offsets[i + 1]].
-data = b"abc"
-offsets = np.array([0, 1, 3, 3], dtype=np.int64)  # three messages: b"a", b"bc", b""
-digests = lustro.hash256_many_offsets(data, offsets)  # shape (3, 32)
-lustro.hash256_many_offsets_into(data, offsets, out)
-```
-
-**C / C++**
-
-```c
-#include "lustro.h"
-
-/* Equal-length messages, stored back to back. */
-uint8_t rows[3][16] = {{0}};
-uint8_t digests[3][LUSTRO_HASH256_LEN];
-lustro_hash256_many_fixed((const uint8_t *)rows, 3, 16, (uint8_t *)digests);
-
-/* Messages of any length. */
-const uint8_t *messages[] = {
-    (const uint8_t *)"a",
-    (const uint8_t *)"bc",
-    (const uint8_t *)""
-};
-uintptr_t lengths[] = {1, 2, 0};
-
-lustro_hash256_many_var(messages, lengths, 3, (uint8_t *)digests);
-```
-
-The names mean the same in Rust, Python and C/C++ for `*_many_fixed` and `*_many_var`; `*_many_offsets` exists in Python only. 
-`hash128_*` and `lustro_hash128_*` work the same way and return 16-byte digests.
-
-AVX2 and the thread pool are used as far as the CPU and the runtime settings allow; the digests do not depend on either.
-
----
 
 ### Batch PRNG and XOF
 
@@ -965,7 +813,7 @@ from lustro import LustroPrngBatch
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
 
 steps = prng.suggested_steps()  # or a fixed number, e.g. 2
-out = np.empty((steps, len(prng), 4), dtype=np.uint64)
+out = np.empty((steps, len(prng), 4), dtype=np.uint64)  # (steps, n_streams, 4)
 prng.fill_blocks(out, steps)
 
 # Or let the library allocate the array:
@@ -980,7 +828,7 @@ from lustro import LustroXofBatch
 xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
 
 steps = xof.suggested_steps()  # or a fixed number, e.g. 2
-out = np.empty((steps, len(xof), 4), dtype=np.uint64)
+out = np.empty((steps, len(xof), 4), dtype=np.uint64)  # (steps, n_streams, 4)
 xof.fill_blocks(out, steps)
 
 more = xof.blocks(steps)
@@ -1049,6 +897,10 @@ lustro_xof_batch_free(xof);
 `lustro_*_batch_len` returns 0 for an empty batch and also for `NULL`. `lustro_*_batch_get_len(ctx, &len)` tells the 
 two apart: it returns `LUSTRO_ERROR_INVALID_POINTER` for `NULL` and writes nothing.
 
+`LustroPrngBatch` can also be created for consecutive stream IDs: `LustroPrngBatch::new_range(&seed, StreamId(first), count)` 
+(Rust), `LustroPrngBatch.new_range(seed, first, count)` (Python) and `lustro_prng_batch_new_range(seed, first_hi, first_lo, count, &prng)` 
+(C/C++) use the IDs `first`, `first + 1`, ... XOF batches have no `new_range`.
+
 In C/C++, `lustro_batch_block_offset(step, batch_len, lane)` from `lustro.h` gives the byte offset of one block in the output: 
 `(step * batch_len + lane) * LUSTRO_BLOCK_LEN`. It expects `step < steps` and `lane < batch_len` and does not check its arguments.
 
@@ -1056,8 +908,6 @@ In C/C++, `lustro_batch_block_offset(step, batch_len, lane)` from `lustro.h` giv
 /* lane 2 at step 0 of the PRNG output above */
 const uint8_t *block = out + lustro_batch_block_offset(0, 4, 2);
 ```
-
----
 
 ### Batch into Single Lane
 
@@ -1067,7 +917,6 @@ would write for that lane next. The batch is not changed, and the two evolve ind
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -1081,23 +930,9 @@ let mut lane = prng.lane(1).expect("lane in range");
 let block = lane.next_block();
 ```
 
-```rust
-// XOF
-use lustro::LustroXofBatch;
-
-let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
-let mut xof = LustroXofBatch::new(&messages);
-
-xof.blocks(2);
-
-let mut lane = xof.lane(1).expect("lane in range");
-let block = lane.next_block();
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrngBatch
 
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
@@ -1108,21 +943,9 @@ same = prng[1]       # the same lane; prng[-1] is the last one
 block = lane.next_block()
 ```
 
-```python
-# XOF
-from lustro import LustroXofBatch
-
-xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
-xof.blocks(2)
-
-lane = xof.lane(1)
-block = lane.next_block()
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -1139,36 +962,12 @@ lustro_prng_free(lane);  /* a single stream, not a batch */
 lustro_prng_batch_free(prng);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-const uint8_t *messages[] = {
-    (const uint8_t *)"msg0",
-    (const uint8_t *)"msg1",
-    (const uint8_t *)"msg2"
-};
-uintptr_t lengths[] = {4, 4, 4};
-
-LustroXofBatch *xof = NULL;
-lustro_xof_batch_new(messages, lengths, 3, &xof);
-
-LustroXof *lane = NULL;
-LustroError err = lustro_xof_batch_lane(xof, 1, &lane);
-
-uint8_t block[LUSTRO_BLOCK_LEN];
-lustro_xof_next_block(lane, block);
-
-lustro_xof_free(lane);  /* a single stream, not a batch */
-lustro_xof_batch_free(xof);
-```
+`LustroXofBatch` has `lane` too: `xof.lane(1)` (Rust, Python) and `lustro_xof_batch_lane(xof, 1, &lane)` (C/C++, the lane is a `LustroXof`, freed with `lustro_xof_free`).
 
 The result is an ordinary single stream (`LustroPrng` or `LustroXof`), so it supports typed reads, `fork` and snapshots.
 
 In Python, `batch[i]` does what `batch.lane(i)` does, and a negative `i` counts from the end (`lane(i)` itself rejects it).
 `for lane in batch` goes through all lanes in order, as copies of the lane states from the start of the loop. Slices are not supported.
-
----
 
 ### Single Streams into Batch
 
@@ -1183,7 +982,6 @@ bring it to the next boundary.
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrng, LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -1198,21 +996,9 @@ b.advance_bytes(24);   // the rest of the block
 let batch = LustroPrngBatch::from_streams(&[a, b]);
 ```
 
-```rust
-// XOF
-use lustro::{LustroXof, LustroXofBatch};
-
-let a = LustroXof::new(b"msg0");
-let mut b = LustroXof::new(b"msg1");
-b.next_block();   // a whole block, b stays at a block boundary
-
-let batch = LustroXofBatch::from_streams(&[a, b]);
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrng, LustroPrngBatch
 
 a = LustroPrng(bytes(32), 0)
@@ -1223,21 +1009,9 @@ b.advance_bytes(24)   # the rest of the block
 batch = LustroPrngBatch.from_streams([a, b])
 ```
 
-```python
-# XOF
-from lustro import LustroXof, LustroXofBatch
-
-a = LustroXof(b"msg0")
-b = LustroXof(b"msg1")
-b.next_block()
-
-batch = LustroXofBatch.from_streams([a, b])
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -1255,23 +1029,8 @@ lustro_prng_free(b);
 lustro_prng_free(a);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-LustroXof *a = NULL;
-LustroXof *b = NULL;
-lustro_xof_new((const uint8_t *)"msg0", 4, &a);
-lustro_xof_new((const uint8_t *)"msg1", 4, &b);
-
-const LustroXof *streams[] = {a, b};
-LustroXofBatch *batch = NULL;
-LustroError err = lustro_xof_batch_from_streams(streams, 2, &batch);
-
-lustro_xof_batch_free(batch);
-lustro_xof_free(b);
-lustro_xof_free(a);
-```
+`LustroXof` streams go into a `LustroXofBatch` the same way: `LustroXofBatch::from_streams(&[a, b])` (Rust), `LustroXofBatch.from_streams([a, b])` (Python)
+and `lustro_xof_batch_from_streams(streams, 2, &batch)` with an array of `const LustroXof *` (C/C++).
 
 The streams can come from different seeds or messages, and the same stream can appear more than once. A stream inside 
 a block gives `BatchError::PartialBlock { index }` from `try_from_streams` in Rust (`index` is the first such stream; 
@@ -1279,7 +1038,74 @@ a block gives `BatchError::PartialBlock { index }` from `try_from_streams` in Ru
 owned by the caller and are freed separately. In Python the source can also be a batch, 
 which gives a copy of it.
 
----
+### Fork into a Batch
+
+Derive many children of one stream in a single call. `fork_batch(ids)` returns a batch whose lane `i` is `fork(ids[i])`, 
+and `fork_batch_range(first, count)` uses the IDs `first`, `first + 1`, ... `fork_path(path)` returns `fork(path[0]).fork(path[1])...` 
+without the intermediate streams. All three start from the current state, like `fork`, and do not change the parent.
+
+**Rust**
+
+```rust
+use lustro::{LustroPrng, Seed256, StreamId};
+
+let seed = Seed256::from_bytes([0u8; 32]);
+let rng = LustroPrng::new(&seed, StreamId(0));
+
+let children = rng.fork_batch(&[StreamId(10), StreamId(20)]); // LustroPrngBatch, 2 lanes
+let numbered = rng.fork_batch_range(StreamId(100), 8);        // ids 100 to 107
+let leaf = rng.fork_path(&[StreamId(12), StreamId(7)]);       // rng.fork(12).fork(7)
+```
+
+**Python**
+
+```python
+from lustro import LustroPrng
+
+rng = LustroPrng(bytes(32), 0)
+
+children = rng.fork_batch([10, 20])        # LustroPrngBatch, 2 lanes
+numbered = rng.fork_batch_range(100, 8)    # ids 100 to 107
+leaf = rng.fork_path([12, 7])              # rng.fork(12).fork(7)
+```
+
+**C / C++**
+
+```c
+#include "lustro.h"
+
+uint8_t seed[LUSTRO_SEED_LEN] = {0};
+LustroPrng *rng = NULL;
+lustro_prng_new(seed, 0, 0, &rng);
+
+uint64_t ids_hi[2] = {0, 0};
+uint64_t ids_lo[2] = {10, 20};
+
+LustroPrngBatch *children = NULL;
+lustro_prng_fork_batch(rng, ids_hi, ids_lo, 2, &children);
+
+LustroPrngBatch *numbered = NULL;
+lustro_prng_fork_batch_range(rng, 0, 100, 8, &numbered);  /* first id as (hi, lo), then count */
+
+uint64_t path_hi[2] = {0, 0};
+uint64_t path_lo[2] = {12, 7};
+
+LustroPrng *leaf = NULL;
+lustro_prng_fork_path(rng, path_hi, path_lo, 2, &leaf);
+
+lustro_prng_free(leaf);
+lustro_prng_batch_free(numbered);
+lustro_prng_batch_free(children);
+lustro_prng_free(rng);
+```
+
+`LustroXof` has the same methods (`lustro_xof_fork_batch`, `lustro_xof_fork_batch_range` and `lustro_xof_fork_path` 
+in C/C++). The first two return a `LustroXofBatch`, `fork_path` a `LustroXof`.
+
+For a stream that has not produced output yet, `fork_path` gives what `derive_path` gives: `LustroPrng::new(&seed, 
+StreamId(5)).fork_path(path)` is `derive_path(&seed, [5] + path)`. It is for the cases `derive_path` does not cover: 
+a stream from `from_entropy()`, a lane of a batch, a restored snapshot, or a stream that has already produced output. 
+`path` must not be empty, with the same errors as `derive_path`.
 
 ### Batch Clone
 
@@ -1288,7 +1114,6 @@ Copy a whole batch with the exact state of every lane. The copy is independent.
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -1299,21 +1124,9 @@ prng.blocks(2);
 let twin = prng.clone();
 ```
 
-```rust
-// XOF
-use lustro::LustroXofBatch;
-
-let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
-let mut xof = LustroXofBatch::new(&messages);
-xof.blocks(2);
-
-let twin = xof.clone();
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrngBatch
 
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
@@ -1322,20 +1135,9 @@ prng.blocks(2)
 twin = prng.copy()
 ```
 
-```python
-# XOF
-from lustro import LustroXofBatch
-
-xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
-xof.blocks(2)
-
-twin = xof.copy()
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -1349,28 +1151,7 @@ lustro_prng_batch_free(twin);
 lustro_prng_batch_free(prng);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-const uint8_t *messages[] = {
-    (const uint8_t *)"msg0",
-    (const uint8_t *)"msg1",
-    (const uint8_t *)"msg2"
-};
-uintptr_t lengths[] = {4, 4, 4};
-
-LustroXofBatch *xof = NULL;
-lustro_xof_batch_new(messages, lengths, 3, &xof);
-
-LustroXofBatch *twin = NULL;
-LustroError err = lustro_xof_batch_clone(xof, &twin);
-
-lustro_xof_batch_free(twin);
-lustro_xof_batch_free(xof);
-```
-
----
+`LustroXofBatch` is cloned the same way: `xof.clone()` (Rust), `xof.copy()` (Python), `lustro_xof_batch_clone(xof, &twin)` (C/C++).
 
 ### Batch Fork
 
@@ -1379,7 +1160,6 @@ Create multiple child streams. The parent is not changed.
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -1391,22 +1171,9 @@ let children = prng.fork_range(StreamId(100));
 let many_children = prng.fork_many(&[StreamId(100), StreamId(200)]);
 ```
 
-```rust
-// XOF
-use lustro::{LustroXofBatch, StreamId};
-
-let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
-
-let xof = LustroXofBatch::new(&messages);
-let one_each = xof.fork(&[StreamId(10), StreamId(11), StreamId(12)]);
-let children = xof.fork_range(StreamId(100));
-let many_children = xof.fork_many(&[StreamId(100), StreamId(200)]);
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrngBatch
 
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
@@ -1416,21 +1183,9 @@ children = prng.fork_range(100)
 many_children = prng.fork_many([100, 200])
 ```
 
-```python
-# XOF
-from lustro import LustroXofBatch
-
-xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
-
-one_each = xof.fork([10, 11, 12])
-children = xof.fork_range(100)
-many_children = xof.fork_many([100, 200])
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -1458,48 +1213,18 @@ lustro_prng_batch_free(one_each);
 lustro_prng_batch_free(prng);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
+`LustroXofBatch` has the same methods: `fork`, `fork_range` and `fork_many` (`lustro_xof_batch_fork`, `lustro_xof_batch_fork_range` and
+`lustro_xof_batch_fork_many` in C/C++).
 
-const uint8_t *messages[] = {
-    (const uint8_t *)"msg0",
-    (const uint8_t *)"msg1",
-    (const uint8_t *)"msg2"
-};
-uintptr_t lengths[] = {4, 4, 4};
+| Method | `ids` | Result | Child at index |
+|---|---|---|---|
+| `fork(ids)` | exactly `batch.len()` IDs | `batch.len()` lanes | `i`: child of lane `i` with `ids[i]` |
+| `fork_range(first)` | none | `batch.len()` lanes | `i`: child of lane `i` with ID `first + i` |
+| `fork_many(ids)` | any number `k` | `batch.len() * k` lanes | `i * k + j`: child `j` of lane `i` with `ids[j]` |
 
-LustroXofBatch *xof = NULL;
-lustro_xof_batch_new(messages, lengths, 3, &xof);
-
-uint64_t ids_hi[3] = {0, 0, 0};
-uint64_t ids_lo[3] = {10, 11, 12};
-
-LustroXofBatch *one_each = NULL;
-lustro_xof_batch_fork(xof, ids_hi, ids_lo, 3, &one_each);
-
-LustroXofBatch *children = NULL;
-lustro_xof_batch_fork_range(xof, 0, 100, &children);
-
-uint64_t k_hi[2] = {0, 0};
-uint64_t k_lo[2] = {100, 200};
-
-LustroXofBatch *many_children = NULL;
-lustro_xof_batch_fork_many(xof, k_hi, k_lo, 2, &many_children);
-
-lustro_xof_batch_free(many_children);
-lustro_xof_batch_free(children);
-lustro_xof_batch_free(one_each);
-lustro_xof_batch_free(xof);
-```
-
-`fork(ids)` derives one child per lane, using the identifier at the same position. `ids` must have exactly `batch.len()` 
-elements (`fork` panics and `try_fork` returns `BatchError::LengthMismatch` in Rust, `ValueError` in Python, 
-`LUSTRO_ERROR_INVALID_LENGTH` in C/C++). `fork_range(first)` derives `batch.len()` children using sequential stream IDs.
-`fork_many(ids)` derives `ids.len()` children per lane instead, producing a batch of `batch.len() * ids.len()` lanes, 
-ordered parent-major: child `j` of lane `i` is at index `i * ids.len() + j`. Each child starts at step 0.
-
----
+If `ids` of `fork` does not have exactly `batch.len()` elements, `fork` panics and `try_fork` returns
+`BatchError::LengthMismatch` in Rust; Python raises `ValueError` and C/C++ returns `LUSTRO_ERROR_INVALID_LENGTH`.
+Each child starts at step 0.
 
 ### Batch Derive Path
 
@@ -1508,7 +1233,6 @@ Derive a batch directly from a shared path, one lane per root (PRNG) or per mess
 **Rust**
 
 ```rust
-// PRNG
 use lustro::{LustroPrngBatch, Seed256, StreamId};
 
 let seed = Seed256::from_bytes([0u8; 32]);
@@ -1518,37 +1242,18 @@ let path = [StreamId(12), StreamId(7)];
 let batch = LustroPrngBatch::derive_path(&seed, &roots, &path);
 ```
 
-```rust
-// XOF
-use lustro::{LustroXofBatch, StreamId};
-
-let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
-let path = [StreamId(12), StreamId(7)];
-
-let batch = LustroXofBatch::derive_path(&messages, &path);
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrngBatch
 
 seed = bytes(32)
 batch = LustroPrngBatch.derive_path(seed, [0, 1, 2, 3], [12, 7])
 ```
 
-```python
-# XOF
-from lustro import LustroXofBatch
-
-batch = LustroXofBatch.derive_path([b"msg0", b"msg1", b"msg2"], [12, 7])
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include "lustro.h"
 
 uint8_t seed[LUSTRO_SEED_LEN] = {0};
@@ -1567,27 +1272,9 @@ lustro_prng_batch_derive_path(
 lustro_prng_batch_free(batch);
 ```
 
-```c
-/* XOF */
-#include "lustro.h"
-
-const uint8_t *messages[] = {
-    (const uint8_t *)"msg0",
-    (const uint8_t *)"msg1",
-    (const uint8_t *)"msg2"
-};
-uintptr_t lengths[] = {4, 4, 4};
-
-uint64_t path_hi[2] = {0, 0};
-uint64_t path_lo[2] = {12, 7};
-
-LustroXofBatch *batch = NULL;
-lustro_xof_batch_derive_path(
-    messages, lengths, 3, path_hi, path_lo, 2, &batch
-);
-
-lustro_xof_batch_free(batch);
-```
+An XOF batch takes the messages instead of the seed and the roots: `LustroXofBatch::derive_path(&messages, &path)` (Rust),
+`LustroXofBatch.derive_path(messages, path)` (Python) and
+`lustro_xof_batch_derive_path(messages, lengths, 3, path_hi, path_lo, 2, &batch)` (C/C++).
 
 For a PRNG batch, `derive_path(seed, roots, path)` derives a canonical batch: lane `i` equals
 `LustroPrng::derive_path(seed, [roots[i]] + path)`, independent of any other
@@ -1595,27 +1282,28 @@ stream's state. For an XOF batch, lane `i` equals `LustroXof::derive_path(messag
 In Python the messages can be any sequence of `bytes` or byte buffers. In Rust, `try_derive_path` returns
 `DerivePathError::EmptyPath` for an empty `path` instead of panicking.
 
----
-
 ### Allocation Failures
 
-These functions reserve memory for the lanes of a batch, for its output or for the buffer of a batch snapshot: 
-`new`, `new_range`, `from_streams`, `fork`, `fork_range`, `fork_many`, `derive_path`, `clone`, `blocks` 
-and `export_snapshot` of `LustroPrngBatch` and `LustroXofBatch`; `fork_batch` and `fork_batch_range` 
-of `LustroPrng` and `LustroXof`; `to_le_bytes` and `from_le_bytes` of `LustroPrngBatchSnapshot` 
-and `LustroXofBatchSnapshot`; the output vector of `hash256_many_fixed`, `hash128_many_fixed`, 
-`hash256_many_var` and `hash128_many_var`. If a reservation fails:
+Batch functions reserve memory for the lanes, the output and the buffer of a batch snapshot. If a reservation fails:
 
-- **Rust:** the function panics, and `clone()` aborts the process. Each has a `try_` variant of the same name that
-  returns an error instead (`try_new_range` exists for `LustroPrngBatch` only): `BatchError::Reserve`,
-  `DerivePathError::Reserve` for `try_derive_path` and `SnapshotError::Reserve` for `try_from_le_bytes` (also through
-  `TryFrom<&[u8]>`). Where the plain version panics for another reason, the `try_` variant returns an error as well:
-  `BatchError::InvalidMessageLen` from `try_hash256_many_fixed` and `try_hash128_many_fixed` (`message_len` of 0, or
-  `data.len()` not a multiple of it), `BatchError::SizeOverflow` from `try_blocks` and `try_fork_many` (`len() * steps` or
-  `len() * ids.len()` overflows `usize`).
-- **Python:** `MemoryError`.
-- **C/C++:** `LUSTRO_ERROR_OUT_OF_MEMORY`, except from `lustro_*_batch_export_snapshot`, which writes into your buffer and
-  allocates nothing.
+| | Plain function |
+|---|---|
+| Rust | panics (`clone()` aborts the process); the `try_` variant of the same name returns an error instead |
+| Python | `MemoryError` |
+| C/C++ | `LUSTRO_ERROR_OUT_OF_MEMORY`, except from `lustro_*_batch_export_snapshot`, which writes into your buffer and allocates nothing |
+
+The Rust `try_` variants of `LustroPrngBatch` and `LustroXofBatch` (`try_new_range` for `LustroPrngBatch` only):
+
+| Variants | Error |
+|---|---|
+| `try_new`, `try_new_range`, `try_from_streams`, `try_fork`, `try_fork_range`, `try_clone`, `try_export_snapshot` | `BatchError::Reserve` |
+| `try_fork_batch`, `try_fork_batch_range` of `LustroPrng` and `LustroXof` | `BatchError::Reserve` |
+| `try_to_le_bytes` of `LustroPrngBatchSnapshot` and `LustroXofBatchSnapshot` | `BatchError::Reserve` |
+| `try_hash256_many_var`, `try_hash128_many_var` | `BatchError::Reserve` |
+| `try_hash256_many_fixed`, `try_hash128_many_fixed` | `BatchError::Reserve`; `BatchError::InvalidMessageLen` for a `message_len` of 0 or a `data.len()` that is not a multiple of it (the plain versions panic then) |
+| `try_blocks`, `try_fork_many` | `BatchError::Reserve`; `BatchError::SizeOverflow` when `len() * steps` or `len() * ids.len()` overflows `usize` (the plain versions panic then too) |
+| `try_derive_path` | `DerivePathError::Reserve` |
+| `try_from_le_bytes` of the batch snapshots (also through `TryFrom<&[u8]>`) | `SnapshotError::Reserve` |
 
 ---
 
@@ -1628,7 +1316,6 @@ Save and restore the exact stream position.
 **Rust**
 
 ```rust
-// PRNG
 use lustro::types::LustroPrngSnapshot;
 use lustro::{LustroPrng, Seed256, StreamId};
 
@@ -1644,26 +1331,9 @@ let snapshot =
 let mut restored = LustroPrng::import_snapshot(snapshot);
 ```
 
-```rust
-// XOF
-use lustro::types::LustroXofSnapshot;
-use lustro::LustroXof;
-
-let mut xof = LustroXof::new(b"hello world");
-
-let snapshot = xof.export_snapshot();
-let bytes = snapshot.to_le_bytes();
-
-let snapshot =
-    LustroXofSnapshot::from_le_bytes(&bytes).expect("valid snapshot");
-
-let mut restored = LustroXof::import_snapshot(snapshot);
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrng
 
 rng = LustroPrng(bytes(32), 0)
@@ -1672,20 +1342,9 @@ snapshot = rng.export_snapshot()
 restored = LustroPrng.import_snapshot(snapshot)
 ```
 
-```python
-# XOF
-from lustro import LustroXof
-
-xof = LustroXof(b"hello world")
-
-snapshot = xof.export_snapshot()
-restored = LustroXof.import_snapshot(snapshot)
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include <stdio.h>
 #include "lustro.h"
 
@@ -1706,26 +1365,9 @@ lustro_prng_free(restored);
 lustro_prng_free(rng);
 ```
 
-```c
-/* XOF */
-#include <stdio.h>
-#include "lustro.h"
-
-LustroXof *xof = NULL;
-lustro_xof_new((const uint8_t *)"hello world", 11, &xof);
-
-uint8_t snapshot[LUSTRO_SNAPSHOT_LEN];
-lustro_xof_export_snapshot(xof, snapshot, LUSTRO_SNAPSHOT_LEN);
-
-LustroXof *restored = NULL;
-LustroError err = lustro_xof_import_snapshot(snapshot, LUSTRO_SNAPSHOT_LEN, &restored);
-if (err != LUSTRO_ERROR_OK) {
-    fprintf(stderr, "%s\n", lustro_strerror(err));
-}
-
-lustro_xof_free(restored);
-lustro_xof_free(xof);
-```
+`LustroXof` works the same way: `export_snapshot()`, `LustroXofSnapshot::from_le_bytes` (`lustro::types`) and `LustroXof::import_snapshot` in Rust;
+`export_snapshot()` and `LustroXof.import_snapshot` in Python; `lustro_xof_export_snapshot` and `lustro_xof_import_snapshot`
+with `LUSTRO_SNAPSHOT_LEN` in C/C++.
 
 A snapshot holds the full stream state, so keep it as private as the seed (for an XOF, the message). Importing 
 malformed bytes fails: 
@@ -1742,8 +1384,6 @@ To find out which type exported some bytes, call `SnapshotKind::detect(bytes)` (
 (Python: `"prng"`, `"xof"`, `"prng_batch"` or `"xof_batch"`) or `lustro_snapshot_kind(bytes, len, &kind)` 
 (C/C++: `LUSTRO_SNAPSHOT_KIND_*`). It reads only the version and kind bytes, so a result does not mean the import will succeed.
 
----
-
 ### Batch Snapshot
 
 Save and restore every lane of a batch at once. The snapshot has a dynamic size: a header plus one entry per lane.
@@ -1751,7 +1391,6 @@ Save and restore every lane of a batch at once. The snapshot has a dynamic size:
 **Rust**
 
 ```rust
-// PRNG
 use lustro::types::LustroPrngBatchSnapshot;
 use lustro::{LustroPrngBatch, Seed256, StreamId};
 
@@ -1769,28 +1408,9 @@ let snapshot =
 let mut restored = LustroPrngBatch::import_snapshot(snapshot);
 ```
 
-```rust
-// XOF
-use lustro::types::LustroXofBatchSnapshot;
-use lustro::LustroXofBatch;
-
-let messages = [b"msg0".as_ref(), b"msg1".as_ref(), b"msg2".as_ref()];
-let mut xof = LustroXofBatch::new(&messages);
-xof.blocks(2);
-
-let snapshot = xof.export_snapshot();
-let bytes = snapshot.to_le_bytes();   // Vec<u8>
-
-let snapshot =
-    LustroXofBatchSnapshot::from_le_bytes(&bytes).expect("valid snapshot");
-
-let mut restored = LustroXofBatch::import_snapshot(snapshot);
-```
-
 **Python**
 
 ```python
-# PRNG
 from lustro import LustroPrngBatch
 
 prng = LustroPrngBatch(bytes(32), [0, 1, 2, 3])
@@ -1800,21 +1420,9 @@ snapshot = prng.export_snapshot()   # bytes
 restored = LustroPrngBatch.import_snapshot(snapshot)
 ```
 
-```python
-# XOF
-from lustro import LustroXofBatch
-
-xof = LustroXofBatch([b"msg0", b"msg1", b"msg2"])
-xof.blocks(2)
-
-snapshot = xof.export_snapshot()    # bytes
-restored = LustroXofBatch.import_snapshot(snapshot)
-```
-
 **C / C++**
 
 ```c
-/* PRNG */
 #include <stdio.h>
 #include <stdlib.h>
 #include "lustro.h"
@@ -1838,53 +1446,25 @@ free(snapshot);
 lustro_prng_batch_free(prng);
 ```
 
-```c
-/* XOF */
-#include <stdio.h>
-#include <stdlib.h>
-#include "lustro.h"
-
-const uint8_t *messages[] = {
-    (const uint8_t *)"msg0",
-    (const uint8_t *)"msg1",
-    (const uint8_t *)"msg2"
-};
-uintptr_t lengths[] = {4, 4, 4};
-
-LustroXofBatch *xof = NULL;
-lustro_xof_batch_new(messages, lengths, 3, &xof);
-
-size_t size = lustro_xof_batch_snapshot_size(xof);
-uint8_t *snapshot = (uint8_t *)malloc(size);
-lustro_xof_batch_export_snapshot(xof, snapshot, size);
-
-LustroXofBatch *restored = NULL;
-LustroError err = lustro_xof_batch_import_snapshot(snapshot, size, &restored);
-if (err != LUSTRO_ERROR_OK) {
-    fprintf(stderr, "%s\n", lustro_strerror(err));
-}
-
-lustro_xof_batch_free(restored);
-free(snapshot);
-lustro_xof_batch_free(xof);
-```
+`LustroXofBatch` works the same way: `LustroXofBatchSnapshot` (`lustro::types`) in Rust, `LustroXofBatch.import_snapshot` in Python,
+`lustro_xof_batch_snapshot_size`, `lustro_xof_batch_export_snapshot` and `lustro_xof_batch_import_snapshot` in C/C++.
 
 The snapshot size is `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN + n * LUSTRO_BATCH_SNAPSHOT_LANE_LEN` for `n` streams. 
 In C/C++ call `*_batch_snapshot_size(ctx)` before export; `out_len` must equal it.
 
-
----
-
 ### Runtime Settings
 
-Thread count and SIMD backend follow `LUSTRO_NUM_THREADS`, `LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` by default. 
-`configure` sets them from code, best before first use (see below). They apply to hash batches as well as to PRNG and XOF batches.
+Thread count and SIMD backend follow environment variables by default. `configure` sets them from code, best before
+first use (see below). They apply to hash batches as well as to PRNG and XOF batches.
 
-`LUSTRO_DISABLE_MT` and `LUSTRO_DISABLE_SIMD` are set by `1`, `true`, `on` or `yes` and are not set by `0`, `false`, `off`, `no` 
-or an empty value (case is ignored). Any other value sets them.
+| Variable | `configure` | Effect | Values |
+|---|---|---|---|
+| `LUSTRO_NUM_THREADS` | `threads` | Pool size, capped at the CPU count; `1` disables the pool | A positive number. Anything else (`abc`, `0`, `-1`) is ignored and the pool gets the full CPU count |
+| `LUSTRO_DISABLE_MT` | `threads=1` | Never use the thread pool | Flag |
+| `LUSTRO_DISABLE_SIMD` | `allow_simd=False` | Scalar backend | Flag |
 
-`LUSTRO_NUM_THREADS` takes a positive number, capped at the CPU count. A value that is not a positive number (`abc`, `0`, `-1`) 
-is ignored and the pool gets the full CPU count.
+A flag is set by `1`, `true`, `on` or `yes`, and not set by `0`, `false`, `off`, `no` or an empty value (case is ignored).
+Any other value sets it.
 
 **Rust**
 
@@ -1925,18 +1505,24 @@ if (err != LUSTRO_ERROR_OK) {
 }
 ```
 
-Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you 
-pass override it. `threads` is capped at the number of logical CPUs, and `1` disables the thread pool. `allow_simd=False` 
-(`LUSTRO_SIMD_SCALAR` in C/C++) selects the scalar backend.
+Arguments you omit (`None` in Python, `0` and `LUSTRO_SIMD_KEEP` in C/C++) still follow the environment; the ones you
+pass override it. In C/C++, `simd` is `LUSTRO_SIMD_KEEP`, `LUSTRO_SIMD_AUTO` (`allow_simd=True`) or `LUSTRO_SIMD_SCALAR`
+(`allow_simd=False`).
 
-The settings are fixed once, by whichever comes first: `configure`, the first hash batch call, batch `fill_blocks`/`blocks`, 
-or creating an XOF batch from at least one message (`LustroXofBatch::new`, `LustroXofBatch(...)`, `lustro_xof_batch_new`). 
-These calls do not fix them: `runtime_info()`, `suggested_steps()` and, in C/C++, `lustro_runtime_threads()` and 
-`lustro_runtime_backend()`. A batch call that fails once it has started the hash (for example `hash*_many_var_into` with 
-`release_gil=False` on a big list that has a bad item) has fixed them.
+The settings are fixed once, by whichever of these comes first:
 
-In C/C++ the `*_many_*` functions with `n == 0` and `*_batch_fill_blocks` with `n == 0` or `steps == 0` return before the
-dispatcher and fix nothing (a hash batch call with zero messages fixes them in Rust and Python).
+- `configure`;
+- a hash batch call;
+- batch `fill_blocks` or `blocks`;
+- creating an XOF batch from at least one message (`LustroXofBatch::new`, `LustroXofBatch(...)`, `lustro_xof_batch_new`).
+
+These do not fix them: `runtime_info()`, `suggested_steps()` and, in C/C++, `lustro_runtime_threads()` and
+`lustro_runtime_backend()`. Two edge cases:
+
+- A batch call that fails once it has started the hash (for example `hash*_many_var_into` with `release_gil=False` on a big
+  list that has a bad item) has fixed them.
+- In C/C++ the `*_many_*` functions with `n == 0` and `*_batch_fill_blocks` with `n == 0` or `steps == 0` return before the
+  dispatcher and fix nothing. In Rust and Python a hash batch call with zero messages fixes them.
 
 The settings belong to the whole process. An application calls `configure` early, before any batch; a library that uses 
 Lustro should not call it and can read the settings with `runtime_info()`.
@@ -2014,7 +1600,8 @@ entries, `TypeError` for another dtype or dimension).
 Stream IDs and path elements are Python ints from 0 to `2**128 - 1` (`OverflowError` otherwise). A list of them can be any
 sequence, for example a `tuple`, a `range` or a NumPy integer array.
 
-All four classes can be pickled, for example to pass them to a worker process. The restored object is a copy that continues
+`LustroPrng`, `LustroXof`, `LustroPrngBatch` and `LustroXofBatch` can be pickled, for example to pass them to a worker
+process (`LustroHasher` and `LustroXofAbsorber` cannot). The restored object is a copy that continues
 from the same position, not a new stream: workers that need independent streams should use `fork()` or different stream IDs.
 Do not load pickles from untrusted sources; for long-term storage use `export_snapshot()`.
 
@@ -2022,20 +1609,18 @@ An instance must not be used by several threads at the same time (an overlapping
 `fork()` or separate instances instead. The installed version is available as `lustro.__version__`, and the package ships
 type stubs (`lustro.pyi`, `py.typed`).
 
----
-
 ### GIL and Throughput (Python)
 
-Calls that process 4096 bytes or more release the GIL and hold it below that: `hash256`, `hash128`, `fill`, `read`,
-`fill_u64`, `fill_into`, `readinto`, `advance_bytes` (for `advance_blocks`, 128 blocks), `LustroHasher.update`,
-`LustroXofAbsorber.update`, `LustroXof(message)` and `LustroXof.derive_path`. The copy into `buf` in `fill_into` and
-`readinto` holds it.
+Whether a call releases the GIL depends on what it does:
 
-The hash batch functions (`hash*_many_*`) and `fill_blocks` release it; all of them except `hash*_many_fixed` take
-`release_gil=False` to keep it. `blocks`, `LustroXofBatch(...)` and `LustroXofBatch.derive_path` release it while they work.
-Other batch calls that build or copy lanes (constructors, `new_range`, `fork*`, `from_streams`, `copy`, `iter(batch)`,
-snapshots, `LustroPrngBatch.derive_path`) hold it, and their time grows with the lane count. A pending Ctrl-C during
-`advance_bytes` or `advance_blocks` is raised between chunks of 2^20 blocks and leaves the stream unchanged.
+| Calls | GIL |
+|---|---|
+| `hash256`, `hash128`, `fill`, `read`, `fill_u64`, `fill_into`, `readinto`, `advance_bytes` (for `advance_blocks`, 128 blocks), `LustroHasher.update`, `LustroXofAbsorber.update`, `LustroXof(message)`, `LustroXof.derive_path` | released from 4096 bytes, held below that. The copy into `buf` in `fill_into` and `readinto` holds it |
+| `hash*_many_*`, `fill_blocks` | released; `release_gil=False` keeps it (for `fill_blocks` on little-endian targets only). `hash256_many_fixed` and `hash128_many_fixed` have no such argument, their `_into` variants do |
+| `blocks`, `LustroXofBatch(...)`, `LustroXofBatch.derive_path` | released while they work |
+| the other batch calls that build or copy lanes: constructors, `new_range`, `fork*`, `from_streams`, `copy`, `iter(batch)`, snapshots, `LustroPrngBatch.derive_path` | held; their time grows with the lane count |
+
+A pending Ctrl-C during `advance_bytes` or `advance_blocks` is raised between chunks of 2^20 blocks and leaves the stream unchanged.
 
 By default (`release_gil=True`) other Python threads run during the call. Input that is not `bytes` is copied before the GIL
 is released (`hash*_many_fixed*` copy their rows), `*_into` calls compute the digests in a scratch buffer and copy them into
@@ -2066,8 +1651,6 @@ how it is shared). If a big exact `list` or `tuple` (4096 items or more) given t
 Each thread keeps up to four buffers between hash batch calls (copied rows, digests of `*_into`, copied `offsets`, the table
 of message slices), up to 32 MiB each and 128 MiB in all until the thread exits. The buffers are not cleared, so bytes of the
 last calls stay in them.
-
----
 
 ### rand_core Integration (Rust)
 
@@ -2112,8 +1695,10 @@ let b = draw(&mut xof);
   `LustroPrng::fork(StreamId)`. The trait method `SeedableRng::fork()` runs in code
   generic over `SeedableRng` or when called as `SeedableRng::fork(&mut prng)`; it
   seeds a new generator from the next 32 bytes of `prng`.
-- **Clone and `derive_path`:** a clone repeats the same bytes, so do not use it to get a second independent stream; use
-  `fork` or `derive_path`. `derive_path` is not a trait method, so generic code over `Rng` cannot call it; `clone` needs a
+- **Clone and `derive_path`:** both exist on `LustroPrng` and `LustroXof` and work
+  without the `rand` feature. A clone repeats the same bytes, so do not use it to get
+  a second independent stream; use `fork` or `derive_path` for that. `derive_path` is
+  not a trait method, so generic code over `Rng` cannot call it; `clone` needs a
   `Clone` bound.
 - **Quality:** `CryptoRng` is not implemented.
 
@@ -2133,4 +1718,6 @@ let b = draw(&mut xof);
 | Batch snapshot header | 16 | `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN` | `LUSTRO_BATCH_SNAPSHOT_HEADER_LEN` | `BATCH_SNAPSHOT_HEADER_LEN` |
 | Batch snapshot, per stream | 48 | `LUSTRO_BATCH_SNAPSHOT_LANE_LEN` | `LUSTRO_BATCH_SNAPSHOT_LANE_LEN` | `BATCH_SNAPSHOT_LANE_LEN` |
 
-For full API details please see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+---
+
+For full API details please see **[ARCHITECTURE.md](https://github.com/Ligatum/Lustro_API/blob/main/ARCHITECTURE.md)**.

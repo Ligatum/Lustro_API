@@ -611,7 +611,8 @@ LustroError lustro_prng_position(const struct LustroPrng *ctx, uint8_t *out);
  * If `ctx` is non-null, it must point to a live `LustroPrng` context that
  * is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_clone(const struct LustroPrng *ctx, struct LustroPrng **out_ctx);
 
@@ -626,7 +627,8 @@ LustroError lustro_prng_clone(const struct LustroPrng *ctx, struct LustroPrng **
  * If `ctx` is non-null, it must point to a live `LustroPrng` context that
  * is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_fork(const struct LustroPrng *ctx,
                              uint64_t id_hi,
@@ -646,7 +648,8 @@ LustroError lustro_prng_fork(const struct LustroPrng *ctx,
  * is not mutably accessed or freed during the call.
  * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_fork_batch(const struct LustroPrng *ctx,
                                    const uint64_t *ids_hi,
@@ -665,7 +668,8 @@ LustroError lustro_prng_fork_batch(const struct LustroPrng *ctx,
  * If `ctx` is non-null, it must point to a live `LustroPrng` context that
  * is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_fork_batch_range(const struct LustroPrng *ctx,
                                          uint64_t first_hi,
@@ -686,7 +690,8 @@ LustroError lustro_prng_fork_batch_range(const struct LustroPrng *ctx,
  * is not mutably accessed or freed during the call.
  * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_fork_path(const struct LustroPrng *ctx,
                                   const uint64_t *ids_hi,
@@ -804,7 +809,8 @@ void lustro_prng_batch_free(struct LustroPrngBatch *ctx);
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
  * that is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_batch_clone(const struct LustroPrngBatch *ctx,
                                     struct LustroPrngBatch **out_ctx);
@@ -819,7 +825,8 @@ LustroError lustro_prng_batch_clone(const struct LustroPrngBatch *ctx,
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
  * that is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_batch_lane(const struct LustroPrngBatch *ctx,
                                    uintptr_t index,
@@ -839,7 +846,8 @@ LustroError lustro_prng_batch_lane(const struct LustroPrngBatch *ctx,
  * `LustroPrng` context that is not mutably accessed or freed during the call. The same context
  * may appear more than once.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of the contexts.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of one of the
+ * contexts is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_batch_from_streams(const struct LustroPrng *const *streams,
                                            uintptr_t n,
@@ -909,7 +917,8 @@ LustroError lustro_prng_batch_fill_blocks(struct LustroPrngBatch *ctx,
  * `ids_hi` and `ids_lo` must each be valid for `n` readable elements
  * when `n > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_batch_fork(const struct LustroPrngBatch *ctx,
                                    const uint64_t *ids_hi,
@@ -932,7 +941,8 @@ LustroError lustro_prng_batch_fork(const struct LustroPrngBatch *ctx,
  * `ids_hi` and `ids_lo` must each be valid for `k` readable elements
  * when `k > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_batch_fork_many(const struct LustroPrngBatch *ctx,
                                         const uint64_t *ids_hi,
@@ -978,7 +988,8 @@ LustroError lustro_prng_batch_derive_path(const uint8_t *seed,
  * If `ctx` is non-null, it must point to a live `LustroPrngBatch` context
  * that is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_prng_batch_fork_range(const struct LustroPrngBatch *ctx,
                                          uint64_t first_hi,
@@ -1153,7 +1164,8 @@ LustroError lustro_xof_position(const struct LustroXof *ctx, uint8_t *out);
  * If `ctx` is non-null, it must point to a live `LustroXof` context that
  * is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_clone(const struct LustroXof *ctx, struct LustroXof **out_ctx);
 
@@ -1168,7 +1180,8 @@ LustroError lustro_xof_clone(const struct LustroXof *ctx, struct LustroXof **out
  * If `ctx` is non-null, it must point to a live `LustroXof` context that
  * is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_fork(const struct LustroXof *ctx,
                             uint64_t id_hi,
@@ -1188,7 +1201,8 @@ LustroError lustro_xof_fork(const struct LustroXof *ctx,
  * is not mutably accessed or freed during the call.
  * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_fork_batch(const struct LustroXof *ctx,
                                   const uint64_t *ids_hi,
@@ -1207,7 +1221,8 @@ LustroError lustro_xof_fork_batch(const struct LustroXof *ctx,
  * If `ctx` is non-null, it must point to a live `LustroXof` context that
  * is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_fork_batch_range(const struct LustroXof *ctx,
                                         uint64_t first_hi,
@@ -1228,7 +1243,8 @@ LustroError lustro_xof_fork_batch_range(const struct LustroXof *ctx,
  * is not mutably accessed or freed during the call.
  * `ids_hi` and `ids_lo` must each be valid for `n` readable elements when `n > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_fork_path(const struct LustroXof *ctx,
                                  const uint64_t *ids_hi,
@@ -1414,7 +1430,8 @@ void lustro_xof_batch_free(struct LustroXofBatch *ctx);
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
  * that is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of one of the
+ * contexts is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_batch_clone(const struct LustroXofBatch *ctx,
                                    struct LustroXofBatch **out_ctx);
@@ -1429,7 +1446,8 @@ LustroError lustro_xof_batch_clone(const struct LustroXofBatch *ctx,
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
  * that is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_batch_lane(const struct LustroXofBatch *ctx,
                                   uintptr_t index,
@@ -1449,7 +1467,8 @@ LustroError lustro_xof_batch_lane(const struct LustroXofBatch *ctx,
  * `LustroXof` context that is not mutably accessed or freed during the call. The same context
  * may appear more than once.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of the contexts.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_batch_from_streams(const struct LustroXof *const *streams,
                                           uintptr_t n,
@@ -1519,7 +1538,8 @@ LustroError lustro_xof_batch_fill_blocks(struct LustroXofBatch *ctx,
  * `ids_hi` and `ids_lo` must each be valid for `n` readable elements
  * when `n > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
                                   const uint64_t *ids_hi,
@@ -1542,7 +1562,8 @@ LustroError lustro_xof_batch_fork(const struct LustroXofBatch *ctx,
  * `ids_hi` and `ids_lo` must each be valid for `k` readable elements
  * when `k > 0`.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_batch_fork_many(const struct LustroXofBatch *ctx,
                                        const uint64_t *ids_hi,
@@ -1591,7 +1612,8 @@ LustroError lustro_xof_batch_derive_path(const uint8_t *const *message_ptrs,
  * If `ctx` is non-null, it must point to a live `LustroXofBatch` context
  * that is not mutably accessed or freed during the call.
  * If `out_ctx` is non-null, it must be valid for writing one pointer
- * and must not overlap any input buffer or the memory of `ctx`.
+ * and must not overlap any input buffer. An `out_ctx` that overlaps the memory of `ctx`
+ * is `InvalidPointer`, and then `*out_ctx` is not written.
  */
 LustroError lustro_xof_batch_fork_range(const struct LustroXofBatch *ctx,
                                         uint64_t first_hi,

@@ -78,7 +78,9 @@ unsafe fn write_into(
 }
 
 // Writes into a writable, C-contiguous byte buffer, see `write_into`; the held buffer view
-// keeps the exporter alive and blocks resizing.
+// keeps the exporter alive and blocks resizing. TypeError, BufferError and ValueError of the
+// exporter become the same TypeError as for a missing buffer, other exceptions are passed on
+// (as in `fill_raw_buffer`).
 pub(crate) fn fill_buffer(
     buf: &Bound<'_, pyo3::PyAny>,
     fill: impl FnMut(&mut [u8]) + Send,
@@ -89,7 +91,17 @@ pub(crate) fn fill_buffer(
              (bytearray, memoryview, numpy uint8 array)",
         )
     };
-    let view = pyo3::buffer::PyBuffer::<u8>::get(buf).map_err(|_| bad())?;
+    let view = pyo3::buffer::PyBuffer::<u8>::get(buf).map_err(|e| {
+        let py = buf.py();
+        if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+            || e.is_instance_of::<pyo3::exceptions::PyBufferError>(py)
+            || e.is_instance_of::<pyo3::exceptions::PyValueError>(py)
+        {
+            bad()
+        } else {
+            e
+        }
+    })?;
     if view.readonly() || !view.is_c_contiguous() {
         return Err(bad());
     }

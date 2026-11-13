@@ -1,10 +1,9 @@
 # Lustro API V1: Architecture
 
 This document describes the architecture, execution semantics, and
-binding references for Lustro. For a quick start, see [README](README.md).
+binding references for Lustro. For a quick start, see [README](https://github.com/Ligatum/Lustro_API/blob/main/README.md).
 
-For binding details please see [Rust API](#121-rust-api-pure-rust-no-bindings),
-[Python Bindings](#122-python-bindings), and [C FFI Reference](#123-c-ffi-reference).
+[Overview](#1-architecture-at-a-glance) · [Domains](#3-domain-separation) · [Absorption](#4-absorption--hash--xof-init-model) · [Engine](#5-engine) · [Batches](#7-batch-model-streamlane) · [Snapshots](#8-snapshot-model) · [Execution](#9-execution-policy) · [Guarantees](#10-behavioral-guarantees) · [Names across layers](#operation-names-across-layers) · [Rust](#121-rust-api-pure-rust-no-bindings) · [Python](#122-python-bindings) · [C](#123-c-ffi-reference) · [Security](#13-security--memory-model)
 
 ---
 
@@ -250,10 +249,10 @@ blocks, so batch has no `next_u64()`-style API and its snapshot format has no cu
 
 `fill_blocks()` writes directly into caller-provided output; `blocks(steps)` (Rust and Python) 
 allocates and returns the output instead. The Python buffer kept between calls is described in §12.2.
-`lane(i)` copies the state of one lane into a new single stream (Rust, Python) or context (C). 
-The new stream starts at the lane's next block, with an empty output buffer (cursor 32 in snapshot terms).
+`lane(i)` copies the state of one lane into a new single stream (Rust, Python) or context (C),
+positioned at the lane's next block (cursor 32 in snapshot terms).
 `from_streams(streams)` is the reverse: it copies `(s0, s1, step)` of each stream into a lane.
-Only a stream at a block boundary is accepted (see §10).
+Rules and errors of both: §10, Batch semantics.
 
 ### Output Layout
 
@@ -280,14 +279,44 @@ restoration.
   then `version`, `kind`, the reserved bytes of the header, `lane_count` against
   the total length and finally the reserved bytes of every lane, all before the
   lane buffer is allocated.
-- **Single-stream** (`LustroPrngSnapshot`, `LustroXofSnapshot`): fixed
-  56-byte layout: `version(1) | kind(1) | reserved(6) | s0(16) | s1(16) |
-  step(8) | cursor(1) | reserved(7)`.
-- **Batch** (`LustroPrngBatchSnapshot`, `LustroXofBatchSnapshot`):
-  variable length: a 16-byte header (`version(1) | kind(1) | reserved(6) |
-  lane_count(8)`) followed by `lane_count × 48` bytes, each lane encoding
-  `s0(16) | s1(16) | step(8) | reserved(8)`. There is no cursor field, since batch
-  lanes are always block-aligned.
+- **Single-stream** (`LustroPrngSnapshot`, `LustroXofSnapshot`): fixed 56 bytes.
+- **Batch** (`LustroPrngBatchSnapshot`, `LustroXofBatchSnapshot`): variable
+  length, a 16-byte header followed by `lane_count` lanes of 48 bytes. There is
+  no cursor field, since batch lanes are always block-aligned.
+
+All integers are little-endian.
+
+Single-stream snapshot:
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 1 | `version` | 1 |
+| 1 | 1 | `kind` | 1 (`LustroPrngSnapshot`) or 2 (`LustroXofSnapshot`) |
+| 2 | 6 | reserved | 0 |
+| 8 | 16 | `s0` | `u128` |
+| 24 | 16 | `s1` | `u128` |
+| 40 | 8 | `step` | `u64` |
+| 48 | 1 | `cursor` | `1..=32` |
+| 49 | 7 | reserved | 0 |
+
+Batch snapshot header (16 bytes):
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 1 | `version` | 1 |
+| 1 | 1 | `kind` | 3 (`LustroPrngBatchSnapshot`) or 4 (`LustroXofBatchSnapshot`) |
+| 2 | 6 | reserved | 0 |
+| 8 | 8 | `lane_count` | `u64` |
+
+Batch snapshot lanes: `lane_count` entries of 48 bytes, lane `i` starting at
+offset `16 + i × 48` (offsets below are relative to the lane):
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 16 | `s0` | `u128` |
+| 16 | 16 | `s1` | `u128` |
+| 32 | 8 | `step` | `u64` |
+| 40 | 8 | reserved | 0 |
 
 The `version` byte is 1; it does not follow the crate or API version.
 `SnapshotKind` values: `Prng` = 1, `Xof` = 2, `PrngBatch` = 3, `XofBatch` = 4.
@@ -312,26 +341,13 @@ This affects only formatting; `to_le_bytes()` / `from_le_bytes()` are unaffected
 
 Thresholds used by the dispatch layer to select the scalar or Rayon path, tuned on an Intel Core i5-11600K (6 cores / 12 threads, 12 MB L3).
 
-```text
-Hash parallelization (batch)
+**Hash parallelization (batch)**
 
-Scalar backend (fixed and variable length: separate parameters, same values):
-  Rayon path if (count >= 2048 messages OR total input >= 80 KiB)
-  AND count >= 2
-  messages per Rayon work item: at least ceil(count / (threads × 4))
-
-AVX2 backend, fixed length (`x86_64`, AVX2 available):
-  minimum messages for AVX2:    4 (fixed length 0 stays scalar)
-  Rayon path if (count >= 4096 messages OR total input >= 192 KiB)
-  AND count >= 2
-  messages per Rayon work item: whole groups of 4,
-                                max(4, ceil4(ceil(count / (threads × 2))))
-
-AVX2 backend, variable length:
-  minimum messages for AVX2:    4
-  Rayon path if (count >= 3072 messages OR total input >= 192 KiB)
-  AND count >= 16
-  messages per Rayon work item: as for fixed length
+| Backend, length | Min. messages for AVX2 | Rayon path if | Messages per Rayon work item |
+|---|---|---|---|
+| Scalar, fixed and variable (separate parameters, same values) | — | (`count >= 2048` or total input `>= 80 KiB`) and `count >= 2` | at least `ceil(count / (threads × 4))` |
+| AVX2, fixed (`x86_64`, AVX2 available) | 4 (fixed length 0 stays scalar) | (`count >= 4096` or total input `>= 192 KiB`) and `count >= 2` | whole groups of 4: `max(4, ceil4(ceil(count / (threads × 2))))` |
+| AVX2, variable | 4 | (`count >= 3072` or total input `>= 192 KiB`) and `count >= 16` | as for fixed |
 
 AVX2 kernels process 4 messages per group; the last 0..=3 messages run scalar.
 For variable lengths, messages are taken in windows of up to 256. If the first groups of a
@@ -339,23 +355,16 @@ window do not already have equal block counts, the window is regrouped by block 
 that the lanes of a group finish together. A group of unequal lengths whose lanes would be
 less than 40% busy (sum of blocks < 1.6 × longest) runs scalar.
 
-Stream parallelization (`fill_blocks`)
+**Stream parallelization (`fill_blocks`)**
 
-Scalar backend:
-  parallel work-size threshold: 4096 (lanes × steps)
-  lanes per Rayon work item:    ceil4(lanes / 8), at most floor4(512 / steps),
-                                at least 4 and at least ceil4(lanes / threads)
-
-AVX2 backend (`x86_64`, AVX2 available):
-  minimum lanes for AVX2:       4
-  parallel work-size threshold: 6144 (lanes × steps)
-  lanes per Rayon work item:    as scalar, with 768 in place of 512
-  AVX2 kernel width:            4 lanes
+| Backend | Min. lanes for AVX2 | Parallel threshold (lanes × steps) | Lanes per Rayon work item |
+|---|---|---|---|
+| Scalar | — | 4096 | `ceil4(lanes / 8)`, at most `floor4(512 / steps)`, at least 4 and at least `ceil4(lanes / threads)` |
+| AVX2 (`x86_64`, AVX2 available; kernel width 4 lanes) | 4 | 6144 | as scalar, with 768 in place of 512 |
 
 Parallel execution needs a pool of at least 2 threads and at least
-min(4, threads) Rayon work items. ceil4 / floor4 round up / down to a
+`min(4, threads)` Rayon work items. `ceil4` / `floor4` round up / down to a
 multiple of 4.
-```
 
 ### Thread pool
 
@@ -389,14 +398,19 @@ A value given there replaces the variables of the same purpose: `threads` replac
 and `LUSTRO_DISABLE_MT`, `allow_simd` replaces `LUSTRO_DISABLE_SIMD`. A value left unset follows the environment. 
 `threads` is capped at the number of logical CPUs, and `1` disables the pool.
 
-The settings are fixed once, by whichever comes first: `configure()` or the first batch call. A batch call is 
-a hash batch call, batch `fill_blocks()`/`blocks()`, or the creation of an XOF batch from at least one message 
-(`LustroXofBatch::new`, Python `LustroXofBatch(...)`, C `lustro_xof_batch_new`). Creating a batch in any other 
-way does not fix them. `suggested_steps()`, `runtime_info()` and a single `hash256()` / `hash128()` call do not 
-fix them. A hash batch call with zero messages fixes them in Rust and Python; the C `*_many_*` functions with `n == 0` return 
-before the dispatcher and do not; the same holds for `*_batch_fill_blocks` with `n == 0` or `steps == 0`. The C
-`*_many_var` functions check the message table on the thread pool from 8192 messages, which fixes the settings even
-if the call then returns an error. When calls race, one of them wins.
+The settings are fixed once, by whichever comes first: `configure()` or the first batch call:
+
+| Call | Rust | Python | C |
+|---|---|---|---|
+| Hash batch call, at least one message | fixes | fixes | fixes |
+| Hash batch call, zero messages | fixes | fixes | does not (`*_many_*` with `n == 0` return before the dispatcher) |
+| Batch `fill_blocks()` / `blocks()` | fixes | fixes | fixes (`*_batch_fill_blocks`) |
+| The same with an empty batch or `steps = 0` | fixes | does not | does not (`n == 0` or `steps == 0`) |
+| XOF batch creation from at least one message | fixes (`LustroXofBatch::new`) | fixes (`LustroXofBatch(...)`) | fixes (`lustro_xof_batch_new`) |
+| Any other batch creation, `suggested_steps()`, `runtime_info()`, a single `hash256()` / `hash128()` call | does not | does not | does not |
+
+The C `*_many_var` functions check the message table on the thread pool from 8192 messages,
+which fixes the settings even if the call then returns an error. When calls race, one of them wins.
 
 A later `configure()` returns `Ok` if it asks for the same effect as the fixed settings, and `AlreadyConfigured` 
 otherwise. Same effect: the same SIMD choice and, with `parallel`, the same pool size (`threads` above the CPU 
@@ -522,8 +536,7 @@ These guarantees hold across Rust, Python, and C FFI layers.
 - `steps = 0` is a no-op; state is unchanged.
 - `blocks(steps)` (Rust and Python) returns the blocks `fill_blocks` would write, in a new
   `Vec<[u8; 32]>` (Rust) or array (Python), and advances the lanes the same way. On
-  a size or allocation error the state is unchanged; in Python this does not cover a
-  failure while the array object is created, after generation. An empty batch
+  a size or allocation error the state is unchanged. An empty batch
   gives an empty result.
 - `lane(i)` (batch only, PRNG and XOF) returns lane `i` as an independent single
   stream positioned at that lane's next block. Its bytes are the concatenation
@@ -586,24 +599,32 @@ below.
 
 | Operation | Rust | Python | C |
 |---|---|---|---|
+| Hash, one message | `hash256(data)`, `hash128(data)` | `hash256(data)`, `hash128(data)` | `lustro_hash256(data, data_len, out)`, `lustro_hash128(data, data_len, out)` |
+| Hash, batch | `hash256_many_var(&[&[u8]])` (variable length), `hash256_many_fixed(data, message_len)` and `hash256_many_fixed_into(data, message_len, out)` (fixed length) | `hash256_many_fixed` (2D array, fixed length), `hash256_many_fixed_into(data, out)`, `hash256_many_var`, `hash256_many_var_into(messages, out)`, `hash256_many_offsets(data, offsets)`, `hash256_many_offsets_into(data, offsets, out)` | `lustro_hash256_many_fixed` (fixed length), `_many_var` |
+| Incremental hash | `LustroHasher::new(total_len)`, `update(data)`, `finalize()`, `remaining()`; `hash256_reader(total_len, reader)` | `LustroHasher(length)`, `update(data)`, `digest()`, `hexdigest()`, `remaining()` | `lustro_hasher_new(total_len, out_ctx)`, `_update(ctx, data, data_len)`, `_finalize256(ctx, out)`, `_remaining(ctx, out_remaining)`, `_clone`, `_free` |
+| Incremental XOF | `LustroXofAbsorber::new(total_len)`, `update(data)`, `finalize()` → `LustroXof`, `remaining()`; `LustroXof::from_reader(total_len, reader)` | `LustroXofAbsorber(length)`, `update(data)`, `finalize()` → `LustroXof`, `remaining()` | `lustro_xof_absorber_new(total_len, out_ctx)`, `_update(ctx, data, data_len)`, `_finalize(ctx, out_ctx)` → `LustroXof*`, `_remaining(ctx, out_remaining)`, `_clone`, `_free` |
+| Stream constructor | `LustroPrng::new(&seed, stream_id)`, `LustroXof::new(message)` | `LustroPrng(seed, stream_id=0)`, `LustroXof(message)` | `lustro_prng_new(seed, stream_id_hi, stream_id_lo, out_ctx)`, `lustro_xof_new(message, message_len, out_ctx)` |
+| Random seed | `Seed256::from_entropy()`, `LustroPrng::from_entropy()`, `LustroPrng::from_entropy_with_id(id)` (`feature = "entropy"`) | `LustroPrng.from_entropy(stream_id=0)` | `lustro_seed_from_entropy(out_seed)`, `lustro_prng_from_entropy(stream_id_hi, stream_id_lo, out_ctx)` |
+| Runtime settings | `configure(options)`, `runtime_info()` | `configure(threads=None, allow_simd=None)`, `runtime_info()` → `dict` | `lustro_configure(threads, simd)`, `lustro_runtime_info(out, out_size)` |
 | Fill bytes | `fill_bytes(out)` | `fill(size)` → `bytes`, `fill_into(buf)`, `fill_u64(n)` → `uint64` array | `lustro_*_fill(ctx, out, out_len)` |
 | Read as a stream | `std::io::Read::read(buf)` | `read(size)` → `bytes`, `readinto(buf)` → bytes written | `lustro_*_fill` (no separate function) |
 | Typed reads | `next_u32()`, `next_u64()`, `next_u128()`, `next_block()` | same | `lustro_*_next_u32`, `_next_u64`, `_next_u128`, `_next_block` (write to `out`) |
 | Skip and position | `advance_bytes(n)`, `advance_blocks(n)`, `position()` | same | `lustro_*_advance_bytes(ctx, n)`, `_advance_blocks(ctx, n)`, `_position(ctx, out)` (16 bytes, little-endian) |
 | Copy | `clone()`, `try_clone()` (batch) | `copy()`, `copy.copy()` | `lustro_prng_clone`, `lustro_xof_clone`, `lustro_prng_batch_clone`, `lustro_xof_batch_clone` |
 | Release | `Drop` | garbage collection | `lustro_*_free` |
-| Batch constructor | `new(seed, stream_ids)`, `new_range(...)`, `try_` variants | `LustroPrngBatch(seed, stream_ids)`, `new_range(...)` | `lustro_prng_batch_new`, `_new_range` |
+| Fork a stream | `fork(id)`, `fork_path(path)` | `fork(id)`, `fork_path(path)` | `lustro_*_fork(ctx, id_hi, id_lo, out_ctx)`, `lustro_*_fork_path(ctx, ids_hi, ids_lo, n, out_ctx)` |
+| Derive a stream from a seed or message | `LustroPrng::derive_path(seed, path)`, `LustroXof::derive_path(message, path)` | `LustroPrng.derive_path(seed, path)`, `LustroXof.derive_path(message, path)` (staticmethods) | `lustro_prng_derive_path(seed, ids_hi, ids_lo, n, out_ctx)`, `lustro_xof_derive_path(message, message_len, ids_hi, ids_lo, n, out_ctx)` |
+| Batch constructor | `new(seed, stream_ids)`, `new_range(...)`, `try_` variants; `LustroXofBatch::new(messages)` | `LustroPrngBatch(seed, stream_ids)`, `new_range(...)`; `LustroXofBatch(messages)` | `lustro_prng_batch_new`, `_new_range`; `lustro_xof_batch_new` |
 | Batch length | `len()`, `is_empty()` | `len()`, `is_empty()`, `len(batch)` | `lustro_*_batch_len`, `lustro_*_batch_get_len(ctx, &len)` |
 | Batch output | `fill_blocks(out, steps)`, `blocks(steps)`, `try_blocks(steps)` → `Vec<[u8; 32]>` | `fill_blocks(out, steps)`, `blocks(steps)` → `uint64` array | `lustro_*_batch_fill_blocks(ctx, out, out_len, steps)` |
 | Batch lane as a single stream | `lane(i)` → `Option<…>` | `lane(i)` (`IndexError` if out of range) | `lustro_*_batch_lane(ctx, index, out_ctx)` (`InvalidArgument` if out of range) |
 | Single stream forked into a batch | `fork_batch(&ids)`, `fork_batch_range(first, count)`, `try_` variants | `fork_batch(ids)`, `fork_batch_range(first, count)` | `lustro_*_fork_batch(ctx, ids_hi, ids_lo, n, out_ctx)`, `lustro_*_fork_batch_range(ctx, first_hi, first_lo, count, out_ctx)` |
 | Single streams as a batch | `from_streams(&[…])`, `try_from_streams(&[…])` | `from_streams(streams)` (staticmethod; `ValueError` for a stream inside a block) | `lustro_*_batch_from_streams(streams, n, out_ctx)` (`InvalidArgument` for a stream inside a block) |
+| Batch fork | `fork(ids)`, `fork_many(ids)`, `fork_range(first)`, `try_` variants | `fork(ids)`, `fork_many(ids)`, `fork_range(first)` | `lustro_*_batch_fork(ctx, ids_hi, ids_lo, n, out_ctx)`, `lustro_*_batch_fork_many(ctx, ids_hi, ids_lo, k, out_ctx)`, `lustro_*_batch_fork_range(ctx, first_hi, first_lo, out_ctx)` |
+| Batch derive path | `LustroPrngBatch::derive_path(seed, roots, path)`, `LustroXofBatch::derive_path(messages, path)`, `try_` variants | `LustroPrngBatch.derive_path(seed, roots, path)`, `LustroXofBatch.derive_path(messages, path)` (staticmethods) | `lustro_prng_batch_derive_path(seed, roots_hi, roots_lo, n_roots, path_hi, path_lo, n_path, out_ctx)`, `lustro_xof_batch_derive_path(message_ptrs, message_lens, n_messages, path_hi, path_lo, n_path, out_ctx)` |
 | Snapshot | `export_snapshot()` → snapshot type, `to_le_bytes()`; batch also `try_export_snapshot()`, `try_to_le_bytes()` | `export_snapshot()` → `bytes` | `lustro_*_export_snapshot`; batch: `_batch_snapshot_size` first |
 | Restore | `import_snapshot(snapshot)` | `import_snapshot(bytes)` | `lustro_*_import_snapshot` |
 | Snapshot kind | `SnapshotKind::detect(bytes)` | `snapshot_kind(bytes)` | `lustro_snapshot_kind(bytes, len, out_kind)` |
-| Hash, batch | `hash256_many_var(&[&[u8]])` (variable length), `hash256_many_fixed(data, message_len)` and `hash256_many_fixed_into(data, message_len, out)` (fixed length) | `hash256_many_fixed` (2D array, fixed length), `hash256_many_fixed_into(data, out)`, `hash256_many_var`, `hash256_many_var_into(messages, out)`, `hash256_many_offsets(data, offsets)`, `hash256_many_offsets_into(data, offsets, out)` | `lustro_hash256_many_fixed` (fixed length), `_many_var` |
-| Incremental hash | `LustroHasher::new(total_len)`, `update(data)`, `finalize()`, `remaining()`; `hash256_reader(total_len, reader)` | `LustroHasher(length)`, `update(data)`, `digest()`, `hexdigest()`, `remaining()` | `lustro_hasher_new(total_len, out_ctx)`, `_update(ctx, data, data_len)`, `_finalize256(ctx, out)`, `_remaining(ctx, out_remaining)`, `_clone`, `_free` |
-| Incremental XOF | `LustroXofAbsorber::new(total_len)`, `update(data)`, `finalize()` → `LustroXof`, `remaining()`; `LustroXof::from_reader(total_len, reader)` | `LustroXofAbsorber(length)`, `update(data)`, `finalize()` → `LustroXof`, `remaining()` | `lustro_xof_absorber_new(total_len, out_ctx)`, `_update(ctx, data, data_len)`, `_finalize(ctx, out_ctx)` → `LustroXof*`, `_remaining(ctx, out_remaining)`, `_clone`, `_free` |
 
 `fork`, `fork_many`, `fork_range`, `fork_batch`, `fork_batch_range`, `fork_path`,
 `derive_path` and `suggested_steps` have the same name in all three layers (C functions
@@ -625,7 +646,7 @@ to the same items. `EntropyError` is re-exported at the crate root with
 snapshot types are re-exported at the crate root as well.
 `LustroError` is only available under `lustro::errors`.
 
-**Functions**
+#### Rust Functions
 
 | Module | Functions |
 |---|---|
@@ -634,11 +655,11 @@ snapshot types are re-exported at the crate root as well.
 | `LustroHasher` | `new(total_len)`, `update(data)`, `finalize()`, `remaining()`, `clone()` |
 | `LustroXofAbsorber` | `new(total_len)`, `update(data)`, `finalize()`, `remaining()`, `clone()` |
 | `LustroPrng` | `new(seed, stream_id)`, `from_entropy()` and `from_entropy_with_id(id)` (`feature = "entropy"`), `next_u32()`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `advance_bytes(n)`, `advance_blocks(n)`, `position()`, `fork(id)`, `fork_batch(ids)`, `try_fork_batch(ids)`, `fork_batch_range(first, count)`, `try_fork_batch_range(first, count)`, `fork_path(path)`, `try_fork_path(path)`, `derive_path(seed, path)`, `try_derive_path(seed, path)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
-| `LustroPrngBatch` | `new(seed, stream_ids)`, `try_new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `try_new_range(seed, first_stream_id, count)`, `from_streams(streams)`, `try_from_streams(streams)`, `len()`, `is_empty()`, `suggested_steps()`, `fill_blocks(out, steps)`, `blocks(steps)`, `try_blocks(steps)`, `lane(i)`, `fork(ids)`, `try_fork(ids)`, `fork_many(ids)`, `try_fork_many(ids)`, `fork_range(first)`, `try_fork_range(first)`, `derive_path(seed, roots, path)`, `try_derive_path(seed, roots, path)`, `clone()`, `try_clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
+| `LustroPrngBatch` | `new(seed, stream_ids)`, `try_new(seed, stream_ids)`, `new_range(seed, first_stream_id, count)`, `try_new_range(seed, first_stream_id, count)`, `from_streams(streams)`, `try_from_streams(streams)`, `len()`, `is_empty()`, `suggested_steps()`, `fill_blocks(out, steps)`, `blocks(steps)`, `try_blocks(steps)`, `lane(i)`, `fork(ids)`, `try_fork(ids)`, `fork_many(ids)`, `try_fork_many(ids)`, `fork_range(first)`, `try_fork_range(first)`, `derive_path(seed, roots, path)`, `try_derive_path(seed, roots, path)`, `clone()`, `try_clone()`, `export_snapshot()`, `try_export_snapshot()`, `import_snapshot(snapshot)` |
 | `LustroXof` | `new(message)`, `from_reader(total_len, reader)`, `next_u32()`, `next_u64()`, `next_u128()`, `next_block()`, `fill_bytes(out)`, `advance_bytes(n)`, `advance_blocks(n)`, `position()`, `fork(id)`, `fork_batch(ids)`, `try_fork_batch(ids)`, `fork_batch_range(first, count)`, `try_fork_batch_range(first, count)`, `fork_path(path)`, `try_fork_path(path)`, `derive_path(message, path)`, `try_derive_path(message, path)`, `clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
-| `LustroXofBatch` | `new(messages)`, `try_new(messages)`, `from_streams(streams)`, `try_from_streams(streams)`, `len()`, `is_empty()`, `suggested_steps()`, `fill_blocks(out, steps)`, `blocks(steps)`, `try_blocks(steps)`, `lane(i)`, `fork(ids)`, `try_fork(ids)`, `fork_many(ids)`, `try_fork_many(ids)`, `fork_range(first)`, `try_fork_range(first)`, `derive_path(messages, path)`, `try_derive_path(messages, path)`, `clone()`, `try_clone()`, `export_snapshot()`, `import_snapshot(snapshot)` |
+| `LustroXofBatch` | `new(messages)`, `try_new(messages)`, `from_streams(streams)`, `try_from_streams(streams)`, `len()`, `is_empty()`, `suggested_steps()`, `fill_blocks(out, steps)`, `blocks(steps)`, `try_blocks(steps)`, `lane(i)`, `fork(ids)`, `try_fork(ids)`, `fork_many(ids)`, `try_fork_many(ids)`, `fork_range(first)`, `try_fork_range(first)`, `derive_path(messages, path)`, `try_derive_path(messages, path)`, `clone()`, `try_clone()`, `export_snapshot()`, `try_export_snapshot()`, `import_snapshot(snapshot)` |
 
-**Types**
+#### Rust Types
 
 | Type | Methods / Traits |
 |---|---|
@@ -665,7 +686,7 @@ snapshot types are re-exported at the crate root as well.
 | `LustroPrng`, `LustroXof` | `std::io::Read`: `read` behaves like `fill_bytes` and returns `Ok(buf.len())`; the stream has no end, so `read_to_end` and `read_to_string` return `InvalidInput` (bound the read, for example with `take`) |
 | `LustroPrng`, `LustroXof` (`feature = "rand"`) | `rand_core::TryRng` (`Error = Infallible`, the `try_*` methods always return `Ok`) and `rand_core::Rng`; the methods read the same stream as `next_u32`, `next_u64` and `fill_bytes`. `LustroPrng` also implements `rand_core::SeedableRng` (`from_seed` creates stream 0) |
 
-**Optional Integrations**
+#### Optional Integrations
 
 Under `feature = "rand"`, `LustroPrng` and `LustroXof` implement
 `rand_core::TryRng` with `Error = Infallible`, and through it `rand_core::Rng`
@@ -686,7 +707,7 @@ Under `feature = "rand"`, `LustroPrng` and `LustroXof` implement
   the inherent `fork(id)` takes precedence; call `SeedableRng::fork(&mut rng)`
   to use the trait method, which seeds a new generator from 32 bytes of `rng`.
 
-**Error Model**
+#### Error Model
 
 Fallible operations return `Result`: the four snapshot decoders, the
 `TryFrom<&[u8]>` conversions for `Hash128`, `Hash256`, and `Seed256`,
@@ -695,7 +716,8 @@ Fallible operations return `Result`: the four snapshot decoders, the
 and `LustroXofAbsorber`, `hash256_reader()`, `LustroXof::from_reader()` and the
 `try_*` variants. Everything else succeeds for valid arguments;
 documented misuse checks and, in the non-`try_` variants, allocation or size
-failures may panic.
+failures may panic. Operations that have a `try_` twin are listed in the
+second table below.
 
 | Function(s) | Behavior |
 |---|---|
@@ -707,31 +729,36 @@ failures may panic.
 | `Seed256::from_entropy`, `LustroPrng::from_entropy`, `LustroPrng::from_entropy_with_id` (`feature = "entropy"`) | Returns `Result<Self, EntropyError>` when the operating system cannot provide entropy. |
 | `LustroPrng` / `LustroXof` `read_to_end`, `read_to_string` | Always returns `Err` with `ErrorKind::InvalidInput` and reads nothing: the stream has no end. A limited read (`take`) works. |
 | `configure` | Returns `Result<(), ConfigError>`. `Ok(())` if the settings are not fixed yet, or are fixed with the same effect as the requested ones. `Err(ConfigError::AlreadyConfigured)` if they are fixed with another effect. |
-| `hash256_many_fixed` / `hash128_many_fixed` | Panics if `message_len` is 0, if `data.len()` is not a multiple of `message_len`, or if the output allocation fails. `try_hash256_many_fixed` and `try_hash128_many_fixed` return `Err(BatchError::InvalidMessageLen { data_len, message_len })` or `Err(BatchError::Reserve)` instead. |
-| `hash256_many_var` / `hash128_many_var` | Panics if the output allocation fails. `try_hash256_many_var` and `try_hash128_many_var` return `Err(BatchError::Reserve)` instead. |
 | `hash256_many_fixed_into` / `hash128_many_fixed_into` | Panics if `data.len() != out.len() * message_len`. |
 | `hash256_many_var_into` / `hash128_many_var_into` | Panics if `messages.len() != out.len()`. |
 | `LustroPrngBatch::fill_blocks` / `LustroXofBatch::fill_blocks` | Panics if `out.len() != len() * steps` (or on `usize` overflow). |
-| `LustroPrngBatch::blocks` / `LustroXofBatch::blocks` | Panics if `len() * steps` overflows `usize`, or if the output allocation fails. `try_blocks` returns `Err(BatchError::SizeOverflow)` or `Err(BatchError::Reserve)` instead; the state is unchanged. |
 | `LustroPrngBatch::lane` / `LustroXofBatch::lane` | Returns `None` if `i >= len()`. |
-| `LustroPrngBatch::from_streams` / `LustroXofBatch::from_streams` | Panics if a stream is inside a block, or if lane allocation fails. `try_from_streams` returns `Err(BatchError::PartialBlock { index })` (the first such stream) or `Err(BatchError::Reserve)` instead; the streams are not changed. |
-| `LustroPrngBatch::new` / `LustroXofBatch::new` | Panics if lane allocation fails. `try_new` returns `Err(BatchError::Reserve)` instead. |
-| `LustroPrngBatch::fork` / `LustroXofBatch::fork` | Panics if `ids.len() != len()`, or if lane allocation fails. `try_fork` returns `Err(BatchError::LengthMismatch { expected, actual })` or `Err(BatchError::Reserve)` instead. |
-| `LustroPrngBatch::fork_range` / `LustroXofBatch::fork_range` | Panics if lane allocation fails. `try_fork_range` returns `Err(BatchError::Reserve)` instead. |
-| `LustroPrngBatch::new_range` | Panics if lane allocation fails. `try_new_range` returns `Err(BatchError::Reserve)` instead. |
-| `LustroPrngBatch::fork_many` / `LustroXofBatch::fork_many` | Panics if `len() * ids.len()` overflows `usize`, or if lane allocation fails. `try_fork_many` returns `Err(BatchError::SizeOverflow)` or `Err(BatchError::Reserve)` instead. |
 | `LustroPrngBatch::try_clone` / `LustroXofBatch::try_clone` | Returns `Err(BatchError::Reserve)` if the lane buffer cannot be reserved (never `SizeOverflow`). `clone()` aborts the process in that case. |
-| `LustroPrngBatch::export_snapshot` / `LustroXofBatch::export_snapshot` | Panics if the lane buffer cannot be allocated. `try_export_snapshot` returns `Err(BatchError::Reserve)` instead. |
-| `LustroPrng::derive_path` / `LustroXof::derive_path` | Panics if `path` is empty. `try_derive_path` returns `Err(DerivePathError::EmptyPath)` instead. |
-| `LustroPrngBatch::derive_path` / `LustroXofBatch::derive_path` | Panics if `path` is empty or lane allocation fails. `try_derive_path` returns `Err(DerivePathError::EmptyPath)` or `Err(DerivePathError::Reserve)` instead. |
-| `LustroPrng::fork_batch`, `fork_batch_range` / the same on `LustroXof` | Panics if lane allocation fails. `try_fork_batch` and `try_fork_batch_range` return `Err(BatchError::Reserve)` instead. |
-| `LustroPrng::fork_path` / `LustroXof::fork_path` | Panics if `path` is empty. `try_fork_path` returns `Err(DerivePathError::EmptyPath)` instead. |
 | `LustroHasher::update` | Returns `Err(HashError::TooMuchData)` if `data` is longer than what is left of the declared length; nothing is absorbed. |
 | `LustroHasher::finalize` | Returns `Err(HashError::TooLittleData)` while bytes are left; the hasher is unchanged and `update` can continue. Takes `&self`: every call returns the same digest. |
 | `LustroXofAbsorber::update`, `finalize` | As for `LustroHasher`; `finalize` returns a new `LustroXof` at position 0 on every call. |
 | `LustroXof::from_reader` | As `hash256_reader`, returning `io::Result<LustroXof>`. |
 | `hash256_reader` | Returns `io::Result<Hash256>`: `ErrorKind::UnexpectedEof` if the reader ends before `total_len` bytes, `ErrorKind::InvalidData` if a `read` reports more bytes than it was given room for, other read errors passed on (`Interrupted` is retried). Reads exactly `total_len` bytes. |
 | Everything else (single-stream `new`, `next_*`, `fill_bytes`, `Read::read`, single-stream `fork`, `clone`, `export_snapshot`, `import_snapshot(snapshot)`, `hash256`, `hash128`) | Infallible for valid Rust-typed arguments (`Read::read` always returns `Ok`). |
+
+Operations with a `try_` twin:
+
+| Function(s) | Panics if | `try_` variant returns |
+|---|---|---|
+| `hash256_many_fixed` / `hash128_many_fixed` | `message_len` is 0, `data.len()` is not a multiple of `message_len`, or the output allocation fails | `Err(BatchError::InvalidMessageLen { data_len, message_len })` or `Err(BatchError::Reserve)` |
+| `hash256_many_var` / `hash128_many_var` | the output allocation fails | `Err(BatchError::Reserve)` |
+| `LustroPrngBatch::blocks` / `LustroXofBatch::blocks` | `len() * steps` overflows `usize`, or the output allocation fails | `Err(BatchError::SizeOverflow)` or `Err(BatchError::Reserve)`; the state is unchanged |
+| `LustroPrngBatch::from_streams` / `LustroXofBatch::from_streams` | a stream is inside a block, or lane allocation fails | `Err(BatchError::PartialBlock { index })` (the first such stream) or `Err(BatchError::Reserve)`; the streams are not changed |
+| `LustroPrngBatch::new` / `LustroXofBatch::new` | lane allocation fails | `Err(BatchError::Reserve)` |
+| `LustroPrngBatch::new_range` | lane allocation fails | `Err(BatchError::Reserve)` |
+| `LustroPrngBatch::fork` / `LustroXofBatch::fork` | `ids.len() != len()`, or lane allocation fails | `Err(BatchError::LengthMismatch { expected, actual })` or `Err(BatchError::Reserve)` |
+| `LustroPrngBatch::fork_range` / `LustroXofBatch::fork_range` | lane allocation fails | `Err(BatchError::Reserve)` |
+| `LustroPrngBatch::fork_many` / `LustroXofBatch::fork_many` | `len() * ids.len()` overflows `usize`, or lane allocation fails | `Err(BatchError::SizeOverflow)` or `Err(BatchError::Reserve)` |
+| `LustroPrngBatch::export_snapshot` / `LustroXofBatch::export_snapshot` | the lane buffer cannot be allocated | `Err(BatchError::Reserve)` |
+| `LustroPrng::fork_batch`, `fork_batch_range` / the same on `LustroXof` | lane allocation fails | `Err(BatchError::Reserve)` |
+| `LustroPrng::fork_path` / `LustroXof::fork_path` | `path` is empty | `Err(DerivePathError::EmptyPath)` |
+| `LustroPrng::derive_path` / `LustroXof::derive_path` | `path` is empty | `Err(DerivePathError::EmptyPath)` |
+| `LustroPrngBatch::derive_path` / `LustroXofBatch::derive_path` | `path` is empty or lane allocation fails | `Err(DerivePathError::EmptyPath)` or `Err(DerivePathError::Reserve)` |
 
 Note: these panics are plain Rust panics (`assert_eq!`, `expect`), not `LustroError`
 values; `LustroError` is part of the C FFI ABI only (see §12.3).
@@ -740,7 +767,7 @@ values; `LustroError` is part of the C FFI ABI only (see §12.3).
 
 ### 12.2 Python Bindings
 
-**Functions**
+#### Python Functions
 
 | Module | Functions |
 |---|---|
@@ -757,7 +784,7 @@ All four classes support `copy.copy()` / `copy.deepcopy()` and `pickle` (the
 classes report `__module__ == "lustro"`); the batch classes support `len(batch)`. `LustroHasher` and `LustroXofAbsorber`
 support `copy.copy()` / `copy.deepcopy()` but not `pickle` (`TypeError`).
 
-**Parameter Types**
+#### Parameter Types
 
 Unless otherwise noted, parameters for functions not listed here are
 plain Python `int`/`bool` with no shape or dtype constraints. Return values
@@ -777,15 +804,15 @@ C-contiguous with byte items, else `TypeError`. `bytes` is read without copying;
 copied while the GIL is held, so other Python threads cannot change it during the computation 
 (writes from native code without the GIL are not covered). `MemoryError` if the copy cannot be allocated.
 
+##### Module functions
+
 | Function                                                  | Parameter | Expected type |
 |-----------------------------------------------------------|---|---|
 | `configure(threads=None, allow_simd=None)`                | `threads` | Python `int`, `threads >= 1` (`ValueError` if smaller, `TypeError` for a non-int); capped at the logical CPU count; `None` follows the environment. A value outside `i64` raises `OverflowError` |
 |                                                           | `allow_simd` | `bool`; `False` selects the scalar backend; `None` follows the environment. A wrong type raises `TypeError`. Settings already fixed with another effect: `lustro.ConfigError` (a subclass of `RuntimeError`) |
 | `hash256`/`hash128(data)`                                 | `data` | Python `bytes`, or a byte buffer (`bytearray`, `memoryview`, `array('B')`, NumPy `uint8`), any length; `TypeError` for `str`, other types, non-contiguous buffers or buffers with other item formats |
-| `hash256_many_fixed(data)`                                | `data` | 2D `numpy.ndarray`, dtype `uint8`, shape `(n, msg_len)`, rows contiguous (`ValueError` otherwise; `TypeError` for wrong type/dtype) → returns shape `(n, 32)`, dtype `uint8` |
-| `hash256_many_var(messages)`                              | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) → returns shape `(n, 32)`, dtype `uint8` |
-| `hash128_many_fixed(data)`                                | `data` | 2D `numpy.ndarray`, dtype `uint8`, shape `(n, msg_len)`, rows contiguous (`ValueError` otherwise; `TypeError` for wrong type/dtype) → returns shape `(n, 16)`, dtype `uint8` |
-| `hash128_many_var(messages)`                              | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) → returns shape `(n, 16)`, dtype `uint8` |
+| `hash256_many_fixed(data)` / `hash128_many_fixed(data)` | `data` | 2D `numpy.ndarray`, dtype `uint8`, shape `(n, msg_len)`, rows contiguous (`ValueError` otherwise; `TypeError` for wrong type, dtype or ndim) → returns shape `(n, 32)` (`(n, 16)` for `hash128_*`), dtype `uint8` |
+| `hash256_many_var(messages)` / `hash128_many_var(messages)` | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer) → returns shape `(n, 32)` (`(n, 16)` for `hash128_*`), dtype `uint8` |
 | `hash256_many_fixed_into(data, out, *, release_gil=True)` | `data`, `out` | `data` as in `hash256_many_fixed`; `out` a writable, C-contiguous `uint8` array of shape `(n, 32)` (`ValueError` for another shape or a non-contiguous `out`, `TypeError` for another type, dtype or ndim). Returns `None` |
 | `hash128_many_fixed_into(data, out, *, release_gil=True)` | `data`, `out` | as above, `out` of shape `(n, 16)` |
 | `hash256_many_var_into(messages, out, *, release_gil=True)` | `messages`, `out` | `messages` as in `hash256_many_var`; `out` a writable, C-contiguous `uint8` array of shape `(len(messages), 32)`, errors as above. Returns `None` |
@@ -794,83 +821,77 @@ copied while the GIL is held, so other Python threads cannot change it during th
 | `hash128_many_offsets(data, offsets, *, release_gil=True)` | `data`, `offsets` | as above → returns shape `(n, 16)` |
 | `hash256_many_offsets_into(data, offsets, out, *, release_gil=True)` | `data`, `offsets`, `out` | as above; `out` a writable, C-contiguous `uint8` array of shape `(n, 32)`. Nothing is written when the call fails on `offsets`. Returns `None` |
 | `hash128_many_offsets_into(data, offsets, out, *, release_gil=True)` | `data`, `offsets`, `out` | as above, `out` of shape `(n, 16)` |
+| `hash*_many_fixed_into`, `hash*_many_var`, `hash*_many_var_into`, `hash*_many_offsets`, `hash*_many_offsets_into`, `fill_blocks` | `release_gil` | `bool`, keyword-only, default `True`. `False` keeps the GIL held and works in place where the input allows (see Python-Specific Notes) |
+
+##### Hasher and absorber
+
+| Function                                                  | Parameter | Expected type |
+|-----------------------------------------------------------|---|---|
 | `LustroHasher(length)`                                    | `length` | Python `int`, `0 ≤ length < 2⁶⁴` (`OverflowError` if negative or above `2⁶⁴ - 1`): the length of the whole message in bytes |
 | `LustroHasher.update(data)`                               | `data` | as `data` of `hash256`. `ValueError` if `data` is longer than what is left (the message gives both lengths); nothing is absorbed. The GIL is released for 4096 bytes or more. Returns `None` |
 | `LustroHasher.digest()`, `hexdigest()`                    | — | `bytes` (32) / `str` (64 lowercase hex digits), `hash256` of the message. `ValueError` while bytes are left (the message gives how many); `update` can continue. Every call gives the same value |
 | `LustroHasher.remaining()`                                | — | returns Python `int`: bytes still expected |
 | `LustroXofAbsorber(length)`, `update(data)`, `remaining()` | `length`, `data` | as for `LustroHasher` |
 | `LustroXofAbsorber.finalize()`                            | — | a new `LustroXof` of the message at position 0. `ValueError` while bytes are left; `update` can continue |
-| `hash*_many_fixed_into`, `hash*_many_var`, `hash*_many_var_into`, `hash*_many_offsets`, `hash*_many_offsets_into`, `fill_blocks` | `release_gil` | `bool`, keyword-only, default `True`. `False` keeps the GIL held and works in place where the input allows (see Python-Specific Notes) |
+
+##### LustroPrng and LustroXof
+
+| Function                                                  | Parameter | Expected type |
+|-----------------------------------------------------------|---|---|
 | `LustroPrng(seed, stream_id=0)`                           | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) |
 |                                                           | `stream_id` | Python `int`, `0 ≤ stream_id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`); default `0` |
-| `LustroPrng.fill(size)`                                   | `size` | Python `int` → returns `bytes` of that length (`OverflowError` if negative or above `isize::MAX`, `MemoryError` if the buffer cannot be allocated) |
-| `LustroPrng.advance_bytes(n)`, `advance_blocks(n)`        | `n` | Python `int`, `0 ≤ n < 2⁶⁴` (`OverflowError` if negative or above `2⁶⁴ - 1`). Costs O(n). `advance_bytes` releases the GIL from 4096 bytes and `advance_blocks` from 128 blocks. A pending Ctrl-C is raised between chunks of 2²⁰ blocks and leaves the stream unchanged. Returns `None` |
-| `LustroPrng.position()`                                   | — | returns Python `int`: bytes taken from the start |
+| `LustroPrng` / `LustroXof`: `fill(size)` | `size` | Python `int` → returns `bytes` of that length (`OverflowError` if negative or above `isize::MAX`, `MemoryError` if the buffer cannot be allocated) |
+| `LustroPrng` / `LustroXof`: `advance_bytes(n)`, `advance_blocks(n)` | `n` | Python `int`, `0 ≤ n < 2⁶⁴` (`OverflowError` if negative or above `2⁶⁴ - 1`). Costs O(n). `advance_bytes` releases the GIL from 4096 bytes and `advance_blocks` from 128 blocks. A pending Ctrl-C is raised between chunks of 2²⁰ blocks and leaves the stream unchanged. Returns `None` |
+| `LustroPrng` / `LustroXof`: `position()` | — | returns Python `int`: bytes taken from the start |
 | `LustroPrng.from_entropy(stream_id=0)`                    | `stream_id` | as in `LustroPrng(seed, stream_id)` (staticmethod). `OSError` if the system entropy source is unavailable |
-| `LustroPrng.fill_into(buf)`                               | `buf` | writable, C-contiguous buffer of bytes (e.g. `bytearray`, `memoryview`), filled in place to its full length (`TypeError` otherwise) |
-| `LustroPrng.read(size)`                                   | `size` | Python `int`, same as `fill(size)` → returns `bytes` of that length (`OverflowError` if negative; there is no form without `size`) |
-| `LustroPrng.readinto(buf)`                                | `buf` | writable, C-contiguous buffer with any item format that holds no Python objects (e.g. `bytearray`, `memoryview`, `array('I')`, NumPy array of any dtype without Python objects), filled in place to its full length with raw stream bytes, without conversion → returns the number of bytes written (not items). `TypeError` for `bytes`, objects without a buffer, read-only or non-contiguous buffers, and buffers that hold Python objects (NumPy `dtype=object`, a `ctypes.py_object` array); the stream is not moved then. An empty buffer returns `0` and does not move the stream |
-| `LustroPrng.fill_u64(n)`                                  | `n` | Python `int`, `n >= 0` (`OverflowError` if negative, above `2⁶⁴ - 1`, or if `8 * n` exceeds `isize::MAX`) → returns a new writable `numpy.ndarray`, shape `(n,)`, dtype `uint64`, equal to `n` calls of `next_u64()`. `MemoryError` if the output buffer cannot be allocated |
-| `LustroPrng.fork(id)`                                     | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
-| `LustroPrng.fork_batch(ids)`                              | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) → returns a `LustroPrngBatch` whose lane `i` is `fork(ids[i])`. `MemoryError` if the lanes cannot be allocated |
-| `LustroPrng.fork_batch_range(first, count)`               | `first`, `count` | `first` Python `int`, `0 ≤ first < 2¹²⁸`; `count` Python `int`, `0 ≤ count < 2⁶⁴` (`OverflowError` otherwise) → as `fork_batch` with ids `first`, `first + 1`, ... (modulo 2¹²⁸). `MemoryError` if the lanes cannot be allocated |
-| `LustroPrng.fork_path(path)`                              | `path` | Python sequence of `int`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) → returns `fork(path[0]).fork(path[1])...` |
-| `LustroPrng.export_snapshot()`                            | — | returns `bytes`, exactly 56 bytes |
-| `LustroPrng.import_snapshot(bytes)`                       | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
+| `LustroPrng` / `LustroXof`: `fill_into(buf)` | `buf` | writable, C-contiguous buffer of bytes (e.g. `bytearray`, `memoryview`), filled in place to its full length (`TypeError` otherwise) |
+| `LustroPrng` / `LustroXof`: `read(size)` | `size` | Python `int`, same as `fill(size)` → returns `bytes` of that length (`OverflowError` if negative; there is no form without `size`) |
+| `LustroPrng` / `LustroXof`: `readinto(buf)` | `buf` | writable, C-contiguous buffer with any item format that holds no Python objects (e.g. `bytearray`, `memoryview`, `array('I')`, NumPy array of any dtype without Python objects), filled in place to its full length with raw stream bytes, without conversion → returns the number of bytes written (not items). `TypeError` for `bytes`, objects without a buffer, read-only or non-contiguous buffers, and buffers that hold Python objects (NumPy `dtype=object`, a `ctypes.py_object` array); the stream is not moved then. An empty buffer returns `0` and does not move the stream |
+| `LustroPrng` / `LustroXof`: `fill_u64(n)` | `n` | Python `int`, `n >= 0` (`OverflowError` if negative, above `2⁶⁴ - 1`, or if `8 * n` exceeds `isize::MAX`) → returns a new writable `numpy.ndarray`, shape `(n,)`, dtype `uint64`, equal to `n` calls of `next_u64()`. `MemoryError` if the output buffer cannot be allocated |
+| `LustroPrng` / `LustroXof`: `fork(id)` | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
+| `LustroPrng` / `LustroXof`: `fork_batch(ids)` | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) → returns a `LustroPrngBatch` (`LustroXofBatch` for `LustroXof`) whose lane `i` is `fork(ids[i])`. `MemoryError` if the lanes cannot be allocated |
+| `LustroPrng` / `LustroXof`: `fork_batch_range(first, count)` | `first`, `count` | `first` Python `int`, `0 ≤ first < 2¹²⁸`; `count` Python `int`, `0 ≤ count < 2⁶⁴` (`OverflowError` otherwise) → as `fork_batch` with ids `first`, `first + 1`, ... (modulo 2¹²⁸). `MemoryError` if the lanes cannot be allocated |
+| `LustroPrng` / `LustroXof`: `fork_path(path)` | `path` | Python sequence of `int`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) → returns `fork(path[0]).fork(path[1])...` |
+| `LustroPrng` / `LustroXof`: `export_snapshot()` | — | returns `bytes`, exactly 56 bytes |
+| `LustroPrng` / `LustroXof`: `import_snapshot(bytes)` | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
 | `LustroPrng.derive_path(seed, path)`                      | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
 |                                                           | `path` | Python sequence of `int` (`list`, `tuple`, `range`, ...), non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
+| `LustroXof(message)`                                      | `message` | Python `bytes`, any length (including empty) |
+| `LustroXof.derive_path(message, path)`                    | `message` | Python `bytes`, any length (staticmethod) |
+|                                                           | `path` | Python sequence of `int` (`list`, `tuple`, `range`, ...), non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
+
+##### LustroPrngBatch and LustroXofBatch
+
+| Function                                                  | Parameter | Expected type |
+|-----------------------------------------------------------|---|---|
 | `LustroPrngBatch(seed, stream_ids)`                       | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) |
 |                                                           | `stream_ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
 | `LustroPrngBatch.new_range(seed, first_stream_id, count)` | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
 |                                                           | `first_stream_id`, `count` | `first_stream_id` Python `int`, `0 ≤ id < 2¹²⁸`; `count` Python `int`, `0 ≤ count < 2⁶⁴` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
-| `LustroPrngBatch.fill_blocks(out, steps, *, release_gil=True)` | `out`, `steps` | writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == len(batch)`; Python `int`. Wrong type → `TypeError`; shape mismatch or non-C-contiguous → `ValueError`. For non-empty output the data must also be aligned for `uint64`: a misaligned buffer (for example `np.frombuffer` at an odd offset) raises `ValueError` |
-| `LustroPrngBatch.blocks(steps)`                           | `steps` | Python `int`, `steps >= 0` (`OverflowError` if negative or above `2⁶⁴ - 1`); left out or `None`: `suggested_steps()` → returns a new writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, laid out as `fill_blocks` writes it. `OverflowError` if the output size overflows, `MemoryError` if the output buffer cannot be allocated. A very large `steps` gives `OverflowError` also for an empty batch, because NumPy rejects the shape `(steps, 0, 4)` (the limit depends on NumPy; Rust and C return an empty result there) |
-| `LustroPrngBatch.lane(i)`                                 | `i` | Python `int`, `0 ≤ i < len(batch)` → returns a new `LustroPrng` at the lane's next block, independent of the batch. `IndexError` if `i >= len(batch)`, `OverflowError` if negative or above `2⁶⁴ - 1`, `TypeError` for a non-int |
-| `LustroPrngBatch[i]`                                      | `i` | Python `int` (or an object with `__index__`), `-len(batch) ≤ i < len(batch)`; a negative `i` counts from the end → returns a new `LustroPrng`, the same as `lane(i + len(batch))`. `IndexError` if out of range (also if it does not fit a signed 64-bit integer, as for a list), `TypeError` for a slice or a non-int |
-| `iter(LustroPrngBatch)`                                   | — | Yields `lane(0)`, `lane(1)`, … in order, from a copy of the lane states taken by `iter()` (later calls on the batch do not affect it). `MemoryError` if the copy cannot be allocated |
+| `LustroPrngBatch` / `LustroXofBatch`: `fill_blocks(out, steps, *, release_gil=True)` | `out`, `steps` | writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == len(batch)`; Python `int`. Wrong type → `TypeError`; shape mismatch or non-C-contiguous → `ValueError`. For non-empty output the data must also be aligned for `uint64`: a misaligned buffer (for example `np.frombuffer` at an odd offset) raises `ValueError` |
+| `LustroPrngBatch` / `LustroXofBatch`: `blocks(steps)` | `steps` | Python `int`, `steps >= 0` (`OverflowError` if negative or above `2⁶⁴ - 1`); left out or `None`: `suggested_steps()` → returns a new writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, laid out as `fill_blocks` writes it. `OverflowError` if the output size overflows, `MemoryError` if the output buffer cannot be allocated. A very large `steps` gives `OverflowError` also for an empty batch, because NumPy rejects the shape `(steps, 0, 4)` (the limit depends on NumPy; Rust and C return an empty result there) |
+| `LustroPrngBatch` / `LustroXofBatch`: `lane(i)` | `i` | Python `int`, `0 ≤ i < len(batch)` → returns a new `LustroPrng` (`LustroXof` for `LustroXofBatch`) at the lane's next block, independent of the batch. `IndexError` if `i >= len(batch)`, `OverflowError` if negative or above `2⁶⁴ - 1`, `TypeError` for a non-int |
+| `LustroPrngBatch[i]` / `LustroXofBatch[i]` | `i` | Python `int` (or an object with `__index__`), `-len(batch) ≤ i < len(batch)`; a negative `i` counts from the end → returns a new `LustroPrng` (`LustroXof` for `LustroXofBatch`), the same as `lane(i + len(batch))`. `IndexError` if out of range (also if it does not fit a signed 64-bit integer, as for a list), `TypeError` for a slice or a non-int |
+| `iter(LustroPrngBatch)` / `iter(LustroXofBatch)` | — | Yields `lane(0)`, `lane(1)`, … in order, from a copy of the lane states taken by `iter()` (later calls on the batch do not affect it). `MemoryError` if the copy cannot be allocated |
 | `LustroPrngBatch.from_streams(streams)`                   | `streams` | Python sequence of `LustroPrng` (`list`, `tuple`, a batch, ...) (staticmethod) → returns a batch with one lane per stream, lane `i` continuing `streams[i]` at its next block; the streams are not changed. `ValueError` if a stream is inside a block, `TypeError` for a non-sequence (such as a generator or a single stream) or an item that is not a `LustroPrng`, `RuntimeError` if a stream is in use in another thread, `MemoryError` if the lanes cannot be allocated |
-| `LustroPrngBatch.fork(ids)`                               | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), `len(ids) == batch.len()` (`ValueError` otherwise), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
-| `LustroPrngBatch.fork_many(ids)`                          | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise); `OverflowError` if `len() * len(ids)` overflows. `MemoryError` if the lanes cannot be allocated |
-| `LustroPrngBatch.fork_range(first)`                       | `first` | Python `int`, `0 ≤ first < 2¹²⁸` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
+| `LustroPrngBatch` / `LustroXofBatch`: `fork(ids)` | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), `len(ids) == batch.len()` (`ValueError` otherwise), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
+| `LustroPrngBatch` / `LustroXofBatch`: `fork_many(ids)` | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise); `OverflowError` if `len() * len(ids)` overflows. `MemoryError` if the lanes cannot be allocated |
+| `LustroPrngBatch` / `LustroXofBatch`: `fork_range(first)` | `first` | Python `int`, `0 ≤ first < 2¹²⁸` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
 | `LustroPrngBatch.derive_path(seed, roots, path)`          | `seed` | Python `bytes`, exactly 32 bytes (`ValueError` otherwise) (staticmethod) |
 |                                                           | `roots`, `path` | Python sequences of `int` (`list`, `tuple`, `range`, ...); `path` non-empty (`ValueError` if empty), `roots` may be empty (empty batch); each id `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
 | `LustroPrngBatch.copy()` / `LustroXofBatch.copy()`        | — | returns an independent batch (`MemoryError` if the lanes cannot be allocated); also `copy.copy()` / `copy.deepcopy()` |
-| `LustroPrngBatch.export_snapshot()`                       | — | returns `bytes`, variable length |
-| `LustroPrngBatch.import_snapshot(bytes)`                  | `bytes` | Python `bytes`, variable length (staticmethod) |
-| `LustroXof(message)`                                      | `message` | Python `bytes`, any length (including empty) |
-| `LustroXof.fill(size)`                                    | `size` | Python `int` → returns `bytes` of that length (`OverflowError` if negative or above `isize::MAX`, `MemoryError` if the buffer cannot be allocated) |
-| `LustroXof.advance_bytes(n)`, `advance_blocks(n)`         | `n` | Python `int`, `0 ≤ n < 2⁶⁴` (`OverflowError` if negative or above `2⁶⁴ - 1`). Costs O(n). `advance_bytes` releases the GIL from 4096 bytes and `advance_blocks` from 128 blocks. A pending Ctrl-C is raised between chunks of 2²⁰ blocks and leaves the stream unchanged. Returns `None` |
-| `LustroXof.position()`                                    | — | returns Python `int`: bytes taken from the start |
-| `LustroXof.fill_into(buf)`                                | `buf` | writable, C-contiguous buffer of bytes (e.g. `bytearray`, `memoryview`), filled in place to its full length (`TypeError` otherwise) |
-| `LustroXof.read(size)`                                    | `size` | Python `int`, same as `fill(size)` → returns `bytes` of that length (`OverflowError` if negative; there is no form without `size`) |
-| `LustroXof.readinto(buf)`                                 | `buf` | writable, C-contiguous buffer with any item format that holds no Python objects (e.g. `bytearray`, `memoryview`, `array('I')`, NumPy array of any dtype without Python objects), filled in place to its full length with raw stream bytes, without conversion → returns the number of bytes written (not items). `TypeError` for `bytes`, objects without a buffer, read-only or non-contiguous buffers, and buffers that hold Python objects (NumPy `dtype=object`, a `ctypes.py_object` array); the stream is not moved then. An empty buffer returns `0` and does not move the stream |
-| `LustroXof.fill_u64(n)`                                   | `n` | Python `int`, `n >= 0` (`OverflowError` if negative, above `2⁶⁴ - 1`, or if `8 * n` exceeds `isize::MAX`) → returns a new writable `numpy.ndarray`, shape `(n,)`, dtype `uint64`, equal to `n` calls of `next_u64()`. `MemoryError` if the output buffer cannot be allocated |
-| `LustroXof.fork(id)`                                      | `id` | Python `int`, `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
-| `LustroXof.fork_batch(ids)`                               | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) → returns a `LustroXofBatch` whose lane `i` is `fork(ids[i])`. `MemoryError` if the lanes cannot be allocated |
-| `LustroXof.fork_batch_range(first, count)`                | `first`, `count` | `first` Python `int`, `0 ≤ first < 2¹²⁸`; `count` Python `int`, `0 ≤ count < 2⁶⁴` (`OverflowError` otherwise) → as `fork_batch` with ids `first`, `first + 1`, ... (modulo 2¹²⁸). `MemoryError` if the lanes cannot be allocated |
-| `LustroXof.fork_path(path)`                               | `path` | Python sequence of `int`, non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise) → returns `fork(path[0]).fork(path[1])...` |
-| `LustroXof.export_snapshot()`                             | — | returns `bytes`, exactly 56 bytes |
-| `LustroXof.import_snapshot(bytes)`                        | `bytes` | Python `bytes`, exactly 56 bytes (staticmethod) |
-| `LustroXof.derive_path(message, path)`                    | `message` | Python `bytes`, any length (staticmethod) |
-|                                                           | `path` | Python sequence of `int` (`list`, `tuple`, `range`, ...), non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`) |
+| `LustroPrngBatch` / `LustroXofBatch`: `export_snapshot()` | — | returns `bytes`, variable length |
+| `LustroPrngBatch` / `LustroXofBatch`: `import_snapshot(bytes)` | `bytes` | Python `bytes`, variable length (staticmethod) |
 | `LustroXofBatch(messages)`                                | `messages` | sequence of `bytes` or byte buffers, each element independently sized (`TypeError` for a single string or buffer, a non-sequence such as a generator, or an item that is not a byte buffer). `MemoryError` if the lanes cannot be allocated |
-| `LustroXofBatch.fill_blocks(out, steps, *, release_gil=True)` | `out`, `steps` | writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, `n == len(batch)`; Python `int`. Wrong type → `TypeError`; shape mismatch or non-C-contiguous → `ValueError`. For non-empty output the data must also be aligned for `uint64`: a misaligned buffer (for example `np.frombuffer` at an odd offset) raises `ValueError` |
-| `LustroXofBatch.blocks(steps)`                            | `steps` | Python `int`, `steps >= 0` (`OverflowError` if negative or above `2⁶⁴ - 1`); left out or `None`: `suggested_steps()` → returns a new writable, C-contiguous `numpy.ndarray`, shape `(steps, n, 4)`, dtype `uint64`, laid out as `fill_blocks` writes it. `OverflowError` if the output size overflows, `MemoryError` if the output buffer cannot be allocated. A very large `steps` gives `OverflowError` also for an empty batch, because NumPy rejects the shape `(steps, 0, 4)` (the limit depends on NumPy; Rust and C return an empty result there) |
-| `LustroXofBatch.lane(i)`                                  | `i` | Python `int`, `0 ≤ i < len(batch)` → returns a new `LustroXof` at the lane's next block, independent of the batch. `IndexError` if `i >= len(batch)`, `OverflowError` if negative or above `2⁶⁴ - 1`, `TypeError` for a non-int |
-| `LustroXofBatch[i]`                                       | `i` | Python `int` (or an object with `__index__`), `-len(batch) ≤ i < len(batch)`; a negative `i` counts from the end → returns a new `LustroXof`, the same as `lane(i + len(batch))`. `IndexError` if out of range (also if it does not fit a signed 64-bit integer, as for a list), `TypeError` for a slice or a non-int |
-| `iter(LustroXofBatch)`                                    | — | Yields `lane(0)`, `lane(1)`, … in order, from a copy of the lane states taken by `iter()` (later calls on the batch do not affect it). `MemoryError` if the copy cannot be allocated |
 | `LustroXofBatch.from_streams(streams)`                    | `streams` | Python sequence of `LustroXof` (`list`, `tuple`, a batch, ...) (staticmethod) → as `LustroPrngBatch.from_streams`, for `LustroXof` items |
-| `LustroXofBatch.fork(ids)`                                | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), `len(ids) == batch.len()` (`ValueError` otherwise), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
-| `LustroXofBatch.fork_many(ids)`                           | `ids` | Python sequence of `int` (`list`, `tuple`, `range`, ...), each `0 ≤ id < 2¹²⁸` (`OverflowError` otherwise); `OverflowError` if `len() * len(ids)` overflows. `MemoryError` if the lanes cannot be allocated |
-| `LustroXofBatch.fork_range(first)`                        | `first` | Python `int`, `0 ≤ first < 2¹²⁸` (`OverflowError` otherwise). `MemoryError` if the lanes cannot be allocated |
 | `LustroXofBatch.derive_path(messages, path)`              | `messages` | sequence of `bytes` or byte buffers (staticmethod; `TypeError` as for `hash256_many_var`) |
 |                                                           | `path` | Python sequence of `int` (`list`, `tuple`, `range`, ...), non-empty (`ValueError` if empty), each `0 ≤ id < 2¹²⁸` (`OverflowError` if negative or `≥ 2¹²⁸`). `MemoryError` if the lanes cannot be allocated |
-| `LustroXofBatch.export_snapshot()`                        | — | returns `bytes`, variable length |
-| `LustroXofBatch.import_snapshot(bytes)`                   | `bytes` | Python `bytes`, variable length (staticmethod) |
 
-**Python-Specific Notes**
+#### Python-Specific Notes
 
-- The following methods release the GIL while the underlying Rust computation
+##### GIL and buffers
+
+- **Releases the GIL.** The following methods do so while the underlying Rust computation
   runs (`py.detach`), allowing other Python threads to run concurrently:
   `hash256`/`hash128` (inputs of 4096 bytes or more), `hash*_many_fixed`, `hash*_many_fixed_into`, 
   `hash*_many_var`, `hash*_many_var_into`, `hash*_many_offsets`, `hash*_many_offsets_into`;
@@ -878,16 +899,16 @@ copied while the GIL is held, so other Python threads cannot change it during th
   `advance_blocks` (128 blocks or more); `LustroPrngBatch`/`LustroXofBatch.fill_blocks`, `blocks`; `LustroHasher.update` 
   and `LustroXofAbsorber.update` (4096 bytes or more); `LustroXof(message)` and `LustroXof.derive_path` (4096 bytes or more);
   `LustroXofBatch(messages)` and `LustroXofBatch.derive_path` (while the lanes are built).
-  Other calls hold the GIL for their whole run. That includes the calls that build or copy the
+- **Holds the GIL.** Other calls hold it for their whole run. That includes the calls that build or copy the
   lanes of a batch (`LustroPrngBatch` constructors, `new_range`, `fork*`, `from_streams`, `copy`,
   `iter(batch)`, snapshots, and the same calls of `LustroXofBatch`), so their GIL time grows with
   the lane count.
-  With `release_gil=False` (`hash*_many_fixed_into`, `hash*_many_var`, `hash*_many_var_into`,
+- **`release_gil=False`.** With `release_gil=False` (`hash*_many_fixed_into`, `hash*_many_var`, `hash*_many_var_into`,
   `hash*_many_offsets`, `hash*_many_offsets_into`, `fill_blocks`) the GIL stays held, input is read 
   in place where its type and layout allow, and output is written directly into `out` (or the returned array); 
   other Python threads wait. Not every input is read in place, see the notes below. For `fill_blocks` 
   the flag has an effect on little-endian targets only.
-  `fill_into()` and `readinto()` below 4096 bytes write in place with the GIL held (releasing it
+- **`fill_into()` and `readinto()`.** Below 4096 bytes they write in place with the GIL held (releasing it
   costs more than the write). From 4096 bytes the bytes are generated with the GIL released into
   a Rust buffer of at most 16 MiB and copied into the caller's buffer with the GIL held, piece
   by piece, so other Python threads cannot change it while Rust writes. The Rust buffer is
@@ -896,6 +917,9 @@ copied while the GIL is held, so other Python threads cannot change it during th
   `BufferError`) and the call itself keeps the object alive. A second call on the same stream
   meanwhile raises `RuntimeError: Already borrowed`. Native code that writes to the buffer
   without the GIL is not covered.
+
+##### Snapshots and pickling
+
 - `import_snapshot(bytes)` raises `lustro.SnapshotError` (a subclass of
   `ValueError`) on malformed input: wrong length, unsupported version, kind
   mismatch (e.g. a PRNG snapshot passed to `LustroXof`), reserved bytes that
@@ -907,6 +931,9 @@ copied while the GIL is held, so other Python threads cannot change it during th
   from the pickled position, so it is a copy of the stream, not a new one.
   The internal `fill_blocks` buffer of a batch is not pickled. Loading a pickle
   with an invalid snapshot raises `lustro.SnapshotError`.
+
+##### Batch lanes and NumPy output
+
 - Batch `lane(i)` reports an out-of-range index with `IndexError`, where Rust
   returns `None` and C returns `InvalidArgument`. This is the usual Python
   convention for an invalid index; the three cases mean the same.
@@ -917,15 +944,18 @@ copied while the GIL is held, so other Python threads cannot change it during th
 - A batch is a sequence of its lanes, so `from_streams(batch)` gives a copy of `batch`.
 - Each 32-byte block, where represented as NumPy output, is four `uint64`
   values in little-endian order, the same bytes as the raw stream.
-- `hash*_many_fixed` copies its rows before hashing; `hash*_many_var` reads `bytes`
+
+##### Hash batch inputs
+
+- **Copies.** `hash*_many_fixed` copies its rows before hashing; `hash*_many_var` reads `bytes`
   items without copying and copies other byte buffers. By default `hash*_many_fixed_into`
   hashes a copy of `data` and copies the digests into `out` after the GIL is taken back.
-- With `release_gil=False`, `hash*_many_fixed_into` reads a C-contiguous `data` in place.
+- **In-place reads.** With `release_gil=False`, `hash*_many_fixed_into` reads a C-contiguous `data` in place.
   A view that is not C-contiguous as a whole (for example `a[:, :16]`) is copied and hashed
   with the GIL released, as in the default mode. `hash*_many_var` and `hash*_many_var_into`
   read an exact `list` or `tuple` of exact `bytes` without taking a reference on each item;
   other input is handled as by default.
-- `hash*_many_offsets` and `hash*_many_offsets_into` take messages from one buffer and
+- **Offsets.** `hash*_many_offsets` and `hash*_many_offsets_into` take messages from one buffer and
   hold no Python object per message. `offsets` is copied into a `usize` scratch vector
   and checked (non-negative, non-decreasing, last `<= len(data)`) before anything is hashed; the
   NumPy borrow of `offsets` is released before the GIL is. An entry that does not fit in
@@ -938,14 +968,14 @@ copied while the GIL is held, so other Python threads cannot change it during th
   Hashing slices the buffer per block on the hashing thread, so no slice table is built.
   With `release_gil=False` a non-`bytes` `data` that shares memory with `out` raises
   `ValueError`; by default `data` is copied first and the call is allowed.
-- The same array, or views of one array, as `data` and `out` of `hash*_many_fixed_into`
+- **Overlap of `data` and `out`.** The same array, or views of one array, as `data` and `out` of `hash*_many_fixed_into`
   raise `TypeError` in both modes (NumPy borrow check). Memory shared through separate
   wrappers (two `np.frombuffer` views over one `bytearray`; a `memoryview` of `out` used as
   a message of `hash*_many_var_into`) raises `ValueError` with `release_gil=False`; by default
   the input is copied first and the call is allowed.
-- The items are read only on the calling thread, which holds the GIL (the C API needs
+- **Reading the items.** The items are read only on the calling thread, which holds the GIL (the C API needs
   it); the thread pool hashes slices only and never touches a Python object.
-- With `release_gil=False`, an exact `list` or `tuple` of 4096 or more items is read in
+- **Pipelining.** With `release_gil=False`, an exact `list` or `tuple` of 4096 or more items is read in
   ranges while the pool hashes the ranges already read (`hash256_var_pipelined`), when the
   dispatcher chooses the thread pool. This holds for `hash*_many_var_into` and for
   `hash*_many_var`. The pipeline runs to the end only if every item is an exact `bytes`. At the
@@ -956,6 +986,9 @@ copied while the GIL is held, so other Python threads cannot change it during th
   written before all items are read. Any other call takes the ordinary path. On the pipelined
   path the runtime settings are fixed before the first item is read, so a call that then fails
   has fixed them; on the ordinary path a call that fails while its items are read has not.
+
+##### Scratch buffers
+
 - Batch `fill_blocks` with the default `release_gil=True` keeps an internal block buffer
   between calls; `release_buffer()` frees it. `blocks` does not use it, and neither does 
   `release_gil=False` on little-endian targets (elsewhere the flag has no effect and the buffer is used).
@@ -964,15 +997,23 @@ copied while the GIL is held, so other Python threads cannot change it during th
   message slices (`hash*_many_var`, `LustroXofBatch(messages)`). Each is kept up to 32 MiB; a
   bigger one is freed when the call ends. A thread that has used all four holds up to 128 MiB
   until it exits. The buffers are not cleared: the rows and digests of the last calls stay in them.
+
+##### Errors and failed calls
+
 - A size that cannot be represented (above `isize::MAX` bytes, or an overflowing product such
   as `len() * steps`) raises `OverflowError`; a failed allocation raises `MemoryError`.
   `fill_blocks` checks the shape of `out` first, so a `steps` that fits no array gives
   `ValueError` for the shape.
 - `next_block()` allocates the result before it reads the block, so after a `MemoryError` the
   stream is where it was.
-- `fill_u64` and `blocks` leave the stream state unchanged when they fail with
-  `OverflowError` or `MemoryError`. The exception is a failure while the NumPy
-  array object is created, which happens after generation.
+- `fill_u64` and `blocks` allocate the array before they generate, so they leave the stream
+  state unchanged when they fail with `OverflowError` or `MemoryError`.
+- An exception raised by the buffer exporter itself passes through `fill_into()` and
+  `readinto()`, except `TypeError`, `BufferError` and `ValueError`, which become the
+  `TypeError` for an unusable buffer. The stream does not move.
+
+##### Other
+
 - Methods take `&mut self`: overlapping use of one object from several
   threads raises `RuntimeError` ("Already borrowed").
 - `repr()` is redacted: `LustroPrng(<redacted>)`, `LustroXof(<redacted>)`, `LustroPrngBatch(len=N)`, `LustroXofBatch(len=N)`.
@@ -989,7 +1030,7 @@ resume, concatenation guarantee) are as described in
 
 C ABI exported through `extern "C"` functions, compatible with C and C++.
 
-**Function Table**
+#### Function Table
 
 | Module | Functions |
 |---|---|
@@ -1030,7 +1071,7 @@ with one lane per stream, in order; the streams are not changed and stay owned
 by the caller. A stream inside a block returns `InvalidArgument`; the pointers
 (`out_ctx`, the array, each element) are checked first.
 
-**1. Type Mapping**
+#### 1. Type Mapping
 
 | C Type | Rust Origin | Notes |
 |---|---|---|
@@ -1042,7 +1083,7 @@ by the caller. A stream inside a block returns `InvalidArgument`; the pointers
 | `struct LustroRuntimeInfo*` | `*mut LustroRuntimeInfo` (`#[repr(C)]`) | `out` of `lustro_runtime_info()`, with its `sizeof` as `out_size`; must be non-null and aligned |
 | `uint32_t` | `u32` | `lustro_api_version()` return value; `out` of `*_next_u32` |
 | opaque pointer | `*mut LustroPrng` / `*mut LustroPrngBatch` / `*mut LustroXof` / `*mut LustroXofBatch` / `*mut LustroHasher` / `*mut LustroXofAbsorber` | never dereference from C; pass through only |
-| `struct LustroPrng**` (and the other three handle types) | `*mut *mut LustroPrng` | `out_ctx` of the constructors; written only if non-null and aligned |
+| `struct LustroPrng**` (and the other five handle types) | `*mut *mut LustroPrng` | `out_ctx` of the constructors; written only if non-null and aligned |
 | `const uint8_t* const*` | `&[&[u8]]` (array of message slices) | Used by variable-length message APIs such as `*_many_var(...)` and `lustro_xof_batch_new(...)`, together with a parallel `const uintptr_t*` of lengths |
 | `const struct LustroPrng* const*` (and `LustroXof`) | `*const *const LustroPrng` | `streams` of `*_batch_from_streams`: an array of `n` contexts, each non-null and aligned |
 
@@ -1058,14 +1099,18 @@ this includes an overlap between `out` and the `message_ptrs`/`message_lens`
 tables. The `lustro_hasher_*` and `lustro_xof_absorber_*` functions reject `data`, `out`,
 `out_remaining` or the `out_ctx` of `lustro_hasher_clone`, `lustro_xof_absorber_clone` and
 `lustro_xof_absorber_finalize` overlapping their context the same way; such an
-`out_ctx` is not written. Scalar writes such as `*_next_u64` use `write_unaligned`.
+`out_ctx` is not written. The output argument of the PRNG and XOF context functions
+(`*_next_*`, `*_fill`, `*_position`, `*_export_snapshot`, `*_batch_get_len`,
+`*_batch_fill_blocks`) is checked against the context object itself, with the same status. Memory
+that a batch context owns on the heap is not covered by this check. Scalar writes such as
+`*_next_u64` use `write_unaligned`.
 
-**2. Calling Convention**
+#### 2. Calling Convention
 
 All exported functions use `extern "C"` and expose the platform's standard
 C ABI. Do not bind as `stdcall`.
 
-**3. Return Value Conventions**
+#### 3. Return Value Conventions
 
 There are five categories:
 
@@ -1077,7 +1122,7 @@ There are five categories:
   |---|---|---|
   | 0 | `Ok` | success |
   | 1 | `InvalidLength` | buffer/length argument invalid |
-  | 2 | `InvalidPointer` | required pointer is `NULL` or misaligned, or (hash functions, `lustro_hasher_*` and `lustro_xof_absorber_*` only) an input/output range overlaps another (see Type Mapping above) |
+  | 2 | `InvalidPointer` | required pointer is `NULL` or misaligned, or (hash functions, `lustro_hasher_*`, `lustro_xof_absorber_*`, the output argument of the PRNG/XOF context functions, and the `out_ctx` of constructors that take a source context) an input/output range overlaps another (see Type Mapping above and the constructor paragraph) |
   | 3 | `OutputTooSmall` | reserved, not returned by V1 (`InvalidLength` is used instead) |
   | 4 | `AlreadyFinalised` | reserved, not returned by V1 |
   | 5 | `VerificationFailed` | reserved, not returned by V1 |
@@ -1092,11 +1137,7 @@ There are five categories:
   | 14 | `InvalidReserved` | snapshot reserved bytes are not zero (`*_import_snapshot` only) |
 
   Hash, fill, next-value and export functions use only `Ok`, `InvalidLength`,
-  `InvalidPointer` and `InternalPanic`. Codes 7–10 are reported only by constructors, and
-  codes 7 and 8 also by `lustro_snapshot_kind`, code 11 only by
-  `lustro_configure`, code 12 only by `lustro_configure`, `*_batch_lane` and
-  `*_batch_from_streams`, code 13 only by the entropy functions, code 14 only by
-  `*_import_snapshot`.
+  `InvalidPointer` and `InternalPanic`. The other codes are reported by the functions named in the table.
   In Rust the enum is `#[non_exhaustive]`; C code should treat an unknown value
   as a generic failure.
   V1 does not distinguish an undersized output buffer from other invalid-length
@@ -1106,20 +1147,23 @@ There are five categories:
 - **Constructors** (`*_new`, `*_new_range`, `*_clone`, `*_fork`, `*_fork_many`,
   `*_fork_range`, `*_fork_batch`, `*_fork_batch_range`, `*_fork_path`, `*_batch_lane`,
   `*_batch_from_streams`, `*_derive_path`, `*_import_snapshot`,
-  `lustro_prng_from_entropy`) return
+  `lustro_prng_from_entropy`, `lustro_xof_absorber_finalize`) return
   a `LustroError` and store the new context through a trailing `T **out_ctx`.
-  `*out_ctx` is set to `NULL` first and receives the context only when the
+  `*out_ctx` is `NULL` after a failure and receives the context only when the
   status is `Ok`. If `out_ctx` itself is `NULL` or misaligned, the function
   returns `InvalidPointer` and writes nothing. `out_ctx` must be valid for
-  writing one pointer and must not overlap any input buffer or the memory of
-  `ctx`. The exceptions are `lustro_hasher_clone`, `lustro_xof_absorber_clone`
-  and `lustro_xof_absorber_finalize`: they check the overlap with `ctx` first
-  and on overlap return `InvalidPointer` without writing `*out_ctx`. Callers
+  writing one pointer and must not overlap any input buffer. An `out_ctx` that
+  overlaps the memory of a source context (`ctx`, or any context in the `streams`
+  table of `*_batch_from_streams`) is rejected with `InvalidPointer`, and then
+  `*out_ctx` is not written. The check covers the context object itself, not the
+  memory a batch context owns on the heap, and it does not cover input buffers
+  (seeds, identifier arrays, messages, snapshot bytes, and the `streams` pointer table 
+  itself): an `out_ctx` overlapping those is not allowed and is not checked. Callers 
   should initialize the pointer to `NULL` and check the status.
 
   | Status | Reported when |
   |---|---|
-  | `InvalidPointer` | a required pointer is `NULL` (`out_ctx`, `ctx`, `seed`, and byte buffers of nonzero length), or an array of `u64`, `usize` or pointers of nonzero length is `NULL` or misaligned, or `out_ctx` is misaligned, or an element of `streams` in `*_batch_from_streams` is `NULL` or misaligned |
+  | `InvalidPointer` | a required pointer is `NULL` (`out_ctx`, `ctx`, `seed`, and byte buffers of nonzero length), or an array of `u64`, `usize` or pointers of nonzero length is `NULL` or misaligned, or `out_ctx` is misaligned, or an element of `streams` in `*_batch_from_streams` is `NULL` or misaligned, or `out_ctx` overlaps a source context (`ctx`, or a stream in `*_batch_from_streams`) |
   | `InvalidLength` | empty path (`n == 0`, `n_path == 0`); a count or length too large to address; `n` differs from the batch length in `*_batch_fork`; `len() * k` overflows in `*_batch_fork_many`; `out_len` differs from `*_batch_snapshot_size` in `*_batch_export_snapshot`, or from 56 in the single-stream `*_export_snapshot`; the length given to `*_import_snapshot` does not match (56 for a single stream, the size implied by `lane_count` for a batch) |
   | `InvalidArgument` | `index` is not below the batch length in `*_batch_lane`; a stream is inside a block in `*_batch_from_streams`; nothing is created |
   | `EntropyUnavailable` | `lustro_prng_from_entropy`: the system entropy source is unavailable; nothing is created |
@@ -1192,7 +1236,7 @@ There are five categories:
 - **void-returning functions** (`*_free`): no return value; safe to call
   with `NULL` (no-op).
 
-**4. Required Buffer Sizes**
+#### 4. Required Buffer Sizes
 
 The sizes below are available as `#define`s in `lustro.h`: `LUSTRO_SEED_LEN`,
 `LUSTRO_BLOCK_LEN`, `LUSTRO_HASH128_LEN`, `LUSTRO_HASH256_LEN`,
@@ -1204,16 +1248,15 @@ Output buffers:
 
 | Function family | Buffer | Size |
 |---|---|---|
-| `lustro_hash256*` | `out` | 32 bytes per message |
-| `lustro_hash128*` | `out` | 16 bytes per message |
 | `*_next_u32` | `out` | 4 bytes |
 | `*_next_u64` | `out` | 8 bytes |
 | `lustro_hasher_remaining`, `lustro_xof_absorber_remaining` | `out_remaining` | 8 bytes |
-| `*_next_u128` | `out` | 16 bytes |
-| `*_position` | `out` | 16 bytes |
+| `*_next_u128`, `*_position` | `out` | 16 bytes |
+| `*_next_block` | `out` | 32 bytes |
 | `lustro_seed_from_entropy` | `out_seed` | 32 bytes |
 | `lustro_hasher_finalize256` | `out` | 32 bytes |
-| `*_next_block` | `out` | 32 bytes |
+| `lustro_hash128*` | `out` | 16 bytes per message |
+| `lustro_hash256*` | `out` | 32 bytes per message |
 | `*_export_snapshot` (single-context, PRNG/XOF) | `out` | 56 bytes; `out_len` must be 56 |
 | `*_batch_fill_blocks` | `out` | `n_lanes × steps × 32` bytes, the size of a `uint8_t [steps][n_lanes][32]` array. The block of `lane` at `step` starts at byte `lustro_batch_block_offset(step, n_lanes, lane)` |
 | `*_batch_export_snapshot` | `out` | `16 + n_lanes × 48` bytes; call `*_batch_snapshot_size(ctx)` first |
@@ -1225,7 +1268,7 @@ Input buffers:
 | `lustro_prng_new` / `lustro_prng_batch_new` / `lustro_prng_batch_new_range` | `seed` | 32 bytes, fixed |
 | `lustro_prng_derive_path` / `lustro_prng_batch_derive_path` | `seed` | 32 bytes, fixed |
 
-**5. Ownership / Lifetime**
+#### 5. Ownership / Lifetime
 
 | Handle type | Created by | Freed by |
 |---|---|---|
@@ -1242,17 +1285,29 @@ and cleanup rules as a context created by `*_new`.
 The caller owns a context only when the constructor returned `Ok`. On failure
 `*out_ctx` is `NULL` and there is nothing to free.
 
-**6. Null / Zero-Length Semantics**
+#### 6. Null / Zero-Length Semantics
 
 The `n == 0` behavior depends on the return-value category. It does **not**
 make every pointer argument optional; only array/data pointers whose length
-is determined by `n` may be `NULL`:
+is determined by `n` may be `NULL`. Summary of the zero-count cases:
+
+| Functions | Zero value | Result | May be `NULL` |
+|---|---|---|---|
+| `*_many_fixed`, `*_many_var` | `n` | `Ok` | data and output pointers |
+| `*_batch_fill_blocks` | `n_lanes × steps` (`out_len` must be 0) | `Ok` | `out` |
+| `*_batch_new`, `*_batch_new_range`, `*_batch_fork_many`, `*_batch_from_streams`, `*_fork_batch`, `*_fork_batch_range` | `n`, `count` or `k` | `Ok`, empty batch | the `n`-sized arrays, where the function has them |
+| `*_derive_path`, `*_fork_path` | `n` | `InvalidLength` | none |
+| `*_batch_derive_path` | `n_roots` / `n_messages` | `Ok`, empty batch | the roots / message arrays |
+| `*_batch_derive_path` | `n_path` | `InvalidLength` | none |
+| `lustro_hasher_update`, `lustro_xof_absorber_update` | `data_len` | `Ok` | `data` |
+
+Details and exceptions:
 
 - **Hash and fill functions** (`*_many_fixed`, `*_many_var`,
   `*_batch_fill_blocks`): with `n == 0`, the `*_many_*` functions return
   `LustroError::Ok` without dereferencing the data/output pointers; these
   pointers may be `NULL`. They return before the dispatcher, so such a call does not
-  fix the runtime settings (section 9).
+  fix the runtime settings (§9).
   `*_batch_fill_blocks` first checks `out_len == n_lanes × steps × 32`
   (so `out_len` must be 0 when the batch is empty or `steps == 0`), then
   returns `Ok` without dereferencing `out`; in that case only `out` may be
@@ -1283,7 +1338,7 @@ is determined by `n` may be `NULL`:
   return `Ok` and do not read `data`, which may then be `NULL`; this holds also after the
   declared length is reached.
 
-**7. Thread Safety**
+#### 7. Thread Safety
 
 `LustroPrng`, `LustroPrngBatch`, `LustroXof`, and `LustroXofBatch` contain
 generator state (plain integer fields; the batch types also own a vector of lane states) and
@@ -1299,7 +1354,31 @@ This includes the pointer and length tables and the message bytes of the batch f
 several threads of the Rust pool, so a write from another thread during the call is a data race. 
 Output buffers are written by the call and must not be read or written by other threads meanwhile.
 
-**8. ctypes Buffer Mapping**
+#### 8. Behavioral Notes (in addition to §10)
+
+- `*_next_u128` writes 16 raw little-endian bytes from the same stream as
+  `*_fill`. Byte 0 is the lowest byte of the value. 128-bit inputs have the other
+  form: stream IDs are two `uint64_t`, `hi` (upper 64 bits) first, then `lo`, and
+  ID arrays are parallel `*_hi` / `*_lo` arrays. `lustro_u128_from_parts` and
+  `lustro_u128_to_parts` convert between the two forms. New C functions that
+  return a 128-bit value use the 16-byte form.
+- `*_fill` and `*_batch_fill_blocks` preserve the concatenation guarantee from
+  §10. Batch output is step-major, so consecutive `*_batch_fill_blocks` calls
+  concatenate directly.
+- `*_import_snapshot` reports malformed input through the returned
+  `LustroError` and leaves `*out_ctx` as `NULL`. Rust and Python report the same
+  errors through `SnapshotError` and the corresponding Python exception.
+- `*_batch_lane` and `*_batch_from_streams` follow the `lane(i)` and
+  `from_streams` rules in §10 (Batch semantics); the C error is `InvalidArgument`.
+- `lustro_hasher_finalize256` does not change the context: while bytes are left it
+  returns `InvalidLength` and writes nothing, and more `lustro_hasher_update` calls can
+  follow; once the declared length is reached every call writes the same digest. An
+  `update` past the declared length returns `InvalidLength` and absorbs nothing.
+- `lustro_xof_absorber_finalize` follows the same rules (`InvalidLength` with `*out_ctx`
+  set to `NULL` while bytes are left). Each successful call creates a new `LustroXof`
+  context at position 0.
+
+#### 9. ctypes Buffer Mapping
 
 The repository's native Python bindings are implemented with PyO3. The C FFI can also be called 
 from Python using ctypes, but this repository does not provide a ctypes wrapper. Such a wrapper must 
@@ -1308,7 +1387,7 @@ map `uintptr_t` to `ctypes.c_size_t`, and pass buffers as ctypes types, for exam
 or `(ctypes.c_uint8 * n)()` for writable output. Arrays of `uint64_t` or `uintptr_t` must be naturally aligned 
 (a ctypes array is). The `DLL BINDING` section of `Lustro_Speed_Tester.py` declares the signatures of the C API this way.
 
-**9. Header Distribution**
+#### 10. Header Distribution
 
 `lustro.h` is published with each release. Use the header matching the linked
 library version; do not copy or edit it manually between versions.
@@ -1327,32 +1406,6 @@ validates its arguments. For `lustro_batch_block_offset` the caller keeps
 `step < steps` and `lane < batch_len`, and `steps * batch_len * 32` must fit in
 `size_t`. The two `u128` helpers need valid pointers (`out` and `in` are 16 bytes)
 and do not depend on the host byte order.
-
-**C FFI-Specific Behavioral Notes** (in addition to §10)
-
-- `*_next_u128` writes 16 raw little-endian bytes from the same stream as
-  `*_fill`. Byte 0 is the lowest byte of the value. 128-bit inputs have the other
-  form: stream IDs are two `uint64_t`, `hi` (upper 64 bits) first, then `lo`, and
-  ID arrays are parallel `*_hi` / `*_lo` arrays. `lustro_u128_from_parts` and
-  `lustro_u128_to_parts` convert between the two forms. New C functions that
-  return a 128-bit value use the 16-byte form.
-- `*_fill` and `*_batch_fill_blocks` preserve the concatenation guarantee from
-  §10. Batch output is step-major, so consecutive `*_batch_fill_blocks` calls
-  concatenate directly.
-- `*_import_snapshot` reports malformed input through the returned
-  `LustroError` and leaves `*out_ctx` as `NULL`. Rust and Python report the same
-  errors through `SnapshotError` and the corresponding Python exception.
-- `*_batch_lane` returns the lane as a single stream: the next bytes it yields
-  are the block that `*_batch_fill_blocks` would write for that lane next.
-- `*_batch_from_streams` is the reverse: the first block `*_batch_fill_blocks`
-  writes for lane `i` is the block `*_next_block` would return on `streams[i]`.
-- `lustro_hasher_finalize256` does not change the context: while bytes are left it
-  returns `InvalidLength` and writes nothing, and more `lustro_hasher_update` calls can
-  follow; once the declared length is reached every call writes the same digest. An
-  `update` past the declared length returns `InvalidLength` and absorbs nothing.
-- `lustro_xof_absorber_finalize` follows the same rules (`InvalidLength` with `*out_ctx`
-  set to `NULL` while bytes are left). Each successful call creates a new `LustroXof`
-  context at position 0.
 
 ---
 
