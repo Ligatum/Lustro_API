@@ -8,7 +8,7 @@ features = ["python"]
 profile  = "release"
 
 [project]
-name = "lustro"
+name = "lustro_api"
 readme = "README.md"
 license-files = ["LICENSE.md"]
 requires-python = ">=3.11,<3.15"
