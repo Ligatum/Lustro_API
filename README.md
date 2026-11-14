@@ -1661,8 +1661,9 @@ length.
 
 ```toml
 [dependencies]
-lustro = { version = "<version>", features = ["rand"] }
+lustro_api = { version = "<version>", features = ["rand"] }
 rand_core = "0.10"
+The crate is published as `lustro_api`; its library is imported as `lustro`.
 ```
 
 ```rust
